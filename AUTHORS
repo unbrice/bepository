@@ -1,0 +1,7 @@
+bepository is written and maintained by:
+
+Brice Arnould <brice@vleu.net>
+
+For a complete list of contributors, see the git history:
+
+    git log --format='%aN <%aE>' | sort -u

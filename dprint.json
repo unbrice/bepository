@@ -1,0 +1,17 @@
+{
+  "markdown": {
+    "emphasisKind": "asterisks",
+    "lineWidth": 80,
+    "textWrap": "always"
+  },
+  "toml": {},
+  "dockerfile": {},
+  "yaml": {},
+  "excludes": [],
+  "plugins": [
+    "https://plugins.dprint.dev/markdown-0.21.1.wasm",
+    "https://plugins.dprint.dev/toml-0.7.0.wasm",
+    "https://plugins.dprint.dev/dockerfile-0.3.3.wasm",
+    "https://plugins.dprint.dev/g-plane/pretty_yaml-v0.6.0.wasm"
+  ]
+}

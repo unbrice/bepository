@@ -1,0 +1,7 @@
+version = 1
+
+[[annotations]]
+path = "**"
+precedence = "closest"
+SPDX-FileCopyrightText = "The bepository Authors"
+SPDX-License-Identifier = "MIT OR Apache-2.0"

@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Run formatting check
+echo "Checking formatting with 'just fmt-check'..."
+if ! just fmt-check; then
+    echo ""
+    echo "❌ Formatting check failed!"
+    echo "Run 'just fmt' to fix formatting before committing."
+    exit 1
+fi
+
+echo "✅ Formatting check passed."

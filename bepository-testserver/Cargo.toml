@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: 2026 Brice Arnould
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "bepository-testserver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reference test server wiring bepository-tls and bepository-bep"
+
+[features]
+default = ["integration"]
+integration = []
+
+[dependencies]
+bepository-bep = { path = "../bepository-bep", features = ["test-utils"] }
+bepository-tls = { path = "../bepository-tls" }
+tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
+tracing = { version = "0.1", features = ["log"] }
+
+[dev-dependencies]
+bepository-harness = { path = "../bepository-harness" }
+bepository-storage = { path = "../bepository-storage", features = ["test-utils"] }
+bytes = "1"
+object_store = "0.12"
+prost = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+sha2 = "0.11"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util"] }
+tracing-subscriber.workspace = true
+
+[[test]]
+name = "interop"
+required-features = ["integration"]
+
+[lints]
+workspace = true

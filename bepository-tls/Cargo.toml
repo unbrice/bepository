@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: 2026 Brice Arnould
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "bepository-tls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TLS identity and connection helpers for Syncthing BEP"
+
+[dependencies]
+bepository-bep.workspace = true
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+secrecy.workspace = true
+sha2 = "0.11"
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "sync"] }
+tokio-rustls = "0.26"
+tracing.workspace = true
+zeroize = "1"
+
+[lints]
+workspace = true

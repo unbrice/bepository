@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: 2026 Brice Arnould
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "bepository-bep"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Implementation of the Syncthing Block Exchange Protocol (BEP), with pluggable storage"
+
+[features]
+test-utils = []
+
+[dependencies]
+aliri_braid.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+linear-map.workspace = true
+lz4_flex = "0.13"
+once_cell.workspace = true
+parking_lot.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "macros", "io-util", "rt"] }
+tokio-util.workspace = true
+tracing.workspace = true
+ustr = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+bytes.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util"] }
+tracing-subscriber.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+
+[[test]]
+name = "integration"
+required-features = ["test-utils"]
+
+[lints]
+workspace = true

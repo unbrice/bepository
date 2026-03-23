@@ -1,0 +1,82 @@
+# SPDX-FileCopyrightText: 2026 Brice Arnould
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[workspace]
+members = [
+  "bepository-bep",
+  "bepository-cli",
+  "bepository-dav",
+  "bepository-e2etest",
+  "bepository-harness",
+  "bepository-lock",
+  "bepository-storage",
+  "bepository-testserver",
+  "bepository-tls",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.6.0"
+authors = ["Brice Arnould <brice@vleu.net>"]
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[workspace.metadata.crane]
+name = "bepository-workspace"
+
+[workspace.dependencies]
+# Workspace Crates
+bepository-bep = { path = "./bepository-bep" }
+bepository-cli = { path = "./bepository-cli" }
+bepository-dav = { path = "./bepository-dav" }
+bepository-harness = { path = "./bepository-harness" }
+bepository-lock = { path = "./bepository-lock" }
+bepository-storage = { path = "./bepository-storage" }
+bepository-testserver = { path = "./bepository-testserver" }
+bepository-tls = { path = "./bepository-tls" }
+
+# Common Dependencies
+aliri_braid = "0.4"
+anyhow = "1.0"
+async-trait = "0.1"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+dav-server = { version = "0.11", features = ["parking_lot"] }
+figment = { version = "0.10", features = ["parking_lot"] }
+futures = "0.3"
+humantime = "2"
+linear-map = "1.2.0"
+object_store = { version = "0.12", features = ["aws", "gcp", "http"] }
+once_cell = { version = "1", features = ["parking_lot"] }
+opendal = { version = "0.55" }
+parking_lot = { version = "0.12", features = ["deadlock_detection"] }
+prost = { version = "0.14", default-features = false, features = ["std"] }
+prost-build = "0.14"
+prost-types = { version = "0.14", default-features = false, features = ["std"] }
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+slatedb = { version = "0.12", features = ["compaction_filters", "foyer"] }
+tempfile = "3.27"
+thiserror = "2"
+tokio = { version = "1", features = ["full", "parking_lot", "tracing"] }
+tokio-util = { version = "0.7", features = ["tracing"] }
+tracing = { version = "0.1", features = ["log"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "parking_lot"] }
+ustr = { version = "1.1.0", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "v5"] }
+
+[workspace.lints.clippy]
+await_holding_lock = "deny"
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_sign_loss = "deny"
+uninlined_format_args = "deny"
+
+[workspace.package.badges]
+maintenance = { status = "experimental" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"

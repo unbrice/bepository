@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ci:
+    name: nix flake check + e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: "experimental-features = nix-command flakes"
+      # Smoke-check the user-facing flake (module-only, near-instant).
+      - run: nix flake check
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      # Run cargo tests, fmt, and clippy via the contributor flake.
+      - run: nix flake check ./nix/dev
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      - run: nix develop ./nix/dev --command just test-e2e
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true

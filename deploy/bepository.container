@@ -1,0 +1,32 @@
+[Unit]
+Description=bepository BEP bridge
+After=network-online.target
+Wants=network-online.target
+Conflicts=sleep.target
+Before=sleep.target
+
+[Container]
+Image=ghcr.io/unbrice/bepository:latest
+AutoUpdate=registry
+
+Volume=%S/bepository:/data:z
+Volume=%C/bepository:/var/cache/bepository:z
+
+PublishPort=${LISTEN_PORT:-22001}:${LISTEN_PORT:-22001}
+ReadOnly=true
+Tmpfs=/tmp
+
+Environment=CACHE_DIRECTORY=/var/cache/bepository
+EnvironmentFile=-/etc/bepository/env
+EnvironmentFile=-/etc/bepository/credentials
+
+Exec=serve ${STORAGE_URI} ${MASTER_DEVICE_ID} --listen 0.0.0.0:${LISTEN_PORT:-22001} --priority ${PRIORITY:-100} --lease ${LEASE:-180} ${EXTRA_ARGS}
+
+[Service]
+Restart=on-failure
+RestartSec=10s
+CacheDirectory=bepository
+StateDirectory=bepository
+
+[Install]
+WantedBy=default.target

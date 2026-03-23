@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: 2026 Brice Arnould
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "bepository-e2etest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dev-dependencies]
+bepository-harness = { path = "../bepository-harness" }
+libc = "0.2"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+
+[lints]
+workspace = true

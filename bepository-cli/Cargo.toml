@@ -1,0 +1,49 @@
+# SPDX-FileCopyrightText: 2026 Brice Arnould
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "bepository-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI for the bepository daemon"
+
+[[bin]]
+name = "bepository"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+bepository-bep.workspace = true
+bepository-dav.workspace = true
+bepository-lock.workspace = true
+bepository-storage.workspace = true
+bepository-tls.workspace = true
+chrono.workspace = true
+clap = { version = "4.6", features = ["derive", "env"] }
+directories = "6"
+futures.workspace = true
+humantime.workspace = true
+machine-uid = "0.5"
+object_store.workspace = true
+object_store_opendal = "0.55"
+opendal = { version = "0.55", features = ["services-sftp"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+secrecy.workspace = true
+single-instance = "0.3"
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-journald = "0.3"
+tracing-subscriber.workspace = true
+url = "2.5"
+uuid.workspace = true
+
+[dev-dependencies]
+assert_cmd = "2.2"
+predicates = "3.1"
+tempfile.workspace = true
+
+[lints]
+workspace = true

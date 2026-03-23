@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: 2026 Brice Arnould
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "bepository-dav"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Read-only WebDAV server exposing bepository checkpoints"
+
+[dependencies]
+base64 = "0.22"
+bepository-storage.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+dav-server.workspace = true
+futures-util = "0.3"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "tracing"] }
+ring = "0.17"
+secrecy.workspace = true
+subtle = "2"
+tokio = { workspace = true, features = ["net", "rt", "macros"] }
+tokio-util.workspace = true
+tracing.workspace = true
