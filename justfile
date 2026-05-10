@@ -64,5 +64,16 @@ fmt-check:
 setup-hooks:
     git config core.hooksPath .githooks
 
+# Amend the last commit with AI co-authorship trailers
+credit-ai:
+    git commit --amend --no-edit \
+        --trailer "Co-authored-by: Gemini <noreply@google.com>" \
+        --trailer "Co-authored-by: Claude <noreply@anthropic.com>"
+
+# Create and push a git tag to trigger deployment automation
+push-tag version:
+    git tag {{version}}
+    git push origin {{version}}
+
 clean:
     {{cargo}} clean
