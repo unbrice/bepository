@@ -17,7 +17,11 @@ in
           s3://bucket/prefix?region=eu-west-1
           s3://bucket/prefix?region=auto&endpoint=https://minio.example.com
           gs://bucket/prefix?project=my-gcp-project
-        Credentials are supplied separately via <option>environmentFile</option>.
+        Credentials must be placed under <filename>/etc/bepository/</filename>
+        out-of-band (e.g. via sops-nix dropping a service-account JSON at
+        <filename>/etc/bepository/sa-key.json</filename>, or extending
+        <option>environment.etc."bepository/env".text</option>). The container
+        bind-mounts that directory read-only.
       '';
     };
 
@@ -66,19 +70,20 @@ in
       description = "Distributed-lock lease duration in seconds (minimum 180).";
     };
 
-    environmentFile = lib.mkOption {
-      type = lib.types.nullOr lib.types.path;
-      default = null;
-      example = "/run/secrets/bepository.env";
+    extraEnv = lib.mkOption {
+      type = lib.types.attrsOf lib.types.str;
+      default = { };
+      example = lib.literalExpression ''
+        {
+          GOOGLE_APPLICATION_CREDENTIALS = "/etc/bepository/sa-key.json";
+        }
+      '';
       description = ''
-        Path to a file containing credential environment variables.  The file
-        is symlinked into <filename>/etc/bepository/credentials</filename>
-        so the secret never lands in the Nix store.
-        Each line must be in the form VAR=value.
-        AWS:  AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN
-        GCS:  CLOUDSDK_AUTH_ACCESS_TOKEN  (short-lived; from gcloud auth print-access-token)
-              GOOGLE_SERVICE_ACCOUNT_KEY  (JSON content of a service-account key file)
-              GOOGLE_APPLICATION_CREDENTIALS  (path to a service-account key file on disk)
+        Extra <literal>KEY=value</literal> pairs to append to
+        <filename>/etc/bepository/env</filename>. Use for paths to credential
+        files dropped under <filename>/etc/bepository/</filename> (e.g. via
+        sops-nix). Do <emphasis>not</emphasis> put secret values here directly —
+        they would land in the Nix store.
       '';
     };
   };
@@ -92,19 +97,17 @@ in
     environment.etc."containers/systemd/bepository.container".source =
       ../deploy/bepository.container;
 
-    environment.etc."bepository/env".text = ''
-      BEPOSITORY_STORAGE_URI=${cfg.storageUri}
-      BEPOSITORY_MASTER_DEVICE_ID=${cfg.masterDeviceId}
-      BEPOSITORY_PORT=${toString cfg.port}
-      BEPOSITORY_PRIORITY=${toString cfg.priority}
-      BEPOSITORY_LEASE=${toString cfg.lease}
-      ${lib.optionalString (!cfg.enableCache) "BEPOSITORY_NO_CACHE=1"}
-    '';
-
-    systemd.tmpfiles.settings = lib.mkIf (cfg.environmentFile != null) {
-      "10-bepository"."/etc/bepository/credentials" = {
-        "L+".argument = toString cfg.environmentFile;
-      };
-    };
+    environment.etc."bepository/env".text =
+      ''
+        BEPOSITORY_STORAGE_URI=${cfg.storageUri}
+        BEPOSITORY_MASTER_DEVICE_ID=${cfg.masterDeviceId}
+        BEPOSITORY_PORT=${toString cfg.port}
+        BEPOSITORY_PRIORITY=${toString cfg.priority}
+        BEPOSITORY_LEASE=${toString cfg.lease}
+        ${lib.optionalString (!cfg.enableCache) "BEPOSITORY_NO_CACHE=1"}
+      ''
+      + lib.concatStringsSep "\n"
+        (lib.mapAttrsToList (k: v: "${k}=${v}") cfg.extraEnv)
+      + "\n";
   };
 }

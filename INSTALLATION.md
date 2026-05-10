@@ -39,16 +39,16 @@ The `BEPOSITORY_STORAGE_URI` defines where to store data. Non-secret config
 
 ### Credentials
 
-For cloud storage, set credentials in an environment file.
+Put credentials in `/etc/bepository/env` (the Quadlet/Compose container also
+mounts `/etc/bepository/` read-only, so file-based credentials work).
 
-| Backend | Variable                         | Notes                                 |
-| ------- | -------------------------------- | ------------------------------------- |
-| AWS     | `AWS_ACCESS_KEY_ID`              | Your AWS access key ID                |
-| AWS     | `AWS_SECRET_ACCESS_KEY`          | Your AWS secret access key            |
-| AWS     | `AWS_SESSION_TOKEN`              | Optional: AWS session token           |
-| GCS     | `GOOGLE_SERVICE_ACCOUNT_KEY`     | JSON content of a service-account key |
-| GCS     | `GOOGLE_APPLICATION_CREDENTIALS` | Path to a service-account key file    |
-| GCS     | `CLOUDSDK_AUTH_ACCESS_TOKEN`     | Short-lived bearer token              |
+| Backend | Variable                         | Notes                                                                                                |
+| ------- | -------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| AWS     | `AWS_ACCESS_KEY_ID`              | Your AWS access key ID                                                                               |
+| AWS     | `AWS_SECRET_ACCESS_KEY`          | Your AWS secret access key                                                                           |
+| AWS     | `AWS_SESSION_TOKEN`              | Optional: AWS session token                                                                          |
+| GCS     | `GOOGLE_APPLICATION_CREDENTIALS` | Path to a service-account JSON key (recommended; place it at `/etc/bepository/sa-key.json` and 0600) |
+| GCS     | `CLOUDSDK_AUTH_ACCESS_TOKEN`     | Short-lived bearer token (`gcloud auth print-access-token`)                                          |
 
 ### Optional: Configure Cache
 
@@ -91,12 +91,11 @@ sudo curl -o /etc/containers/systemd/bepository.container \
   https://raw.githubusercontent.com/unbrice/bepository/master/deploy/bepository.container
 
 # Install the environment file
-sudo cp bepository.env /etc/bepository/env
+sudo install -m 600 bepository.env /etc/bepository/env
 
-# Create the credentials file. Either leave it empty (and keep all settings in
-# /etc/bepository/env), or move secrets here so the main env file can be
-# world-readable while credentials stay 0600.
-sudo install -m 600 /dev/null /etc/bepository/credentials
+# For GCS with a service-account key file:
+# sudo install -m 600 /path/to/key.json /etc/bepository/sa-key.json
+# (then set GOOGLE_APPLICATION_CREDENTIALS=/etc/bepository/sa-key.json in env)
 
 sudo systemctl daemon-reload
 ```
@@ -164,12 +163,17 @@ outputs = { nixpkgs, bepository, ... }: {
           lease          = 180;   # lock lease in seconds (minimum 180)
           enableCache    = true;  # set false to pass --no-cache (default: true)
 
-          # File containing credentials (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY,
-          # or CLOUDSDK_AUTH_ACCESS_TOKEN / GOOGLE_SERVICE_ACCOUNT_KEY for GCS).
-          # Symlinked into /etc/bepository/credentials so secrets stay out of
-          # the Nix store.
-          environmentFile = "/run/secrets/bepository.env";
+          # Reference credentials by path (the file itself is dropped into
+          # /etc/bepository/ out-of-band, e.g. via sops-nix, so the secret
+          # never lands in the Nix store).
+          extraEnv.GOOGLE_APPLICATION_CREDENTIALS = "/etc/bepository/sa-key.json";
         };
+
+        # Example secret placement with sops-nix:
+        # sops.secrets."bepository-sa-key" = {
+        #   path = "/etc/bepository/sa-key.json";
+        #   mode = "0400";
+        # };
       })
     ];
   };
@@ -225,7 +229,7 @@ ID, and connect it to your master Syncthing node.
 > ```sh
 > alias bepository='sudo podman run --rm \
 >   --env-file=/etc/bepository/env \
->   --env-file=/etc/bepository/credentials \
+>   -v /etc/bepository:/etc/bepository:ro \
 >   ghcr.io/unbrice/bepository:latest'
 > ```
 >

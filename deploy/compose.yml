@@ -26,6 +26,9 @@ x-base: &base
   volumes:
     - data:/data
     - cache:/var/cache/bepository
+    # For GCS: drop sa-key.json next to this compose file and uncomment, then
+    # set GOOGLE_APPLICATION_CREDENTIALS=/etc/bepository/sa-key.json in .env.
+    # - ./sa-key.json:/etc/bepository/sa-key.json:ro
 
 services:
   # --- Daemon (always running) ---

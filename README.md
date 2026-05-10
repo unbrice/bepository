@@ -131,7 +131,7 @@ See [INSTALLATION.md](INSTALLATION.md) for the full guide:
 > ```sh
 > alias bepository='sudo podman run --rm \
 >   --env-file=/etc/bepository/env \
->   --env-file=/etc/bepository/credentials \
+>   -v /etc/bepository:/etc/bepository:ro \
 >   ghcr.io/unbrice/bepository:latest'
 > ```
 >
@@ -141,7 +141,8 @@ See [INSTALLATION.md](INSTALLATION.md) for the full guide:
 > `BEPOSITORY_*` yourself, or pass flags)
 
 The Quadlet and Compose aliases load `BEPOSITORY_STORAGE_URI` and credentials
-from your env file automatically; the commands below assume that.
+from `/etc/bepository/env` automatically (and bind-mount `/etc/bepository/` so
+file-based GCS keys work); the commands below assume that.
 
 Checkpoints are taken automatically. To browse or download files from
 checkpoints, set `BEPOSITORY_DAV_PASSWORD` in `/etc/bepository/env` and start

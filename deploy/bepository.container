@@ -4,17 +4,22 @@ After=network-online.target
 Wants=network-online.target
 Conflicts=sleep.target
 Before=sleep.target
+AssertPathExists=/etc/machine-id
+AssertPathExists=/run/systemd/journal/socket
 
 [Container]
 Image=ghcr.io/unbrice/bepository:latest
 AutoUpdate=registry
 
-Volume=%S/bepository:/data:z
-Volume=%C/bepository:/var/cache/bepository:z
+Volume=%S/bepository:/data:z,idmap=uids=0-65532-1;gids=0-65532-1
+Volume=%C/bepository:/var/cache/bepository:z,idmap=uids=0-65532-1;gids=0-65532-1
+Volume=/etc/bepository:/etc/bepository:ro,idmap=uids=0-65532-1;gids=0-65532-1
+Volume=/etc/machine-id:/etc/machine-id:ro
+Volume=/run/systemd/journal:/run/systemd/journal
 
 # BEPOSITORY_PORT is expanded by systemd at runtime for both port publishing
 # and the application's listen address.
-PublishPort=${BEPOSITORY_PORT:-22001}:${BEPOSITORY_PORT:-22001}
+PublishPort=${BEPOSITORY_PORT}:${BEPOSITORY_PORT}
 ReadOnly=true
 Tmpfs=/tmp
 
@@ -22,7 +27,7 @@ Tmpfs=/tmp
 # container. This includes cloud credentials and all BEPOSITORY_* tuning.
 Environment=AWS_* GOOGLE_* BEPOSITORY_* CACHE_DIRECTORY
 
-Exec=serve --listen 0.0.0.0:${BEPOSITORY_PORT:-22001}
+Exec=serve --listen 0.0.0.0:${BEPOSITORY_PORT}
 
 [Service]
 Restart=on-failure
@@ -30,8 +35,6 @@ RestartSec=10s
 CacheDirectory=bepository
 StateDirectory=bepository
 EnvironmentFile=/etc/bepository/env
-# For credentials on deployments that need eg: per-machine creds.
-EnvironmentFile=-/etc/bepository/credentials
 
 [Install]
 WantedBy=default.target
