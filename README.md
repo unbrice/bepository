@@ -114,7 +114,7 @@ Fellow nix users, a flake lives in `nix/dev`, use it with
 
 ## Getting started
 
-See [INSTALLATION.md](INSTALLATION.md) for the full guide:
+See [INSTALL.md](INSTALL.md) for the full guide:
 
 1. Pick a storage backend (S3, GCS, SFTP, …) and configure credentials.
 2. Install the daemon (Systemd Quadlet, NixOS flake, Podman Compose, or from
