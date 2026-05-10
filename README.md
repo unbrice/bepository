@@ -130,8 +130,8 @@ See [INSTALL.md](INSTALL.md) for the full guide:
 >
 > ```sh
 > alias bepository='sudo podman run --rm \
+>   --volumes-from systemd-bepository \
 >   --env-file=/etc/bepository/env \
->   -v /etc/bepository:/etc/bepository:ro \
 >   ghcr.io/unbrice/bepository:latest'
 > ```
 >
@@ -140,9 +140,10 @@ See [INSTALL.md](INSTALL.md) for the full guide:
 > **Source:** `alias bepository='./target/release/bepository'` (export
 > `BEPOSITORY_*` yourself, or pass flags)
 
-The Quadlet and Compose aliases load `BEPOSITORY_STORAGE_URI` and credentials
-from `/etc/bepository/env` automatically (and bind-mount `/etc/bepository/` so
-file-based GCS keys work); the commands below assume that.
+The Quadlet alias inherits volumes (including `/etc/bepository`) from the
+running daemon via `--volumes-from`, so it requires the service to be active.
+For pre-install commands like `init` / `get-id`, use the standalone form in
+[INSTALL.md](INSTALL.md). The Compose alias works the same way.
 
 Checkpoints are taken automatically. To browse or download files from
 checkpoints, set `BEPOSITORY_DAV_PASSWORD` in `/etc/bepository/env` and start

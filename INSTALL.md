@@ -229,7 +229,7 @@ ID, and connect it to your master Syncthing node.
 > ```sh
 > alias bepository='sudo podman run --rm \
 >   --env-file=/etc/bepository/env \
->   -v /etc/bepository:/etc/bepository:ro \
+>   -v "/etc/bepository:/etc/bepository:ro,idmap=uids=0-65532-1;gids=0-65532-1" \
 >   ghcr.io/unbrice/bepository:latest'
 > ```
 >
