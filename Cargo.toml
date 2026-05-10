@@ -20,7 +20,7 @@ resolver = "2"
 version = "0.6.1"
 authors = ["Brice Arnould <brice@vleu.net>"]
 edition = "2024"
-license = "GPL-3.0-or-later"
+license = "MIT OR Apache-2.0"
 
 [workspace.metadata.crane]
 name = "bepository-workspace"

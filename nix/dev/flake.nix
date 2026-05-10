@@ -87,7 +87,7 @@
                 "org.opencontainers.image.source" = "https://github.com/unbrice/bepository";
                 "org.opencontainers.image.description" = "bepository: Syncthing cold-storage bridge";
                 "org.opencontainers.image.version" = (pkgs.lib.importTOML ./../../Cargo.toml).workspace.package.version;
-                "org.opencontainers.image.licenses" = "GPL-3.0";
+                "org.opencontainers.image.licenses" = "MIT OR Apache-2.0";
               };
             };
           };
