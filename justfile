@@ -70,10 +70,13 @@ credit-ai:
         --trailer "Co-authored-by: Gemini <noreply@google.com>" \
         --trailer "Co-authored-by: Claude <noreply@anthropic.com>"
 
-# Create and push a git tag to trigger deployment automation
+# Bump version and commit, then echo the commands to tag and push (accepts numerical VERSION)
 push-tag version:
-    git tag {{version}}
-    git push origin {{version}}
+    sed -i 's/^version = ".*"/version = "{{version}}"/' Cargo.toml
+    {{cargo}} check
+    git commit -am "chore: bump version to {{version}}"
+    @echo "Version bumped to {{version}}. Verify the commit and then run:"
+    @echo "  git tag v{{version}} && git push origin HEAD v{{version}}"
 
 clean:
     {{cargo}} clean
