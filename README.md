@@ -124,20 +124,31 @@ See [INSTALLATION.md](INSTALLATION.md) for the full guide:
 ## Point-in-time recovery
 
 > [!TIP]
-> **Alias tip:** Depending on your install method, define a shortcut first:
+> **Alias tip:** Depending on your install method, define a shortcut first.
 >
-> | Method  | Command                                                                                                    |
-> | ------- | ---------------------------------------------------------------------------------------------------------- |
-> | Quadlet | `alias bepository='sudo podman run --rm --env-file=/etc/bepository/env ghcr.io/unbrice/bepository:latest'` |
-> | Compose | `alias bepository='podman compose run --rm bepository'`                                                    |
-> | Source  | `alias bepository='./target/release/bepository'`                                                           |
+> **Quadlet:**
+>
+> ```sh
+> alias bepository='sudo podman run --rm \
+>   --env-file=/etc/bepository/env \
+>   --env-file=/etc/bepository/credentials \
+>   ghcr.io/unbrice/bepository:latest'
+> ```
+>
+> **Compose:** `alias bepository='podman compose run --rm bepository'`
+>
+> **Source:** `alias bepository='./target/release/bepository'` (export
+> `BEPOSITORY_*` yourself, or pass flags)
+
+The Quadlet and Compose aliases load `BEPOSITORY_STORAGE_URI` and credentials
+from your env file automatically; the commands below assume that.
 
 Checkpoints are taken automatically. To browse or download files from
-checkpoints, start the WebDAV server:
+checkpoints, set `BEPOSITORY_DAV_PASSWORD` in `/etc/bepository/env` and start
+the WebDAV server:
 
 ```sh
-BEPOSITORY_DAV_PASSWORD=t0ps3cr3t bepository \
-  checkpoint s3://my-bucket/backup?region=us-east-1 serve 0.0.0.0:8080
+bepository checkpoint serve 0.0.0.0:8080
 ```
 
 Open `http://localhost:8080` in a WebDAV client (or a browser) and log in with
@@ -151,16 +162,13 @@ To adjust the checkpoint schedule:
 
 ```sh
 # Keep hourly checkpoints for 48 hours instead of 24
-bepository \
-  checkpoint s3://my-bucket/backup?region=us-east-1 every 1h ttl 2d
+bepository checkpoint every 1h ttl 2d
 
 # Stop taking hourly checkpoints
-bepository \
-  checkpoint s3://my-bucket/backup?region=us-east-1 every 1h remove
+bepository checkpoint every 1h remove
 
 # List current schedules and existing checkpoints
-bepository \
-  checkpoint s3://my-bucket/backup?region=us-east-1 list
+bepository checkpoint list
 ```
 
 ## Maintenance
@@ -169,7 +177,7 @@ Run `fsck` to check and repair storage:
 
 ```sh
 # Run a quick integrity check
-bepository fsck s3://my-bucket/backup?region=us-east-1 --check quick
+bepository fsck --check quick
 ```
 
 The `--check` levels are:
@@ -184,13 +192,13 @@ The `--check` levels are:
 
 ```sh
 # Replace the TLS certificate (changes the Device ID — requires re-pairing)
-bepository fsck s3://my-bucket/backup?region=us-east-1 --regenerate-id
+bepository fsck --regenerate-id
 
 # Force a full compaction
-bepository fsck s3://my-bucket/backup?region=us-east-1 --compact
+bepository fsck --compact
 
 # Clear a stuck distributed lock
-bepository fsck s3://my-bucket/backup?region=us-east-1 --clear-lock
+bepository fsck --clear-lock
 ```
 
 </details>

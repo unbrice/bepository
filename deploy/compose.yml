@@ -17,58 +17,38 @@
 #   S3-compatible: s3://bucket/prefix?region=auto&endpoint=https://minio.example.com
 #   Google GCS:    gs://bucket/prefix?project=my-gcp-project
 
-# Credentials only — non-secret config (region, project, endpoint) goes in STORAGE_URI.
-x-credentials: &credentials # AWS
-  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
-  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
-  # GCS
-  GOOGLE_SERVICE_ACCOUNT_KEY: ${GOOGLE_SERVICE_ACCOUNT_KEY:-}
+x-base: &base
+  image: ghcr.io/unbrice/bepository:latest
+  env_file: .env
+  # Pin the cache directory to the mounted volume regardless of what .env says.
+  environment:
+    BEPOSITORY_CACHE_DIRECTORY: /var/cache/bepository
+  volumes:
+    - data:/data
+    - cache:/var/cache/bepository
 
 services:
   # --- Daemon (always running) ---
   bepository:
-    image: ghcr.io/unbrice/bepository:latest
+    <<: *base
     restart: unless-stopped
     ports:
-      - "${LISTEN_PORT:-22001}:22001"
-    volumes:
-      - data:/data
-      - cache:/var/cache/bepository
+      - "${BEPOSITORY_PORT:-22001}:22001"
     read_only: true
     tmpfs:
       - /tmp
-    environment:
-      <<: *credentials
-      CACHE_DIRECTORY: ${CACHE_DIRECTORY:-/var/cache/bepository}
-    command: >
-      serve
-      ${STORAGE_URI}
-      ${MASTER_DEVICE_ID}
-      --listen 0.0.0.0:22001
-      --priority ${PRIORITY:-100}
-      --lease ${LEASE:-180}
+    command: serve --listen 0.0.0.0:22001
 
   # --- Setup helpers (run with: podman compose run --rm <service>) ---
 
   init:
-    image: ghcr.io/unbrice/bepository:latest
-    volumes:
-      - data:/data
-      - cache:/var/cache/bepository
-    environment:
-      <<: *credentials
-      CACHE_DIRECTORY: ${CACHE_DIRECTORY:-/var/cache/bepository}
-    command: init ${STORAGE_URI}
+    <<: *base
+    command: init
     profiles: [setup]
 
   get-id:
-    image: ghcr.io/unbrice/bepository:latest
-    volumes:
-      - data:/data
-      - cache:/var/cache/bepository
-    environment:
-      <<: *credentials
-    command: get-id ${STORAGE_URI}
+    <<: *base
+    command: get-id
     profiles: [setup]
 
 volumes:

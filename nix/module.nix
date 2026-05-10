@@ -49,9 +49,8 @@ in
         Whether to use the Foyer hybrid disk cache (mounted at
         <filename>/var/cache/bepository</filename> via Quadlet's
         <literal>CacheDirectory=</literal>).  Set to <literal>false</literal>
-        to disable caching entirely (the module passes
-        <literal>--no-cache</literal> to the binary via
-        <literal>EXTRA_ARGS</literal>).
+        to disable caching entirely (the module sets
+        <literal>BEPOSITORY_NO_CACHE=1</literal>).
       '';
     };
 
@@ -94,12 +93,12 @@ in
       ../deploy/bepository.container;
 
     environment.etc."bepository/env".text = ''
-      STORAGE_URI=${cfg.storageUri}
-      MASTER_DEVICE_ID=${cfg.masterDeviceId}
-      LISTEN_PORT=${toString cfg.port}
-      PRIORITY=${toString cfg.priority}
-      LEASE=${toString cfg.lease}
-      ${lib.optionalString (!cfg.enableCache) "EXTRA_ARGS=--no-cache"}
+      BEPOSITORY_STORAGE_URI=${cfg.storageUri}
+      BEPOSITORY_MASTER_DEVICE_ID=${cfg.masterDeviceId}
+      BEPOSITORY_PORT=${toString cfg.port}
+      BEPOSITORY_PRIORITY=${toString cfg.priority}
+      BEPOSITORY_LEASE=${toString cfg.lease}
+      ${lib.optionalString (!cfg.enableCache) "BEPOSITORY_NO_CACHE=1"}
     '';
 
     systemd.tmpfiles.settings = lib.mkIf (cfg.environmentFile != null) {

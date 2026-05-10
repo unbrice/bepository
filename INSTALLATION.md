@@ -15,20 +15,20 @@ provide the corresponding configuration.
 
 ### Create the Environment File
 
-Download the sample environment file and save it as `syncthing.env`:
+Download the sample environment file and save it as `bepository.env`:
 
 ```sh
-curl -o syncthing.env https://raw.githubusercontent.com/unbrice/bepository/master/deploy/env.example
+curl -o bepository.env https://raw.githubusercontent.com/unbrice/bepository/master/deploy/env.example
 ```
 
-Open `syncthing.env` in your editor and configure `STORAGE_URI`,
-`MASTER_DEVICE_ID` (the Device ID of your local Syncthing), and your storage
-credentials if applicable.
+Open `bepository.env` in your editor and configure `BEPOSITORY_STORAGE_URI`,
+`BEPOSITORY_MASTER_DEVICE_ID` (the Device ID of your local Syncthing), and your
+storage credentials if applicable.
 
 ### Storage URI
 
-The `STORAGE_URI` defines where to store data. Non-secret config (region,
-project, endpoint) goes in the URI as query parameters.
+The `BEPOSITORY_STORAGE_URI` defines where to store data. Non-secret config
+(region, project, endpoint) goes in the URI as query parameters.
 
 | Backend                        | Example                                                                   |
 | ------------------------------ | ------------------------------------------------------------------------- |
@@ -53,7 +53,8 @@ For cloud storage, set credentials in an environment file.
 ### Optional: Configure Cache
 
 By default, `bepository` uses a local cache to avoid unnecessary reads. It
-follows the `$CACHE_DIRECTORY` env variable if set, otherwise XDG guidelines.
+follows the `$BEPOSITORY_CACHE_DIRECTORY` or `$CACHE_DIRECTORY` env variable if
+set, otherwise XDG guidelines.
 
 If the cold storage is always local, you can disable it with `--no-cache`. Cache
 can also be overridden with `--cache-dir`.
@@ -61,6 +62,12 @@ can also be overridden with `--cache-dir`.
 ## Step 2: Install the Service
 
 Choose the installation method that best fits your environment.
+
+> [!WARNING]
+> **Pre-1.0 warning:** The on-disk format is not yet stable. If you enable
+> auto-updates (Quadlet's `AutoUpdate=registry`, or pulling `:latest` on a
+> schedule), you may pull breaking changes. Consider pinning to a specific image
+> digest, or disabling auto-update, until 1.0.
 
 ### Decision Table
 
@@ -84,7 +91,13 @@ sudo curl -o /etc/containers/systemd/bepository.container \
   https://raw.githubusercontent.com/unbrice/bepository/master/deploy/bepository.container
 
 # Install the environment file
-sudo cp syncthing.env /etc/bepository/env
+sudo cp bepository.env /etc/bepository/env
+
+# Create the credentials file. Either leave it empty (and keep all settings in
+# /etc/bepository/env), or move secrets here so the main env file can be
+# world-readable while credentials stay 0600.
+sudo install -m 600 /dev/null /etc/bepository/credentials
+
 sudo systemctl daemon-reload
 ```
 
@@ -108,16 +121,10 @@ sudo systemctl enable --now bepository
 sudo systemctl enable --now podman-auto-update.timer
 ```
 
-> [!WARNING]
-> **Pre-1.0 warning:** The on-disk format is not yet stable. Auto-updates may
-> pull breaking changes. Consider pinning to a specific image digest or
-> disabling auto-update until 1.0.
-
 The unit provisions a block cache in `/var/cache/bepository` to speed up access
 to frequent data. To disable the cache (e.g. if the object store is a local
-NAS), edit `/etc/containers/systemd/bepository.container` and append
-`--no-cache` to the `Exec=` line, then run
-`sudo systemctl daemon-reload && sudo systemctl restart bepository`.
+NAS), set `BEPOSITORY_NO_CACHE=1` in `/etc/bepository/env` and run
+`sudo systemctl restart bepository`.
 
 ### NixOS
 
@@ -211,13 +218,20 @@ Once the daemon is installed, you must initialize the storage, find its Device
 ID, and connect it to your master Syncthing node.
 
 > [!TIP]
-> **Alias tip:** Depending on your install method, define a shortcut first:
+> **Alias tip:** Depending on your install method, define a shortcut first.
 >
-> | Method  | Command                                                                                                    |
-> | ------- | ---------------------------------------------------------------------------------------------------------- |
-> | Quadlet | `alias bepository='sudo podman run --rm --env-file=/etc/bepository/env ghcr.io/unbrice/bepository:latest'` |
-> | Compose | `alias bepository='podman compose run --rm bepository'`                                                    |
-> | Source  | `alias bepository='./target/release/bepository'`                                                           |
+> **Quadlet:**
+>
+> ```sh
+> alias bepository='sudo podman run --rm \
+>   --env-file=/etc/bepository/env \
+>   --env-file=/etc/bepository/credentials \
+>   ghcr.io/unbrice/bepository:latest'
+> ```
+>
+> **Compose:** `alias bepository='podman compose run --rm bepository'`
+>
+> **Source:** `alias bepository='./target/release/bepository'`
 
 ### 1. Initialize Storage
 
@@ -226,7 +240,7 @@ and writes the default checkpoint schedules. It is safe to re-run (it is a no-op
 if already initialized).
 
 ```sh
-bepository init <STORAGE_URI>
+bepository init
 ```
 
 *(For Compose, you can alternatively run the pre-configured shortcut:
@@ -237,7 +251,7 @@ bepository init <STORAGE_URI>
 Print the slave's Device ID so you can add it to your Syncthing master.
 
 ```sh
-bepository get-id <STORAGE_URI>
+bepository get-id
 ```
 
 *(For Compose, you can alternatively run the pre-configured shortcut:

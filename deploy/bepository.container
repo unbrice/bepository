@@ -12,21 +12,26 @@ AutoUpdate=registry
 Volume=%S/bepository:/data:z
 Volume=%C/bepository:/var/cache/bepository:z
 
-PublishPort=${LISTEN_PORT:-22001}:${LISTEN_PORT:-22001}
+# BEPOSITORY_PORT is expanded by systemd at runtime for both port publishing
+# and the application's listen address.
+PublishPort=${BEPOSITORY_PORT:-22001}:${BEPOSITORY_PORT:-22001}
 ReadOnly=true
 Tmpfs=/tmp
 
-Environment=CACHE_DIRECTORY=/var/cache/bepository
-EnvironmentFile=-/etc/bepository/env
-EnvironmentFile=-/etc/bepository/credentials
+# Passes matched variables from the systemd service environment into the
+# container. This includes cloud credentials and all BEPOSITORY_* tuning.
+Environment=AWS_* GOOGLE_* BEPOSITORY_* CACHE_DIRECTORY
 
-Exec=serve ${STORAGE_URI} ${MASTER_DEVICE_ID} --listen 0.0.0.0:${LISTEN_PORT:-22001} --priority ${PRIORITY:-100} --lease ${LEASE:-180} ${EXTRA_ARGS}
+Exec=serve --listen 0.0.0.0:${BEPOSITORY_PORT:-22001}
 
 [Service]
 Restart=on-failure
 RestartSec=10s
 CacheDirectory=bepository
 StateDirectory=bepository
+EnvironmentFile=/etc/bepository/env
+# For credentials on deployments that need eg: per-machine creds.
+EnvironmentFile=-/etc/bepository/credentials
 
 [Install]
 WantedBy=default.target

@@ -52,7 +52,7 @@ impl ConflictResolver for TheirsResolver {
 #[command(about = "Cold storage bridge daemon for Syncthing", long_about = None)]
 struct Cli {
     /// Override the machine ID (for tests or cross-machine identity).
-    #[arg(long, global = true)]
+    #[arg(long, global = true, env = "BEPOSITORY_MACHINE_ID")]
     machine_id: Option<String>,
     /// Set the tracing level (e.g., info, debug, trace)
     #[arg(long, global = true, env = "BEPOSITORY_LOG")]
@@ -64,11 +64,11 @@ struct Cli {
 #[derive(clap::Args, Clone)]
 struct CacheArgs {
     /// Override the Foyer block-cache directory.
-    /// Defaults to $CACHE_DIRECTORY (systemd) or the XDG cache dir.
+    /// Defaults to $BEPOSITORY_CACHE_DIRECTORY, $CACHE_DIRECTORY (systemd) or the XDG cache dir.
     #[arg(long, value_name = "PATH")]
     cache_dir: Option<PathBuf>,
     /// Disable the Foyer block cache entirely.
-    #[arg(long, conflicts_with = "cache_dir")]
+    #[arg(long, env = "BEPOSITORY_NO_CACHE", conflicts_with = "cache_dir")]
     no_cache: bool,
 }
 
@@ -85,6 +85,7 @@ impl CacheProvider for CacheArgs {
 #[derive(clap::Args)]
 struct StorageCli {
     /// The path or URI to the SlateDB storage (e.g., s3://bucket/path, file:///tmp/sync).
+    #[arg(env = "BEPOSITORY_STORAGE_URI")]
     storage_uri: String,
     #[command(flatten)]
     cache: CacheArgs,
@@ -143,16 +144,16 @@ enum Commands {
         #[command(flatten)]
         storage: StorageCli,
         /// The Device ID of the master of this instance.
-        #[arg(value_name = "MASTER_DEVICE_ID")]
+        #[arg(env = "BEPOSITORY_MASTER_DEVICE_ID", value_name = "MASTER_DEVICE_ID")]
         master_device_id: String,
         /// The address to listen on for BEP connections.
-        #[arg(long, default_value = "127.0.0.1:0")]
+        #[arg(long, env = "BEPOSITORY_LISTEN", default_value = "127.0.0.1:0")]
         listen: String,
         /// Lock priority. Higher priority can preempt lower ones.
-        #[arg(long, default_value_t = 100)]
+        #[arg(long, env = "BEPOSITORY_PRIORITY", default_value_t = 100)]
         priority: u32,
         /// Lease duration in seconds (minimum 180).
-        #[arg(long, default_value_t = 180, value_parser = clap::value_parser!(u64).range(180..))]
+        #[arg(long, env = "BEPOSITORY_LEASE", default_value_t = 180, value_parser = clap::value_parser!(u64).range(180..))]
         lease: u64,
     },
     /// Manage checkpoint schedules for point-in-time recovery.
@@ -928,11 +929,14 @@ async fn accept_loop(
 ///
 /// Used by [`CacheArgs`] when `--cache-dir` is not explicitly set.
 /// Priority:
-/// 1. `$CACHE_DIRECTORY` (systemd `CacheDirectory=`), first colon-separated path.
-/// 2. XDG / platform cache dir via `directories::ProjectDirs`.
-/// 3. `None` if neither is available (no home directory, unusual environments).
+/// 1. `$BEPOSITORY_CACHE_DIRECTORY`
+/// 2. `$CACHE_DIRECTORY` (systemd `CacheDirectory=`), first colon-separated path.
+/// 3. XDG / platform cache dir via `directories::ProjectDirs`.
+/// 4. `None` if neither is available (no home directory, unusual environments).
 fn get_cache_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("CACHE_DIRECTORY") {
+    if let Ok(dir) =
+        std::env::var("BEPOSITORY_CACHE_DIRECTORY").or_else(|_| std::env::var("CACHE_DIRECTORY"))
+    {
         return dir.split(':').next().map(PathBuf::from);
     }
     directories::ProjectDirs::from("net", "vleu", "bepository").map(|d| d.cache_dir().to_path_buf())
