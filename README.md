@@ -4,18 +4,18 @@ SPDX-FileCopyrightText: 2026 Brice Arnould
 SPDX-License-Identifier: MIT OR Apache-2.0
 -->
 
-# bepository
+<p align="center">
+  <img src="img/bepository-icon-transparent.png" height="128">
+</p>
 
-> [!WARNING]
-> **Pre-1.0:** The on-disk storage format is not yet stable. There are other
-> important limitations, see the [corresponding section](#limitations).
+# BEPository
 
 **Deduplicated incremental backups with peer-to-peer sync between N hosts.**
 
 `bepository` runs as a sidecar to [Syncthing](https://syncthing.net/) (on the
 [same device](#how-it-works)) and gives it access to permanent storage (S3, GCS,
-SFTP …), with snapshot support. Because it integrates Syncthing, you get all the
-benefit of Peer-to-Peer synchronization.
+SFTP …), with snapshot support. Because it integrates with Syncthing, you get
+all the benefits of Peer-to-Peer synchronisation.
 
 **Use it to:**
 
@@ -24,6 +24,10 @@ benefit of Peer-to-Peer synchronization.
 - **Archive into cheap object storage** with automatic point-in-time checkpoints
   for recovery, block deduplication across files and snapshots.
 
+> [!WARNING]
+> **Pre-1.0:** The on-disk storage format is not yet stable. There are other
+> important limitations, see the [corresponding section](#limitations).
+
 ## Features
 
 - **Point-in-time recovery.** Automatic checkpoints (hourly for 24 h, daily for
@@ -31,8 +35,8 @@ benefit of Peer-to-Peer synchronization.
 - **Deduplication.** Identical blocks are deduplicated across files and
   snapshots.
 - **Drop-in compatible.** Works as an add-on for existing Syncthing setups, and
-  takes advantage of Syncthing features (read-only sources, write-only
-  backups...).
+  takes advantage of Syncthing features (read-only sources, write-only backups
+  …).
 - **Reasonably Fast.** A [Foyer](https://foyer.rs/) hybrid disk cache keeps
   bloom filters and indices local (default: `/var/cache/bepository`).
 
@@ -107,7 +111,7 @@ Fellow nix users, a flake lives in `nix/dev`, use it with
 
 See [INSTALL.md](INSTALL.md) for the full guide:
 
-1. Pick a storage backend (S3, GCS, SFTP, …) and configure credentials.
+1. Pick a storage backend (S3, GCS, SFTP …) and configure credentials.
 2. On each device:
    1. Install the daemon (Systemd Quadlet, NixOS flake, Podman Compose, or from
       source).
