@@ -5,7 +5,10 @@ SPDX-License-Identifier: MIT OR Apache-2.0
 -->
 
 <p align="center">
-  <img src="img/bepository-icon-transparent.png" height="128">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="img/bepository-logo-dark.svg">
+    <img src="img/bepository-logo-light.svg" alt="bepository">
+  </picture>
 </p>
 
 # BEPository
