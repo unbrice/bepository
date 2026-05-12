@@ -1,7 +1,8 @@
-#![allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
 // SPDX-FileCopyrightText: 2026 Brice Arnould
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
+
+#![allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
 
 //! Interop tests: verify our Rust BEP implementation can talk to the real
 //! Go master over TLS.

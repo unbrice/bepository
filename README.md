@@ -12,13 +12,10 @@ SPDX-License-Identifier: MIT OR Apache-2.0
 
 **Deduplicated incremental backups with peer-to-peer sync between N hosts.**
 
-`bepository` presents an object store (S3, GCS, SFTP …) as a regular
-[Syncthing](https://syncthing.net/) peer, with snapshot support.
-
-It can be run from multiple machines at the same time, only the device with the
-highest priority will be active. It speaks standard
-[Syncthing protocol](https://docs.syncthing.net/specs/bep-v1.html), any existing
-Syncthing setup works to synchronize online devices as well as offline backups.
+`bepository` runs as a sidecar to [Syncthing](https://syncthing.net/) (on the
+[same device](#how-it-works)) and gives it access to permanent storage (S3, GCS,
+SFTP …), with snapshot support. Because it integrates Syncthing, you get all the
+benefit of Peer-to-Peer synchronization.
 
 **Use it to:**
 
@@ -31,16 +28,11 @@ Syncthing setup works to synchronize online devices as well as offline backups.
 
 - **Point-in-time recovery.** Automatic checkpoints (hourly for 24 h, daily for
   7 days by default) exposed over WebDAV.
-- **Content-addressed storage.** Identical blocks are deduplicated across files
-  and snapshots.
+- **Deduplication.** Identical blocks are deduplicated across files and
+  snapshots.
 - **Drop-in compatible.** Works as an add-on for existing Syncthing setups, and
   takes advantage of Syncthing features (read-only sources, write-only
   backups...).
-- **Cheap, durable backing.** File data lives as a
-  [SlateDB](https://slatedb.io/) on top of a dumb object store (S3, GCS, SFTP,
-  etc.).
-- **Portable identity.** The Device certificate lives inside the object store.
-  Any host with access to the storage URI can resume.
 - **Reasonably Fast.** A [Foyer](https://foyer.rs/) hybrid disk cache keeps
   bloom filters and indices local (default: `/var/cache/bepository`).
 
@@ -49,12 +41,10 @@ Syncthing setup works to synchronize online devices as well as offline backups.
 First and foremost, reliability:
 
 - Not much field testing.
-- CI is broken and installation instructions don't work.
+- Installation instructions only test on NixOS (report success or failure).
 - On-disk format not stable yet (that will be 1.0).
-- Partially implemented using LLMs. (Or should I say? Leverages a *vibe-coding*
-  🤠⚡ paradigm 🧠 to establish a robust Plausible Deniability Protocol 🥸 .
-  ✨🚀 — —) I've been careful to not trust it blindly but it probably managed to
-  slip in some sloppy code.
+- Partially implemented using LLMs. I've been careful to not trust it blindly
+  and to be driving the session, please report slop if you see it.
 
 On the feature front:
 
@@ -67,7 +57,7 @@ On the feature front:
 - Encryption support. Need to decide between:
   - Encrypting at SlateDB level, which allows deduplication to work at the
     folder level and keeps webdav working but requires custom crypto.
-  - Relying on Syncthing's built-in encryption, which is more secure.
+  - Relying on Syncthing's built-in encryption (more secure?).
 
 ## Contributing
 
@@ -101,7 +91,8 @@ Fellow nix users, a flake lives in `nix/dev`, use it with
                                 ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 ```
 
-- `bepository` sits next to a regular Syncthing instance.
+- `bepository` runs on the same device as a regular Syncthing instance
+  ([see FAQ](#running-on-different-device)).
 - Multiple `bepository` instances can share the same object store. An
   epoch-based distributed lock ensures only the highest-priority instance writes
   at any time; the rest stay on standby and take over automatically if the
@@ -117,9 +108,11 @@ Fellow nix users, a flake lives in `nix/dev`, use it with
 See [INSTALL.md](INSTALL.md) for the full guide:
 
 1. Pick a storage backend (S3, GCS, SFTP, …) and configure credentials.
-2. Install the daemon (Systemd Quadlet, NixOS flake, Podman Compose, or from
-   source).
-3. Pair it with your Syncthing instance.
+2. On each device:
+   1. Install the daemon (Systemd Quadlet, NixOS flake, Podman Compose, or from
+      source).
+   2. Pair it with your local Syncthing instance (see
+      [FAQ for running on a different device](#running-on-different-device)).
 
 ## Point-in-time recovery
 
@@ -204,3 +197,15 @@ bepository fsck --clear-lock
 ```
 
 </details>
+
+## FAQ
+
+<a id="running-on-different-device"></a>
+
+### Can Syncthing run on a different device?
+
+Technically yes, but it is strongly recommended to run them together.
+`bepository` does not implement relaying or discovery, meaning you would need a
+fixed IP or domain and a clear line of sight between the devices. Furthermore,
+each `bepository` process only accepts connections from a single Syncthing
+instance ("`MASTER_ID`" in the config).
