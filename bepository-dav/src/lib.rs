@@ -191,6 +191,10 @@ fn parse_path<'a, R: SnapshotRef>(path: &'a str, snapshots: &'a [R]) -> Option<L
         return Some(Level::Root);
     }
 
+    if trimmed.split('/').any(|c| c == ".." || c == ".") {
+        return None;
+    }
+
     let mut parts = trimmed.splitn(3, '/');
     let folder_label = parts.next()?;
 
@@ -530,5 +534,41 @@ fn map_snap_err(e: SnapshotError) -> FsError {
         SnapshotError::NotFound => FsError::NotFound,
         SnapshotError::NotADir | SnapshotError::NotAFile => FsError::Forbidden,
         SnapshotError::Io(_) => FsError::GeneralFailure,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bepository_storage::{FolderLabelRef, SnapshotRef};
+    use chrono::{DateTime, Utc};
+
+    #[derive(Clone, Copy, Debug)]
+    struct MockSnapRef;
+
+    impl SnapshotRef for MockSnapRef {
+        fn folder_label(&self) -> &'static FolderLabelRef {
+            FolderLabelRef::from_str("folder")
+        }
+
+        fn create_time(&self) -> DateTime<Utc> {
+            "2026-04-09T10:00:00Z".parse().unwrap()
+        }
+    }
+
+    #[test]
+    fn test_parse_path_traversal() {
+        let snaps = vec![MockSnapRef];
+
+        // Allowed paths
+        assert!(parse_path("folder/2026-04-09T10-00", &snaps).is_some());
+        assert!(parse_path("folder/2026-04-09T10-00/test.txt", &snaps).is_some());
+        assert!(parse_path("folder/2026-04-09T10-00/.gitignore", &snaps).is_some());
+
+        // Blocked paths
+        assert!(parse_path("folder/2026-04-09T10-00/../secret", &snaps).is_none());
+        assert!(parse_path("folder/2026-04-09T10-00/./secret", &snaps).is_none());
+        assert!(parse_path("folder/../2026-04-09T10-00", &snaps).is_none());
+        assert!(parse_path("../folder", &snaps).is_none());
     }
 }
