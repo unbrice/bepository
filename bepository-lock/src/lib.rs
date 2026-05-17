@@ -394,8 +394,8 @@ impl<'a, T: ObjectStore + ?Sized> Lock<'a, T> {
                 }
                 Ok::<(), Error>(())
             })
-            .buffer_unordered(100)
-            .try_for_each(|_| async move { Ok(()) })
+            .buffer_unordered(16)
+            .try_collect::<()>()
             .await?;
 
         Ok(())
