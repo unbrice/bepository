@@ -10,7 +10,7 @@ pub use epoch::Epoch;
 pub use guard::{LockGuard, LockLost};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{ObjectStore, PutMode, PutOptions};
 use serde::{Deserialize, Serialize};
@@ -384,13 +384,20 @@ impl<'a, T: ObjectStore + ?Sized> Lock<'a, T> {
     }
 
     pub async fn release(&self) -> Result<(), Error> {
-        for meta in self.list_epoch_metas().await? {
-            if let Some(entry) = self.read_entry(meta).await?
-                && entry.is_owned_by(&self.holder)
-            {
-                self.best_effort_delete(&entry.meta.location).await;
-            }
-        }
+        let metas = self.list_epoch_metas().await?;
+        futures::stream::iter(metas)
+            .map(|meta| async move {
+                if let Some(entry) = self.read_entry(meta).await?
+                    && entry.is_owned_by(&self.holder)
+                {
+                    self.best_effort_delete(&entry.meta.location).await;
+                }
+                Ok::<(), Error>(())
+            })
+            .buffer_unordered(16)
+            .try_collect::<()>()
+            .await?;
+
         Ok(())
     }
 
