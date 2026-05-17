@@ -384,13 +384,22 @@ impl<'a, T: ObjectStore + ?Sized> Lock<'a, T> {
     }
 
     pub async fn release(&self) -> Result<(), Error> {
-        for meta in self.list_epoch_metas().await? {
-            if let Some(entry) = self.read_entry(meta).await?
-                && entry.is_owned_by(&self.holder)
-            {
-                self.best_effort_delete(&entry.meta.location).await;
-            }
-        }
+        use futures::StreamExt;
+
+        let metas = self.list_epoch_metas().await?;
+        futures::stream::iter(metas)
+            .map(|meta| async move {
+                if let Some(entry) = self.read_entry(meta).await?
+                    && entry.is_owned_by(&self.holder)
+                {
+                    self.best_effort_delete(&entry.meta.location).await;
+                }
+                Ok::<(), Error>(())
+            })
+            .buffer_unordered(100)
+            .try_collect::<Vec<()>>()
+            .await?;
+
         Ok(())
     }
 
