@@ -26,6 +26,3 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"
 
 [lints]
 workspace = true
-[[bench]]
-name = "release_bench"
-harness = false
