@@ -189,7 +189,10 @@ fn snap_dir_name<R: SnapshotRef>(snap: &R) -> String {
 /// Note that paths originating from `DavPath` are pre-normalized and will not
 /// contain traversal components (`..` or `.`), meaning that downstream VFS
 /// code receives safe subpaths.
-fn parse_path<'a, R: SnapshotRef>(path: &'a dav_server::davpath::DavPath, snapshots: &'a [R]) -> Option<Level<'a, R>> {
+fn parse_path<'a, R: SnapshotRef>(
+    path: &'a dav_server::davpath::DavPath,
+    snapshots: &'a [R],
+) -> Option<Level<'a, R>> {
     let path_str = path.as_rel_ospath().to_str().unwrap_or("");
     let trimmed = path_str.trim_matches('/');
     if trimmed.is_empty() {
