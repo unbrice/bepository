@@ -87,8 +87,6 @@ fn bepository_clear_lock(storage_uri: &str) {
 
 struct BepositoryProcess {
     child: Option<Child>,
-    #[allow(dead_code)]
-    listen_port: u16,
 }
 
 impl BepositoryProcess {
@@ -115,10 +113,7 @@ impl BepositoryProcess {
             .spawn()
             .expect("failed to start bepository");
 
-        let mut proc = BepositoryProcess {
-            child: Some(child),
-            listen_port: port,
-        };
+        let mut proc = BepositoryProcess { child: Some(child) };
 
         // Poll the port until the listener is accepting connections.
         let deadline = Instant::now() + Duration::from_secs(60);
