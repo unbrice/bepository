@@ -290,12 +290,12 @@ impl CompactionScheduler for FullCompactionScheduler {
         let manifest = state.manifest();
 
         let mut sources: Vec<SourceId> = manifest
-            .l0
+            .l0()
             .iter()
             .map(|sst| SourceId::SstView(sst.id))
             .collect();
 
-        for sr in &manifest.compacted {
+        for sr in manifest.compacted() {
             sources.push(SourceId::SortedRun(sr.id));
         }
 
@@ -305,7 +305,12 @@ impl CompactionScheduler for FullCompactionScheduler {
 
         // If there are no compacted runs yet, we create the first one at slot 0
         // otherwise we re-use the ID of the first compacted run to match the behaviour of the default compactor
-        let destination = manifest.compacted.iter().map(|sr| sr.id).min().unwrap_or(0);
+        let destination = manifest
+            .compacted()
+            .iter()
+            .map(|sr| sr.id)
+            .min()
+            .unwrap_or(0);
         vec![CompactionSpec::new(sources, destination)]
     }
 }

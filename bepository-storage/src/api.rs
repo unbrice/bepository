@@ -10,7 +10,9 @@ use std::sync::Arc;
 use async_stream::stream;
 use async_trait::async_trait;
 use bytes::Bytes;
-use foyer::{DirectFsDeviceOptions, Engine, HybridCacheBuilder};
+use foyer::{
+    BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCacheBuilder, PsyncIoEngineConfig,
+};
 use futures::stream::{self, Stream};
 use object_store::ObjectStore;
 use parking_lot::{Mutex, RwLock};
@@ -1338,8 +1340,17 @@ async fn make_block_cache(cache_dir: Option<PathBuf>) -> Arc<dyn DbCache> {
             .with_name("slatedb")
             .memory(16 * 1024 * 1024) // 16 MiB memory tier
             .with_weighter(|_, v: &CachedEntry| v.size())
-            .storage(Engine::large())
-            .with_device_options(DirectFsDeviceOptions::new(dir).with_capacity(512 * 1024 * 1024))
+            .storage()
+            .with_io_engine_config(PsyncIoEngineConfig::new())
+            .with_engine_config(
+                BlockEngineConfig::new(
+                    FsDeviceBuilder::new(dir)
+                        .with_capacity(512 * 1024 * 1024)
+                        .build()
+                        .unwrap(),
+                )
+                .with_block_size(64 * 1024),
+            )
             .build()
             .await
             .expect("build foyer hybrid cache");
