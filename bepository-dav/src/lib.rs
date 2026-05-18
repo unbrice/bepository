@@ -182,11 +182,19 @@ fn snap_dir_name<R: SnapshotRef>(snap: &R) -> String {
     snap.create_time().format(TIMESTAMP_FMT).to_string()
 }
 
-/// Parse a URL-decoded path string (with leading `/`) into a [`Level`].
+/// Parse a `DavPath` into a [`Level`].
 ///
 /// Returns `None` when the path references a non-existent folder or snapshot.
-fn parse_path<'a, R: SnapshotRef>(path: &'a str, snapshots: &'a [R]) -> Option<Level<'a, R>> {
-    let trimmed = path.trim_matches('/');
+///
+/// Note that paths originating from `DavPath` are pre-normalized and will not
+/// contain traversal components (`..` or `.`), meaning that downstream VFS
+/// code receives safe subpaths.
+fn parse_path<'a, R: SnapshotRef>(
+    path: &'a dav_server::davpath::DavPath,
+    snapshots: &'a [R],
+) -> Option<Level<'a, R>> {
+    let path_str = path.as_rel_ospath().to_str().unwrap_or("");
+    let trimmed = path_str.trim_matches('/');
     if trimmed.is_empty() {
         return Some(Level::Root);
     }
@@ -246,8 +254,7 @@ impl<Fs: SnapshotFs> DavFileSystem for DavSfs<Fs> {
         path: &'a dav_server::davpath::DavPath,
     ) -> FsFuture<'a, Box<dyn DavMetaData>> {
         Box::pin(async move {
-            let path_str = path.as_pathbuf().to_string_lossy().into_owned();
-            match parse_path(&path_str, &self.snapshots) {
+            match parse_path(path, &self.snapshots) {
                 Some(Level::Root | Level::Folder(_)) => {
                     Ok(Box::new(EntryMeta::dir(SystemTime::now())) as _)
                 }
@@ -280,9 +287,8 @@ impl<Fs: SnapshotFs> DavFileSystem for DavSfs<Fs> {
         _meta: ReadDirMeta,
     ) -> FsFuture<'a, FsStream<Box<dyn DavDirEntry>>> {
         Box::pin(async move {
-            let path_str = path.as_pathbuf().to_string_lossy().into_owned();
             let entries: Vec<FsResult<Box<dyn DavDirEntry>>> =
-                match parse_path(&path_str, &self.snapshots) {
+                match parse_path(path, &self.snapshots) {
                     Some(Level::Root) => {
                         let mut seen = HashSet::new();
                         self.snapshots
@@ -324,9 +330,8 @@ impl<Fs: SnapshotFs> DavFileSystem for DavSfs<Fs> {
             if options.write || options.append || options.create || options.create_new {
                 return Err(FsError::Forbidden);
             }
-            let path_str = path.as_pathbuf().to_string_lossy().into_owned();
             let Level::SubPath(snap, subpath) =
-                parse_path(&path_str, &self.snapshots).ok_or(FsError::NotFound)?
+                parse_path(path, &self.snapshots).ok_or(FsError::NotFound)?
             else {
                 return Err(FsError::Forbidden);
             };
@@ -530,5 +535,34 @@ fn map_snap_err(e: SnapshotError) -> FsError {
         SnapshotError::NotFound => FsError::NotFound,
         SnapshotError::NotADir | SnapshotError::NotAFile => FsError::Forbidden,
         SnapshotError::Io(_) => FsError::GeneralFailure,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bepository_storage::{FolderLabelRef, SnapshotRef};
+    use chrono::{DateTime, Utc};
+    use dav_server::davpath::DavPath;
+
+    #[derive(Clone, Copy, Debug)]
+    struct MockSnapRef;
+
+    impl SnapshotRef for MockSnapRef {
+        fn folder_label(&self) -> &'static FolderLabelRef {
+            FolderLabelRef::from_str("folder")
+        }
+
+        fn create_time(&self) -> DateTime<Utc> {
+            "2026-04-09T10:00:00Z".parse().unwrap()
+        }
+    }
+
+    #[test]
+    fn test_parse_path() {
+        let snaps = vec![MockSnapRef];
+
+        let safe_dav = DavPath::new("/folder/2026-04-09T10-00/.gitignore").unwrap();
+        assert!(parse_path(&safe_dav, &snaps).is_some());
     }
 }
