@@ -10,7 +10,9 @@ use std::sync::Arc;
 use async_stream::stream;
 use async_trait::async_trait;
 use bytes::Bytes;
-use foyer::{DirectFsDeviceOptions, Engine, HybridCacheBuilder};
+use foyer::{
+    BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCacheBuilder, PsyncIoEngineConfig,
+};
 use futures::stream::{self, Stream};
 use object_store::ObjectStore;
 use parking_lot::{Mutex, RwLock};
@@ -88,8 +90,12 @@ pub enum FsckEvent {
 ///
 /// Persistent metadata (identity, folder registry) is stored as a TOML file
 /// `bepository-{epoch}.toml` in the object store root. Each folder gets its
-/// own SlateDB instance under `folder_<BASE32(id)>/`, opened
-/// lazily on first access.
+/// own SlateDB instance under `folder_<BASE32(id)>/` in the object store,
+/// opened lazily on first access.
+///
+/// All folders in an activated storage session share a single Foyer block
+/// cache (RAM + local disk) to optimize resource usage and improve the
+/// deduplication hit rate.
 ///
 /// `Storage` trait methods receive folder **labels** from the BEP
 /// engine and resolve them to directory names via the registry.
@@ -154,6 +160,7 @@ struct Activated {
     object_store: Arc<dyn ObjectStore>,
     cache_provider: Option<Arc<dyn CacheProvider + Send + Sync>>,
     runtime: tokio::runtime::Handle,
+    db_cache: tokio::sync::OnceCell<Arc<dyn DbCache>>,
 }
 
 /// Provides the base directory for the Foyer block cache, computed from the device ID.
@@ -212,6 +219,7 @@ impl SlateStorage {
             object_store: self.inner.object_store.clone(),
             cache_provider: self.inner.cache_provider.clone(),
             runtime: self.inner.runtime.clone(),
+            db_cache: tokio::sync::OnceCell::new(),
         });
         self.inner
             .activated
@@ -244,12 +252,25 @@ impl SlateStorage {
             }
         }
 
-        let new_reader =
+        let db_cache = if let Ok(act) = self.activated() {
+            Some(act.get_shared_db_cache().await.map_err(|e| {
+                crate::snapshot::SnapshotError::Io(format!("get shared db cache: {e}"))
+            })?)
+        } else {
+            None
+        };
+
+        let mut builder =
             DbReaderBuilder::new(folder_sk.to_string(), self.inner.object_store.clone())
-                .with_checkpoint_id(id)
-                .build()
-                .await
-                .map_err(|e| crate::snapshot::SnapshotError::Io(format!("open DbReader: {e}")))?;
+                .with_checkpoint_id(id);
+        if let Some(cache) = db_cache {
+            builder = builder.with_db_cache(cache);
+        }
+
+        let new_reader = builder
+            .build()
+            .await
+            .map_err(|e| crate::snapshot::SnapshotError::Io(format!("open DbReader: {e}")))?;
 
         // Double-check after reacquiring the lock: another task may have
         // installed a reader for the same key while we were opening ours.
@@ -855,7 +876,7 @@ impl Activated {
         Ok(())
     }
 
-    fn get_cache_dir(&self, folder_sk: &str) -> Result<Option<PathBuf>, StorageError> {
+    fn get_base_cache_dir(&self) -> Result<Option<PathBuf>, StorageError> {
         let Some(provider) = self.cache_provider.as_ref() else {
             return Ok(None);
         };
@@ -864,9 +885,20 @@ impl Activated {
             .get_identity()?
             .ok_or_else(|| StorageError::Internal("No identity found in storage".into()))?;
         let device_id = *identity.device_id();
-        Ok(provider
-            .get_cache_dir(&device_id)
-            .map(|base| base.join(folder_sk)))
+        Ok(provider.get_cache_dir(&device_id))
+    }
+
+    async fn get_shared_db_cache(&self) -> Result<Arc<dyn DbCache>, StorageError> {
+        self.db_cache
+            .get_or_try_init(|| async {
+                let dir = self.get_base_cache_dir()?;
+                // Each folder used to have its own cache under `dir/folder_sk`.
+                // We now share a single cache at `dir` to save file descriptors.
+                // Old per-folder directories are currently orphaned on upgrade.
+                Ok(make_block_cache(dir).await)
+            })
+            .await
+            .cloned()
     }
 
     /// Open a SlateDB instance for `folder_sk` with the standard cold-archive
@@ -880,8 +912,7 @@ impl Activated {
         full_compaction: bool,
     ) -> Result<Arc<FolderStore>, StorageError> {
         let path = folder_sk.to_string();
-        let folder_cache_dir = self.get_cache_dir(&path)?;
-        let db_cache = make_block_cache(folder_cache_dir).await;
+        let db_cache = self.get_shared_db_cache().await?;
 
         let gc = Arc::new(CompactionState::new());
         let store_slot = Arc::new(std::sync::OnceLock::<Arc<FolderStore>>::new());
@@ -1320,7 +1351,7 @@ impl StorageFolder for SlateFolder {
     }
 }
 
-/// Creates a per-folder block cache for cold/archival workloads.
+/// Creates a shared block cache for cold/archival workloads.
 ///
 /// When `cache_dir` is `Some`, builds a Foyer hybrid cache (16 MiB memory +
 /// 512 MiB disk) rooted at that directory. The disk tier persists bloom
@@ -1338,8 +1369,14 @@ async fn make_block_cache(cache_dir: Option<PathBuf>) -> Arc<dyn DbCache> {
             .with_name("slatedb")
             .memory(16 * 1024 * 1024) // 16 MiB memory tier
             .with_weighter(|_, v: &CachedEntry| v.size())
-            .storage(Engine::large())
-            .with_device_options(DirectFsDeviceOptions::new(dir).with_capacity(512 * 1024 * 1024))
+            .storage()
+            .with_io_engine_config(PsyncIoEngineConfig::new())
+            .with_engine_config(BlockEngineConfig::new(
+                FsDeviceBuilder::new(dir)
+                    .with_capacity(512 * 1024 * 1024)
+                    .build()
+                    .unwrap(),
+            ))
             .build()
             .await
             .expect("build foyer hybrid cache");

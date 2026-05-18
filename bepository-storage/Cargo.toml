@@ -20,7 +20,7 @@ bytes.workspace = true
 chrono.workspace = true
 fastbloom = "0.17"
 figment.workspace = true
-foyer = { version = "0.18", features = ["serde", "tracing"] }
+foyer = { version = "0.22", features = ["serde", "tracing"] }
 futures.workspace = true
 hex = "0.4"
 humantime.workspace = true

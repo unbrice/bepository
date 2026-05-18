@@ -135,6 +135,7 @@ impl FolderStore {
     {
         let options = WriteOptions {
             await_durable: false,
+            ..Default::default()
         };
         self.db
             .put_with_options(key, value, &PutOptions::default(), &options)
@@ -146,6 +147,7 @@ impl FolderStore {
     async fn write_non_durable(&self, batch: WriteBatch) -> Result<(), StorageError> {
         let options = WriteOptions {
             await_durable: false,
+            ..Default::default()
         };
         self.db
             .write_with_options(batch, &options)
