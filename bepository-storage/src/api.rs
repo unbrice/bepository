@@ -1354,53 +1354,71 @@ async fn make_block_cache(cache_dir: Option<PathBuf>) -> Arc<dyn DbCache> {
 
 /// Creates per-folder SlateDB settings for cold/archival workloads.
 ///
-/// Tuned for battery efficiency *and* a single config that performs on both
-/// slow (10 Mbps) and fast (≥100 Mbps) uplinks. The compactor `poll_interval`
-/// is held at 60 s (battery budget), so back-pressure and burst capacity are
-/// shaped by `max_unflushed_bytes` and `l0_max_ssts` instead.
+/// One config for both slow (≥10 Mbps) and fast (≥100 Mbps) uplinks, with a
+/// battery-friendly 60 s compactor cadence. Back-pressure and burst capacity
+/// are shaped by `l0_max_ssts × max_unflushed_bytes`, not by polling more
+/// often.
 ///
-/// Stall model (with poll_interval = 60 s):
-///   stall_free_burst   = l0_max_ssts × max_unflushed_bytes = 512 MiB
-///   sustained_ceiling  = stall_free_burst / poll_interval  ≈ 68 Mbps
+/// Stall model (poll_interval = 60 s):
+///   stall_free_burst   = l0_max_ssts × max_unflushed_bytes   = 512 MiB
+///   sustained_ceiling  = stall_free_burst / poll_interval    ≈ 68 Mbps
 ///   stall_duration_max = max_unflushed_bytes / upload_speed
 ///       (0.67 s @ 100 Mbps, 3.4 s @ 20 Mbps, 6.7 s @ 10 Mbps)
+///
+/// `max_sst_size` (compactor output) and `max_unflushed_bytes` (memtable +
+/// L0 flush size) look similar but sit on opposite sides of the writer
+/// latency boundary: compactor uploads run in the background, flush uploads
+/// bound the foreground stall when L0 is full.
 fn make_db_settings() -> Settings {
     Settings {
-        // WAL flush fallback timer. Size-based flush still fires at
+        // Fallback timer for the WAL flush. Size-based flush still fires at
         // `max_unflushed_bytes`, so this only causes a GCS PUT when there is
         // genuinely buffered data — not a per-tick radio wakeup.
         flush_interval: Some(Duration::from_secs(60)),
-        // Per-L0-SST flush size. Doubles burst/sustained headroom vs 4 MiB
-        // while keeping the worst-case write stall under 7 s on a 10 Mbps
-        // uplink (<1 s on 100 Mbps). 16 MiB would push slow-link stalls past
-        // 13 s, which is the reason we don't go higher.
+        // Active memtable size and L0 flush SST size. Three constraints set
+        // this jointly:
+        //   - Foreground stall: a back-pressured writer waits one flush
+        //     upload, so this bounds the stall duration on the slow link
+        //     (6.7 s @ 10 Mbps; 16 MiB would push it past 13 s).
+        //   - RAM and WAL replay: held in memory per folder and replayed on
+        //     crash recovery; keep it modest.
+        //   - Burst/sustained capacity: multiplied by `l0_max_ssts` to give
+        //     the stall-free burst and sustained ceiling above.
         max_unflushed_bytes: 8 * 1024 * 1024,
-        // Single-writer setup: no need to detect remote manifest changes often.
+        // Single-writer setup (epoch lock): remote manifest changes are not
+        // expected, so polling for them is mostly a battery cost.
         manifest_poll_interval: Duration::from_secs(120),
-        // Serialize L0 SST uploads to avoid CPU/radio bursts. Cold storage
-        // doesn't need flush throughput, and parallel flushes would fill L0
-        // faster without raising the stall threshold.
+        // Serialize L0 SST uploads. Cold storage doesn't need flush
+        // throughput, and parallel flushes would fill L0 faster without
+        // raising the stall threshold — strictly worse for back-pressure.
         l0_flush_parallelism: 1,
-        // Back-pressure ceiling. Sized so that
-        //   - a single several-hundred-MiB file uploaded at 100 Mbps fits
-        //     entirely within the burst buffer (64 × 8 MiB = 512 MiB),
-        //   - sustained ingest tops out at ~68 Mbps, well above 10/20 Mbps
-        //     links and acceptable on fast broadband for an archival workload.
-        // Compaction download+upload during a tick is ~2× the sustained
-        // ceiling (~137 Mbps), bounded by `max_fetch_tasks` parallelism.
+        // Back-pressure ceiling on L0 SST count. Sized so that:
+        //   - the stall-free burst (512 MiB) absorbs a single
+        //     several-hundred-MiB file uploaded at 100 Mbps without ever
+        //     stalling the writer,
+        //   - the sustained ceiling (~68 Mbps) covers 10/20 Mbps links
+        //     fully and is acceptable on fast broadband for an archival
+        //     workload (no point sizing for a 1 Gbps cold ingest).
+        // Compaction GCS bandwidth peaks at ~2× the sustained ceiling
+        // during a tick, bounded by `max_fetch_tasks` parallelism.
         l0_max_ssts: 64,
         compactor_options: Some(CompactorOptions {
-            // 60 s is the floor: each tick triggers a GCS manifest GET that
-            // keeps the radio awake even when there is nothing to compact.
+            // Battery floor: each tick triggers a GCS manifest GET that keeps
+            // the radio awake even when there is nothing to compact.
             poll_interval: Duration::from_secs(60),
-            // Serial compaction: halves CPU burst, fine for cold/archival use.
+            // Serial compaction: bounds CPU and network bursts. Fine for
+            // cold/archival; L0 headroom above absorbs flushes that arrive
+            // during a compaction cycle.
             max_concurrent_compactions: 1,
-            // Fewer parallel fetch tasks reduces network bursts during compaction.
+            // Bound parallel L0 fetches during compaction. Two is enough to
+            // overlap download with merge work without saturating the link.
             max_fetch_tasks: 2,
-            // L1+ output chunk size. 128 MiB halves compaction frequency vs
-            // 64 MiB while keeping each upload under ~2 min even at 10 Mbps
-            // (~11 s at 100 Mbps). The default 256 MiB pushes the slow-link
-            // upload past 3 min and risks transient timeouts.
+            // L1+ output chunk size. Compactor uploads are background work,
+            // so per-SST upload time only affects compaction wall-clock, not
+            // writer latency — pick the largest size that still completes
+            // each upload within a single GCS retry window on the slow link
+            // (~107 s @ 10 Mbps; ~11 s @ 100 Mbps). The 256 MiB default
+            // exceeds 3 min on a slow link and risks transient timeouts.
             max_sst_size: 128 * 1024 * 1024,
             ..CompactorOptions::default()
         }),
