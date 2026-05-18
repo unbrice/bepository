@@ -1371,9 +1371,12 @@ fn make_db_settings() -> Settings {
         // Serialize L0 SST uploads to avoid CPU/radio bursts. Cold storage
         // doesn't need flush throughput.
         l0_flush_parallelism: 1,
-        // More L0 headroom: with slower compaction polling the L0 backlog can
-        // grow before compaction catches up, so raise the stall threshold.
-        l0_max_ssts: 16,
+        // More L0 headroom: with slower compaction polling and serial L0 uploads,
+        // the L0 backlog can grow significantly. Increasing l0_max_ssts to 64
+        // provides a larger burst buffer (64 * 4 MiB = 256 MiB). This prevents
+        // SlateDB from applying write backpressure (stalling writes) during large
+        // syncs, which otherwise causes application tasks to block for long periods.
+        l0_max_ssts: 64,
         compactor_options: Some(CompactorOptions {
             // Wake up 12x less often to check whether compaction is needed.
             poll_interval: Duration::from_secs(60),
