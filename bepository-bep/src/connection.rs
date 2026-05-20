@@ -597,7 +597,7 @@ async fn handle_index<S: Storage, W: AsyncWrite + Unpin>(
     .await
 }
 
-#[tracing::instrument(level = "debug", skip(inner, writer, ctx), fields(folder_id = %update.folder), err)]
+#[tracing::instrument(level = "debug", skip(inner, writer, ctx, update), fields(folder_id = %update.folder), err)]
 async fn handle_index_update<S: Storage, W: AsyncWrite + Unpin>(
     inner: &Arc<Mutex<ConnectionInner<S>>>,
     writer: &mut W,
@@ -1067,7 +1067,7 @@ async fn drain_deferred<S: Storage, W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-#[tracing::instrument(level = "debug", skip(inner, writer, folder, ctx), fields(file = %file.name), err)]
+#[tracing::instrument(level = "debug", skip(inner, writer, folder, ctx, file), fields(file = %file.name), err)]
 async fn request_blocks<S: Storage, W: AsyncWrite + Unpin>(
     inner: &Arc<Mutex<ConnectionInner<S>>>,
     writer: &mut W,
