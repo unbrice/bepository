@@ -47,6 +47,7 @@ figment = { version = "0.10", features = ["parking_lot"] }
 futures = "0.3"
 humantime = "2"
 linear-map = "1.2.0"
+lockable = "0.2"
 object_store = { version = "0.12", features = ["aws", "gcp", "http"] }
 once_cell = { version = "1", features = ["parking_lot"] }
 opendal = { version = "0.55" }

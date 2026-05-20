@@ -177,6 +177,11 @@ pub trait StorageFolder: Clone + Send + Sync + 'static {
     /// Returns the committed [`FileInfo`] with its locally-assigned sequence
     /// number on success, or `None` if this was a no-op (not staged, or
     /// version mismatch).
+    ///
+    /// **Concurrency:** Implementations MUST be safe under concurrent calls
+    /// for the same `name`. Concurrent callers may both see the staged
+    /// entry and write identical commit data; the resulting peer-visible
+    /// state is the same single commit regardless of execution order.
     async fn complete_file(
         &self,
         name: &str,

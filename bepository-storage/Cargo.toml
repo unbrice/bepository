@@ -26,6 +26,7 @@ hex = "0.4"
 humantime.workspace = true
 humantime-serde = "1"
 linear-map.workspace = true
+lockable.workspace = true
 object_store.workspace = true
 parking_lot.workspace = true
 prost.workspace = true
@@ -46,6 +47,9 @@ test-utils = ["bepository-bep/test-utils"]
 
 [dev-dependencies]
 bepository-bep = { path = "../bepository-bep", features = ["test-utils"] }
+bepository-storage = { path = ".", features = ["test-utils"] }
+futures = { workspace = true }
+prost = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [build-dependencies]

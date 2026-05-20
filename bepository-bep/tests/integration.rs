@@ -29,7 +29,7 @@ use bepository_bep::test_utils::{
 };
 use bepository_bep::{
     BepEngine, BepError, CloseReason, ConnectionOptions, DeviceId, EngineEvent, FolderId,
-    ImmediateRetry, Storage, StorageError,
+    ImmediateRetry, Storage, StorageError, StorageFolder,
 };
 use bytes::Bytes;
 
@@ -234,7 +234,10 @@ async fn block_requests_are_served() {
         .await
         .expect("should not time out")
         .expect("channel should deliver");
-    assert!(matches!(reason, CloseReason::Remote(_)));
+    assert!(
+        matches!(reason, CloseReason::Remote(_)),
+        "expected CloseReason::Remote, got: {reason:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1265,4 +1268,107 @@ async fn storage_standby_closes_connection() {
         0,
         "B should have no peers after Standby"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent index and block processing: no duplicate completions
+// ---------------------------------------------------------------------------
+//
+// Processing an Index batch runs in a separate task from handling Responses.
+// Both can call into `complete_and_notify` for files staged by the index loop.
+// This test asserts that the completion mechanism is idempotent: even under
+// concurrent pressure, a file is committed exactly once, and B's
+// `local_sequence` increments exactly once per distinct file.
+#[tokio::test]
+async fn many_files_complete_exactly_once_under_concurrent_pressure() {
+    init_tracing();
+
+    let dev_a = make_device(1);
+    let dev_b = make_device(2);
+
+    let storage_a = MemoryStorage::new();
+    let f_a = storage_a.folder(FolderId::from("shared")).await.unwrap();
+
+    // 20 single-block files. Each unique payload → unique block hash.
+    const N: usize = 20;
+    let mut files: Vec<(String, Bytes, [u8; 32])> = Vec::with_capacity(N);
+    for i in 0..N {
+        let name = format!("file-{i:02}.bin");
+        let data = Bytes::from(format!("payload-for-{name}"));
+        let mut hash = [0u8; 32];
+        hash[0] = i as u8;
+        hash[1] = (i >> 8) as u8;
+        files.push((name, data, hash));
+    }
+    for (name, data, hash) in &files {
+        f_a.insert_file(make_file_with_blocks(name, &[(1, 1)], &[*hash]))
+            .await;
+        f_a.insert_block(name, 0, data.clone()).await;
+    }
+
+    let storage_b = MemoryStorage::new();
+    let f_b = storage_b.folder(FolderId::from("shared")).await.unwrap();
+
+    let engine_a = BepEngine::new(
+        storage_a,
+        dev_a,
+        "node-a".into(),
+        vec!["shared".into()],
+        resolver(),
+    );
+    let engine_b = BepEngine::new(
+        storage_b,
+        dev_b,
+        "node-b".into(),
+        vec!["shared".into()],
+        resolver(),
+    );
+
+    let (stream_a, stream_b) = tokio::io::duplex(128 * 1024);
+    let handle_a = engine_a.connect(stream_a, dev_b).await.unwrap();
+    let handle_b = engine_b.accept(stream_b, dev_a).await.unwrap();
+
+    // Wait until B has every file in its committed index. Poll with a short
+    // sleep until completion.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut all_present = true;
+        for (name, _, _) in &files {
+            if f_b.get_file(name).await.is_none() {
+                all_present = false;
+                break;
+            }
+        }
+        if all_present {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("not all files were committed on B within 10s");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Every file present with its block stored.
+    for (name, data, _) in &files {
+        let got = f_b.get_block(name, 0).await;
+        assert_eq!(
+            got.as_deref(),
+            Some(data.as_ref()),
+            "block for {name} should be stored on B"
+        );
+    }
+
+    // The key invariant: B's local_sequence advances exactly once per file
+    // completion. If complete_file ran twice for any file, the counter
+    // would be > N. (>N is also possible from index re-staging, but A
+    // sends each file exactly once in a single Index.)
+    let seq = f_b.local_sequence().await.unwrap().get();
+    assert_eq!(
+        seq, N as i64,
+        "B's local_sequence must equal N={N} (one increment per completion); \
+         a higher value indicates duplicate complete_file calls"
+    );
+
+    handle_a.shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle_b.closed).await;
 }

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
+use lockable::{LockPool, Lockable};
 use parking_lot::RwLock;
 use prost::Message;
 use slatedb::config::{PutOptions, WriteOptions};
@@ -106,6 +107,22 @@ impl CompactionState {
     }
 }
 
+/// Witness that the caller holds [`FolderStore::name_locks`] for `name`.
+///
+/// Constructed only by [`FolderStore::lock_filename`]. Acts as a compile-time
+/// proof for functions that mutate per-name state and must run under
+/// the lock.
+struct LockedFileName<'a> {
+    name: String,
+    _guard: <LockPool<String> as Lockable<String, ()>>::Guard<'a>,
+}
+
+impl LockedFileName<'_> {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 /// Per-folder SlateDB wrapper.
 ///
 /// Each shared folder gets its own SlateDB instance with the key layout
@@ -113,9 +130,13 @@ impl CompactionState {
 pub(crate) struct FolderStore {
     pub(crate) db: Db,
     pub(crate) gc: Arc<CompactionState>,
-    /// Serialises all operations that allocate a sequence number
-    /// (`put_file`, `complete_file`) so the read-modify-write on
-    /// `max_sequence` is never interleaved.
+    /// Per-name async lock pool. Serializes `n/`, `s/`, and `in/`
+    /// mutations for a given name. Witnessed by `LockedFileName`.
+    /// Compaction may drop dead entries outside this lock; see
+    /// `compaction.rs`.
+    name_locks: LockPool<String>,
+    /// Guards the `IX_KEY` RMW and its batch write. Held briefly,
+    /// in-memory only. Compaction preserves `ix`.
     seq_lock: Mutex<()>,
 }
 
@@ -124,7 +145,18 @@ impl FolderStore {
         Self {
             db,
             gc,
+            name_locks: LockPool::new(),
             seq_lock: Mutex::new(()),
+        }
+    }
+
+    /// Acquire the per-name lock.
+    async fn lock_filename(&self, name: impl Into<String>) -> LockedFileName<'_> {
+        let name = name.into();
+        let guard = self.name_locks.async_lock(name.clone()).await;
+        LockedFileName {
+            name,
+            _guard: guard,
         }
     }
 
@@ -207,33 +239,32 @@ impl FolderStore {
         }
     }
 
-    /// The single code path that allocates a sequence number and commits a
-    /// file entry.
+    /// Allocate a sequence number and commit a file entry.
     ///
-    /// Holds `seq_lock` for the entire read-modify-write so no two callers
-    /// can observe the same `max_sequence`. All sequence-related keys
-    /// (old cleanup, new allocation, metadata bump, file entry, seq mapping)
-    /// plus any caller-supplied `extra_batch` operations are written in one
-    /// `WriteBatch`.
+    /// The prior-entry read runs outside `seq_lock`: the per-name lock
+    /// excludes other `commit_with_new_seq` calls for this name, and this
+    /// fn is the sole writer of `file_key`/`seq_key`. Compaction may drop
+    /// dead entries concurrently; memtable writes win on reads.
     ///
-    /// **Every** public method that needs a new sequence number MUST go
-    /// through this function — never read/increment `max_sequence` directly.
-    async fn commit_file_with_seq(
+    /// INVARIANT: must remain the sole writer of `file_key`/`seq_key` in
+    /// this module.
+    async fn commit_with_new_seq(
         &self,
-        name: &str,
+        locked_filename: &LockedFileName<'_>,
         file: FileInfo,
-        extra_batch: WriteBatch,
-    ) -> Result<i64, StorageError> {
-        let _guard = self.seq_lock.lock().await;
-
-        let mut batch = extra_batch;
+        mut batch: WriteBatch,
+    ) -> Result<(i64, FileInfo), StorageError> {
+        let name = locked_filename.name();
 
         // Remove old sequence entry if file already exists.
+        // Safe outside seq_lock — see function doc.
         if let Some(old) = self.get_file(name).await?
             && old.sequence > 0
         {
             batch.delete(store_keys::seq_key(old.sequence)?);
         }
+
+        let _guard = self.seq_lock.lock().await;
 
         // Allocate next sequence.
         let mut meta = self.get_index_meta().await?;
@@ -245,13 +276,13 @@ impl FolderStore {
         stored.sequence = seq;
 
         let file_wrapper = File {
-            file_info: Some(stored.into()),
+            file_info: Some(stored.clone().into()),
         };
         batch.put(store_keys::file_key(name), file_wrapper.encode_to_vec());
         batch.put(store_keys::seq_key(seq)?, name.as_bytes());
 
         self.write_non_durable(batch).await?;
-        Ok(seq)
+        Ok((seq, stored))
     }
 
     /// Insert or update a file in the index. Handles sequence bookkeeping.
@@ -260,8 +291,11 @@ impl FolderStore {
     /// update, file entry, sequence entry) are written in a single `WriteBatch`
     /// to ensure atomicity.
     pub async fn put_file(&self, file: &FileInfo) -> Result<i64, StorageError> {
-        self.commit_file_with_seq(&file.name, file.clone(), WriteBatch::new())
-            .await
+        let locked_filename = self.lock_filename(&file.name).await;
+        let (seq, _) = self
+            .commit_with_new_seq(&locked_filename, file.clone(), WriteBatch::new())
+            .await?;
+        Ok(seq)
     }
 
     // --- Full index scan ---
@@ -308,9 +342,17 @@ impl FolderStore {
     // --- Inbox (two-phase file intake) ---
 
     /// Stage a file in the inbox for block transfer.
+    ///
+    /// The inbox key is unique per `(epoch, name)`; a later `stage_file` for
+    /// the same name simply overwrites the entry (last-write-wins).
+    ///
+    /// Holds the per-name lock to serialize against `complete_file`'s
+    /// read-check-commit sequence; this ensures we don't overwrite the inbox
+    /// just as a concurrent completion is trying to promote it.
     #[tracing::instrument(level = "debug", skip_all, fields(file = %file.name, epoch = %epoch.as_base32()))]
     pub async fn stage_file(&self, epoch: Epoch, file: &FileInfo) -> Result<(), StorageError> {
-        let key = store_keys::inbox_key(epoch, &file.name);
+        let locked_filename = self.lock_filename(&file.name).await;
+        let key = store_keys::inbox_key(epoch, locked_filename.name());
         let inbox_wrapper = Inbox {
             file_info: Some(file.clone().into()),
         };
@@ -321,8 +363,14 @@ impl FolderStore {
 
     /// Promote a staged file from inbox to committed index.
     ///
-    /// Atomically: delete inbox entry, write to `n/<name>` with sequence,
-    /// write `s/<seq>` mapping. No-op if no inbox entry exists.
+    /// Holds the per-name lock across the entire read-check-commit so a
+    /// concurrent `stage_file` (e.g. a newer `IndexUpdate` arriving
+    /// mid-download) cannot race with the version check: either we observe
+    /// and commit the staged version, or we observe the newer one and return
+    /// `Ok(None)`.
+    ///
+    /// Returns `Ok(None)` if the inbox is empty (idempotent re-call) or if
+    /// the staged entry's version differs from `expected_version`.
     #[tracing::instrument(level = "debug", skip_all, fields(file = %name, epoch = %epoch.as_base32()))]
     pub async fn complete_file(
         &self,
@@ -330,7 +378,9 @@ impl FolderStore {
         name: &str,
         expected_version: Option<&Vector>,
     ) -> Result<Option<FileInfo>, StorageError> {
-        let inbox_key = store_keys::inbox_key(epoch, name);
+        let locked_filename = self.lock_filename(name).await;
+
+        let inbox_key = store_keys::inbox_key(epoch, locked_filename.name());
         let staged: FileInfo = match self.db.get(&inbox_key).await.map_err(slate_err)? {
             Some(bytes) => {
                 let inbox = Inbox::decode(bytes)
@@ -353,13 +403,12 @@ impl FolderStore {
             return Ok(None);
         }
 
-        // Inbox deletion is batched atomically with the sequence commit.
         let mut batch = WriteBatch::new();
         batch.delete(inbox_key);
 
-        let mut committed = staged.clone();
-        let seq = self.commit_file_with_seq(name, staged, batch).await?;
-        committed.sequence = seq;
+        let (_seq, committed) = self
+            .commit_with_new_seq(&locked_filename, staged, batch)
+            .await?;
 
         tracing::debug!("file complete");
 
