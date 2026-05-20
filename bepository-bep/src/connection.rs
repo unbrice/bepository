@@ -1392,7 +1392,7 @@ async fn drain_deferred<S: Storage>(
     writer: &MessageWriter,
     ctx: &ConnectionContext,
 ) -> Result<()> {
-    loop {
+    while !ctx.shutdown.is_cancelled() {
         let deferred = {
             let mut conn = inner.lock();
             if conn.pending_requests.len() >= conn.max_pending_requests {
@@ -1462,6 +1462,9 @@ async fn request_blocks<S: Storage>(
 ) -> Result<()> {
     tracing::debug!(total_blocks = file.blocks.len(), "requesting blocks");
     for (i, block) in file.blocks.iter().enumerate() {
+        if ctx.shutdown.is_cancelled() {
+            break;
+        }
         // Skip if we already have this block (e.g. from a rename/move).
         let reused = ctx
             .retry("reuse_block", || {
