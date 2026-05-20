@@ -42,6 +42,52 @@ const BLOOM_CAPACITY: usize = 5_000_000;
 /// False-positive rate for the compaction bloom filter.
 const BLOOM_FP_RATE: f64 = 0.001;
 
+/// Scan `prefix` against `snapshot`, decode each entry, and insert every block
+/// hash from the contained `FileInfo` into `bloom`. A wrong-length hash is
+/// treated as corruption: the compaction aborts rather than silently produce
+/// a bloom that drops live data.
+async fn index_blocks_under_prefix<F>(
+    snapshot: &slatedb::DbSnapshot,
+    prefix: &[u8],
+    bloom: &AtomicBloomFilter,
+    extract: F,
+) -> Result<(), CompactionFilterError>
+where
+    F: Fn(bytes::Bytes) -> Result<Option<crate::proto::storage::FileInfo>, prost::DecodeError>,
+{
+    let mut iter = snapshot
+        .scan_prefix(prefix)
+        .await
+        .map_err(|e| CompactionFilterError::CreationError(crate::store::slate_err(e).into()))?;
+    while let Some(kv) = iter
+        .next()
+        .await
+        .map_err(|e| CompactionFilterError::CreationError(crate::store::slate_err(e).into()))?
+    {
+        let fi = match extract(kv.value)
+            .map_err(|e| CompactionFilterError::CreationError(format!("decode: {e}").into()))?
+        {
+            Some(fi) => fi,
+            None => continue,
+        };
+        for block in &fi.blocks {
+            let hash: &[u8; store_keys::HASH_LEN] =
+                block.hash.as_slice().try_into().map_err(|_| {
+                    CompactionFilterError::CreationError(
+                        format!(
+                            "invalid hash length {} in file {}",
+                            block.hash.len(),
+                            fi.name
+                        )
+                        .into(),
+                    )
+                })?;
+            bloom.insert(hash);
+        }
+    }
+    Ok(())
+}
+
 /// Factory that creates a [`GcFilter`] for each compaction job.
 ///
 /// Holds a late-binding reference to the [`FolderStore`] (via `OnceLock`)
@@ -89,31 +135,25 @@ impl CompactionFilterSupplier for GcFilterSupplier {
         // Register with shared compaction state before scanning so writes go into our bloom filter.
         let job = self.gc.register(bloom.clone());
 
-        // Committed files (n/ entries).
-        let files = store
-            .all_files()
-            .await
-            .map_err(|e| CompactionFilterError::CreationError(e.into()))?;
-        for file in &files {
-            for block in &file.blocks {
-                if block.hash.len() == store_keys::HASH_LEN {
-                    bloom.insert(&block.hash[..]);
-                }
-            }
-        }
+        // Single snapshot covers both scans: `complete_file` atomically moves
+        // an entry from `in/<epoch>/<name>` to `n/<name>`, so scanning the two
+        // prefixes against the same point-in-time view guarantees every live
+        // file appears in exactly one of them. Independent scans would each
+        // take their own snapshot and could miss a file mid-transition.
+        let snapshot =
+            store.db.snapshot().await.map_err(|e| {
+                CompactionFilterError::CreationError(crate::store::slate_err(e).into())
+            })?;
 
-        // In-progress transfers (in/<epoch>/ entries).
-        let inbox_files = store
-            .inbox_files(self.epoch)
-            .await
-            .map_err(|e| CompactionFilterError::CreationError(e.into()))?;
-        for file in &inbox_files {
-            for block in &file.blocks {
-                if block.hash.len() == store_keys::HASH_LEN {
-                    bloom.insert(&block.hash[..]);
-                }
-            }
-        }
+        let inbox_prefix = store_keys::inbox_key(self.epoch, "");
+        index_blocks_under_prefix(&snapshot, &inbox_prefix, &bloom, |bytes| {
+            crate::proto::storage::Inbox::decode(bytes).map(|i| i.file_info)
+        })
+        .await?;
+        index_blocks_under_prefix(&snapshot, store_keys::FILE_PREFIX, &bloom, |bytes| {
+            crate::proto::storage::File::decode(bytes).map(|f| f.file_info)
+        })
+        .await?;
 
         // Compute peer floor for sequence/tombstone pruning.
         let peer_floor = store
