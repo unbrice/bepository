@@ -103,6 +103,15 @@ pub enum BepError {
     #[error("network error: {0}")]
     NetworkError(String),
 
+    /// The writer task has exited; sends through MessageWriter no longer succeed.
+    /// This is a proxy error — the writer's real exit reason (network I/O failure,
+    /// panic, etc.) is reported separately as that task's own error. WriterClosed
+    /// has a low priority in the WorkerError ranking — only `PeerClosed` (the
+    /// clean peer-initiated close) ranks lower — so it is unlikely to mask a
+    /// more informative error from a sibling task.
+    #[error("writer task closed")]
+    WriterClosed,
+
     #[error("device rejected by event handler")]
     DeviceRejected,
 }

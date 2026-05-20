@@ -72,6 +72,11 @@ The inbox holds file metadata during block transfer.
    sequence mapping are deleted, and the new file entry and sequence mapping are
    written atomically.
 
+**Concurrency:** Per-name locks (`name_locks`) protect staging and promotion; a
+global `seq_lock` serializes sequence allocation. This ensures safe, idempotent
+promotion (e.g., concurrent Index/Message loop updates) without blocking
+operations on different files.
+
 Version comparison uses the committed index only. The inbox is not
 authoritative.
 
@@ -100,6 +105,11 @@ persistence from the wire format, ensuring stability across bepository versions.
 
 ## Invariants
 
+- **Index mutation serialization:** `name_locks` serializes `n/`, `s/`, `in/`
+  mutations per name; `seq_lock` serializes the `IX_KEY` allocation.
+  `commit_with_new_seq` must remain the sole writer of `n/` and `s/`; enforced
+  at the type level by `LockedFileName`. Compaction may drop dead `n/`, `s/`,
+  `in/` entries outside any lock (see Compaction GC); `ix` is preserved.
 - **Index commit atomicity:** All mutations for file promotion happen in a
   single atomic batch.
 - **Block reference integrity:** Canonical block data is verified to exist
@@ -190,4 +200,4 @@ or skipping.
   negative not possible, but if dropped), it forces a re-request from peers,
   safely rewriting it.
 - **Crash safety:** Bloom filters are in-memory. SlateDB handles crash recovery
-  independently.
+  independently. s are in-memory. SlateDB handles crash recovery independently.

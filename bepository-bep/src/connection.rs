@@ -6,13 +6,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use parking_lot::Mutex;
 use prost::Message;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::oneshot;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::task::JoinSet;
 use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use crate::conflict::ConflictResolver;
 use crate::device_id::DeviceId;
@@ -120,22 +123,283 @@ impl<S: Storage> ConnectionInner<S> {
     }
 }
 
-struct ConnectionContext<'a> {
+#[derive(Clone)]
+struct ConnectionContext {
     remote_device: DeviceId,
     local_device: DeviceId,
-    resolver: &'a dyn ConflictResolver,
-    policy: &'a dyn RetryPolicy,
-    shutdown: &'a CancellationToken,
+    resolver: Arc<dyn ConflictResolver>,
+    policy: Arc<dyn RetryPolicy>,
+    shutdown: CancellationToken,
 }
 
-impl<'a> ConnectionContext<'a> {
+impl ConnectionContext {
     /// Helper to run storage operations with the context's retry policy and shutdown token.
     async fn retry<F, Fut, T>(&self, op: &str, f: F) -> crate::error::Result<T>
     where
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = std::result::Result<T, StorageError>> + Send,
     {
-        crate::retry::retry_storage_op(self.policy, self.shutdown, op, f).await
+        crate::retry::retry_storage_op(self.policy.as_ref(), &self.shutdown, op, f).await
+    }
+}
+
+struct OutgoingMessage {
+    msg_type: MessageType,
+    payload: Vec<u8>,
+}
+
+/// Byte-bounded mpsc sender.
+///
+/// BEP message payloads vary by ~6 orders of magnitude (empty Ping vs multi-MiB Index).
+///
+/// **Oversized messages**: A single message that exceeds the total budget is allowed.
+struct ByteBudgetSender<T> {
+    inner: mpsc::Sender<(OwnedSemaphorePermit, T)>,
+    budget: Arc<Semaphore>,
+    max_budget: u32,
+}
+
+impl<T> Clone for ByteBudgetSender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            budget: Arc::clone(&self.budget),
+            max_budget: self.max_budget,
+        }
+    }
+}
+
+impl<T> ByteBudgetSender<T> {
+    async fn send(&self, msg: T, bytes: usize) -> Result<()> {
+        // Clamp to [1, max_budget].
+        let clamped = u32::try_from(bytes)
+            .unwrap_or(u32::MAX)
+            .clamp(1, self.max_budget);
+        let permit = Arc::clone(&self.budget)
+            .acquire_many_owned(clamped)
+            .await
+            .map_err(|e| BepError::Internal(format!("nothing should close semaphore: {e}")))?;
+        self.inner
+            .send((permit, msg))
+            .await
+            .map_err(|_| BepError::WriterClosed)
+    }
+}
+
+fn byte_budget_channel<T>(
+    count: usize,
+    max_budget: u32,
+) -> (
+    ByteBudgetSender<T>,
+    mpsc::Receiver<(OwnedSemaphorePermit, T)>,
+) {
+    let (tx, rx) = mpsc::channel(count);
+    let budget = Arc::new(Semaphore::new(max_budget as usize));
+    (
+        ByteBudgetSender {
+            inner: tx,
+            budget,
+            max_budget,
+        },
+        rx,
+    )
+}
+
+/// Per-connection byte budgets. See `ByteBudgetSender` doc.
+///
+/// `WRITER_BUDGET_BYTES` = 4 MiB: ~32 full Response payloads at the default
+/// 128 KiB block size — well above latency-bound need, well below OOM territory
+/// on small devices.
+///
+/// `INDEX_BUDGET_BYTES` = 32 MiB: a full Index for a large folder can be
+/// tens of MiB; this keeps multiple such batches queueable before backpressure
+/// reaches the TCP reader.
+///
+/// NOTE: When this budget is full, `run_message_loop` blocks on `index_tx.send()`.
+/// This stops Pings from being sent. 32 MiB is large enough that we should
+/// only hit this if the index task is severely stalled (e.g. disk IO) or
+/// the peer is flooding us.
+const WRITER_BUDGET_BYTES: u32 = 4 * 1024 * 1024;
+const INDEX_BUDGET_BYTES: u32 = 32 * 1024 * 1024;
+
+/// Roughly accounts for the framing header and protobuf overhead on top of
+/// the payload bytes. Constant — we don't care about per-byte accuracy.
+const WRITER_PER_MESSAGE_OVERHEAD: usize = 16;
+
+/// The single owner of the outbound socket from the supervisor's point of
+/// view: every BEP message we send goes through here, into the writer mpsc,
+/// where `run_writer_loop` drains it serially. This serialization is the
+/// invariant that makes concurrent sending safe — without it, the message loop
+/// and the index loop could write to the socket concurrently and interleave
+/// bytes mid-frame, corrupting the wire protocol.
+///
+/// **Cloning is cheap and explicitly supported** (each clone is just another
+/// `mpsc::Sender` reference) — `MessageWriter` is handed to every task that
+/// needs to send. But every additional clone site changes the *message-level*
+/// ordering observable by the peer: while bytes within a single message are
+/// always contiguous, the relative order of messages from different tasks
+/// is non-deterministic (e.g., an `IndexUpdate` from the index loop can
+/// land between two `Response`s from the message loop). This is
+/// protocol-legal but worth understanding before introducing a new sender.
+#[derive(Clone)]
+struct MessageWriter {
+    tx: ByteBudgetSender<OutgoingMessage>,
+}
+
+impl MessageWriter {
+    async fn send<M: prost::Message>(&self, msg_type: MessageType, msg: &M) -> Result<()> {
+        let payload = msg.encode_to_vec();
+        let bytes = payload.len() + WRITER_PER_MESSAGE_OVERHEAD;
+        self.tx
+            .send(OutgoingMessage { msg_type, payload }, bytes)
+            .await
+    }
+}
+
+enum IndexTaskMessage {
+    Index(Index),
+    IndexUpdate(IndexUpdate),
+}
+
+/// Wraps a BepError with a priority used by the connection supervisor to
+/// pick the most informative error when multiple worker tasks fail. Ranking:
+/// storage/corruption > protocol > peer-level > network/IO > writer-closed-proxy
+/// > peer-clean-close.
+#[derive(Debug)]
+struct WorkerError(BepError);
+
+impl WorkerError {
+    fn priority(&self) -> u8 {
+        match &self.0 {
+            BepError::Corruption(_) => 100,
+            BepError::Internal(_) => 90,
+            BepError::PeerBadHello(_) | BepError::PeerBadMessage(_) => 70,
+            BepError::PeerError { .. } | BepError::DeviceRejected => 60,
+            BepError::Standby(_) => 50,
+            BepError::NetworkError(_) => 20,
+            BepError::TransientIo(_) => 15,
+            BepError::WriterClosed => 5,
+            BepError::PeerClosed(_) => 1,
+        }
+    }
+}
+
+impl PartialEq for WorkerError {
+    fn eq(&self, other: &Self) -> bool {
+        self.priority() == other.priority()
+    }
+}
+
+impl Eq for WorkerError {}
+
+impl PartialOrd for WorkerError {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for WorkerError {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.priority().cmp(&other.priority())
+    }
+}
+
+#[cfg(test)]
+mod worker_error_tests {
+    use super::*;
+
+    #[test]
+    fn corruption_beats_peer_bad_message() {
+        let a = WorkerError(BepError::Corruption("x".into()));
+        let b = WorkerError(BepError::PeerBadMessage("y".into()));
+        assert!(a > b);
+    }
+
+    #[test]
+    fn peer_bad_message_beats_network_error() {
+        let a = WorkerError(BepError::PeerBadMessage("x".into()));
+        let b = WorkerError(BepError::NetworkError("y".into()));
+        assert!(a > b);
+    }
+
+    #[test]
+    fn network_error_beats_writer_closed() {
+        let a = WorkerError(BepError::NetworkError("x".into()));
+        let b = WorkerError(BepError::WriterClosed);
+        assert!(a > b);
+    }
+
+    #[test]
+    fn internal_beats_network_error() {
+        let a = WorkerError(BepError::Internal("x".into()));
+        let b = WorkerError(BepError::NetworkError("y".into()));
+        assert!(a > b);
+    }
+}
+
+async fn run_writer_loop<W: AsyncWrite + Unpin>(
+    mut writer: W,
+    mut rx: mpsc::Receiver<(OwnedSemaphorePermit, OutgoingMessage)>,
+) -> Result<()> {
+    while let Some((_permit, msg)) = rx.recv().await {
+        let header = Header {
+            r#type: msg.msg_type as i32,
+            compression: MessageCompression::None as i32,
+        };
+        if let Err(e) = framing::write_message(&mut writer, &header, &msg.payload, false).await {
+            return Err(BepError::NetworkError(e.to_string()));
+        }
+        // _permit drops here, releasing budget back to senders.
+    }
+    writer
+        .shutdown()
+        .await
+        .map_err(|e| BepError::NetworkError(e.to_string()))
+}
+
+async fn run_index_loop<S: Storage>(
+    inner: Arc<Mutex<ConnectionInner<S>>>,
+    ctx: ConnectionContext,
+    writer: MessageWriter,
+    mut rx: mpsc::Receiver<(OwnedSemaphorePermit, IndexTaskMessage)>,
+) -> Result<()> {
+    loop {
+        // Shutdown / error semantics:
+        //   - The shutdown branch abandons queued and in-flight Index work
+        //     without draining. This is safe because `apply_remote_index`
+        //     writes `set_remote_state` only at the end of a batch: the
+        //     peer's last acked `max_sequence` is still authoritative, and on
+        //     reconnect the peer resends from there. Mid-batch leftovers in
+        //     the inbox are overwritten or completed idempotently next time.
+        //   - On a fatal error we also call `ctx.shutdown.cancel()`. This is
+        //     redundant in the steady state — the `JoinSet` supervisor in
+        //     `run_connection_inner` cancels the token as soon as any worker
+        //     returns — but it makes the index loop's behaviour
+        //     supervisor-independent and self-documenting.
+        tokio::select! {
+            _ = ctx.shutdown.cancelled() => {
+                return Ok(());
+            }
+            msg = rx.recv() => {
+                let (_permit, msg) = match msg {
+                    Some(m) => m,
+                    None => return Ok(()),
+                };
+                let res = match msg {
+                    IndexTaskMessage::Index(index) => {
+                        handle_index(&inner, &writer, index, &ctx).await
+                    }
+                    IndexTaskMessage::IndexUpdate(update) => {
+                        handle_index_update(&inner, &writer, update, &ctx).await
+                    }
+                };
+                // _permit drops here, releasing budget back to senders.
+                if let Err(e) = res {
+                    ctx.shutdown.cancel();
+                    return Err(e);
+                }
+            }
+        }
     }
 }
 
@@ -169,11 +433,11 @@ where
 /// loop.
 ///
 /// Returns `(mutual_folders, our_cc_folders)`.
-async fn exchange_initial_cluster_config<S, R, W>(
+async fn exchange_initial_cluster_config<S, R>(
     storage: &Arc<S>,
     reader: &mut R,
-    writer: &mut W,
-    ctx: &ConnectionContext<'_>,
+    writer: &MessageWriter,
+    ctx: &ConnectionContext,
     shared_folders: &[FolderId],
 ) -> Result<(
     std::collections::HashMap<FolderId, u64>,
@@ -182,7 +446,6 @@ async fn exchange_initial_cluster_config<S, R, W>(
 where
     S: Storage,
     R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
 {
     let mut initial_folders: Vec<FolderId> = shared_folders.to_vec();
     let folders = ctx.retry("list_folders", || storage.list_folders()).await?;
@@ -201,7 +464,9 @@ where
     )
     .await?;
     tracing::debug!(folders = ?initial_folders, "sending ClusterConfig");
-    send_typed_message(writer, MessageType::ClusterConfig, &cluster_config).await?;
+    writer
+        .send(MessageType::ClusterConfig, &cluster_config)
+        .await?;
 
     let peer_cc_msg = framing::read_message(reader).await?;
     if peer_cc_msg.header.r#type != MessageType::ClusterConfig as i32 {
@@ -260,7 +525,7 @@ pub(crate) async fn run_connection<S, T>(
         shared_folders,
         options,
         stream,
-        &shutdown,
+        shutdown.clone(),
     )
     .await;
 
@@ -283,26 +548,50 @@ async fn run_connection_inner<S, T>(
     shared_folders: Vec<FolderId>,
     options: ConnectionOptions,
     stream: T,
-    shutdown: &CancellationToken,
+    shutdown: CancellationToken,
 ) -> Result<CloseReason>
 where
     S: Storage,
     T: AsyncRead + AsyncWrite + Send + 'static,
 {
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (mut reader, mut raw_writer) = tokio::io::split(stream);
 
-    perform_hello(&mut reader, &mut writer, &device_name).await?;
+    perform_hello(&mut reader, &mut raw_writer, &device_name).await?;
+
+    // Set up the writer channel. From here on, no one writes to raw_writer
+    // directly — all sends go through MessageWriter -> mpsc -> run_writer_loop.
+    // The writer loop itself is spawned below in the JoinSet alongside the
+    // other worker tasks. The count cap (4096) is generous; the real bound is
+    // `WRITER_BUDGET_BYTES` enforced by `ByteBudgetSender`.
+    let (writer_tx, writer_rx) = byte_budget_channel::<OutgoingMessage>(4096, WRITER_BUDGET_BYTES);
+    let writer = MessageWriter { tx: writer_tx };
 
     let ctx = ConnectionContext {
         remote_device,
         local_device,
-        resolver: resolver.as_ref(),
-        policy: options.retry_policy.as_ref(),
-        shutdown,
+        resolver: Arc::clone(&resolver),
+        policy: Arc::clone(&options.retry_policy),
+        shutdown: shutdown.clone(),
     };
 
+    // Spawn the writer task FIRST so the cluster-config exchange below has
+    // something draining the writer channel. Without this, our outbound CC
+    // sits in the mpsc forever while we wait to read the peer's CC, and the
+    // peer is in the same state — startup deadlock.
+    let mut join_set: JoinSet<std::result::Result<Option<CloseReason>, WorkerError>> =
+        JoinSet::new();
+    join_set.spawn(
+        async move {
+            run_writer_loop(raw_writer, writer_rx)
+                .await
+                .map(|()| None)
+                .map_err(WorkerError)
+        }
+        .in_current_span(),
+    );
+
     let (mutual_folders, our_cc_folders) =
-        exchange_initial_cluster_config(&storage, &mut reader, &mut writer, &ctx, &shared_folders)
+        exchange_initial_cluster_config(&storage, &mut reader, &writer, &ctx, &shared_folders)
             .await?;
 
     let inner = Arc::new(Mutex::new(ConnectionInner {
@@ -315,18 +604,99 @@ where
         deferred_blocks: std::collections::VecDeque::new(),
     }));
 
-    run_message_loop(
-        &inner,
-        &mut reader,
-        &mut writer,
-        &ctx,
-        options.ping_interval,
-    )
-    .await
+    // Spawn the remaining two worker tasks into the same JoinSet. Each closure
+    // adapts the return type to Result<Option<CloseReason>, WorkerError>:
+    //   - message loop  → Ok(Some(reason)) | Err(WorkerError(e))
+    //   - index / writer → Ok(None)         | Err(WorkerError(e))
+    //
+    // The message loop owns index_tx and a writer clone; the index loop
+    // gets its own writer clone. No supervisor-side writer or index_tx is
+    // kept, so channel-close ordering is implicit via task exit:
+    //   message loop exits → index_tx dropped → index loop exits → its
+    //   writer clone dropped → writer channel closed → writer loop drains
+    //   and exits.
+
+    // Index processor — bound by bytes (`INDEX_BUDGET_BYTES`) rather than
+    // count, because Index payloads vary by orders of magnitude. The count
+    // cap (256) is just a safety net; the real bound is the byte budget.
+    // When the budget is full, the message loop's `index_tx.send().await`
+    // applies backpressure, which travels back to the reader socket
+    // naturally via TCP windowing.
+    let (index_tx, index_rx) = byte_budget_channel::<IndexTaskMessage>(256, INDEX_BUDGET_BYTES);
+
+    // Index loop — owns a writer clone; exits when index_tx is dropped.
+    join_set.spawn(
+        run_index_loop(Arc::clone(&inner), ctx.clone(), writer.clone(), index_rx)
+            .map(|r| r.map(|()| None).map_err(WorkerError))
+            .in_current_span(),
+    );
+
+    // Message loop — owns reader, index_tx, and a writer clone.
+    join_set.spawn(
+        run_message_loop(inner, reader, writer, index_tx, ctx, options.ping_interval)
+            .map(|r| r.map(Some).map_err(WorkerError))
+            .in_current_span(),
+    );
+
+    // Supervisor: wait for the first task to finish, then cancel and drain.
+    let mut first_done = false;
+    let mut errors: Vec<WorkerError> = Vec::new();
+    let mut close_reason: Option<CloseReason> = None;
+
+    loop {
+        let outcome = if first_done {
+            // After the first task finished we give the others 2 s to drain.
+            match tokio::time::timeout(Duration::from_secs(2), join_set.join_next()).await {
+                Ok(r) => r,
+                Err(_) => {
+                    tracing::warn!("worker tasks did not shut down within 2s; abandoning");
+                    join_set.shutdown().await;
+                    break;
+                }
+            }
+        } else {
+            join_set.join_next().await
+        };
+
+        match outcome {
+            None => break, // JoinSet exhausted
+            Some(join_result) => {
+                if !first_done {
+                    first_done = true;
+                    shutdown.cancel();
+                }
+                match join_result {
+                    Ok(Ok(reason)) => {
+                        if close_reason.is_none() {
+                            close_reason = reason;
+                        }
+                    }
+                    Ok(Err(e)) => errors.push(e),
+                    Err(e) => {
+                        if e.is_cancelled() {
+                            tracing::debug!(error = ?e, "task cancelled during shutdown");
+                        } else {
+                            tracing::warn!(error = ?e, "task panicked");
+                            errors.push(WorkerError(BepError::Internal(format!(
+                                "task panicked: {e}"
+                            ))));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Return the highest-priority error, or the close reason if all succeeded.
+    match errors.into_iter().max() {
+        Some(e) => Err(e.0),
+        None => Ok(close_reason.unwrap_or(CloseReason::Local)),
+    }
 }
+
 async fn build_cluster_config<S: Storage>(
     storage: &Arc<S>,
-    ctx: &ConnectionContext<'_>,
+    ctx: &ConnectionContext,
     local_device: &DeviceId,
     remote_device: &DeviceId,
     folders: &[FolderId],
@@ -334,7 +704,10 @@ async fn build_cluster_config<S: Storage>(
     let mut cc_folders = Vec::with_capacity(folders.len());
     for folder_id in folders {
         let f = ctx.retry("folder", || storage.folder(*folder_id)).await?;
-        let seq = f.local_sequence().await.unwrap_or(Sequence::ZERO).get();
+        let seq = ctx
+            .retry("local_sequence", || f.local_sequence())
+            .await?
+            .get();
         cc_folders.push(Folder {
             id: folder_id.to_string(),
             label: f.label().to_string(),
@@ -368,11 +741,11 @@ async fn build_cluster_config<S: Storage>(
 /// Returns `(new_mutual, new_for_our_cc)` where:
 /// - `new_mutual`: folders the peer proposed that weren't already in `current_mutual`
 /// - `new_for_our_cc`: subset of `new_mutual` absent from `our_cc` (caller adds to its CC set)
-async fn process_peer_cc<S: Storage, W: AsyncWrite + Unpin>(
+async fn process_peer_cc<S: Storage>(
     peer_cc: &ClusterConfig,
     storage: &Arc<S>,
-    writer: &mut W,
-    ctx: &ConnectionContext<'_>,
+    writer: &MessageWriter,
+    ctx: &ConnectionContext,
     current_mutual: &std::collections::HashMap<FolderId, u64>,
     our_cc: &std::collections::HashSet<FolderId>,
 ) -> Result<(Vec<(FolderId, u64)>, Vec<FolderId>)> {
@@ -438,7 +811,7 @@ async fn process_peer_cc<S: Storage, W: AsyncWrite + Unpin>(
         )
         .await?;
         tracing::debug!(folders = ?all_our_cc, "sending updated ClusterConfig");
-        send_typed_message(writer, MessageType::ClusterConfig, &updated_cc).await?;
+        writer.send(MessageType::ClusterConfig, &updated_cc).await?;
     }
 
     // Send Index for newly-mutual folders so the peer can see our local sequence.
@@ -450,11 +823,11 @@ async fn process_peer_cc<S: Storage, W: AsyncWrite + Unpin>(
 }
 
 #[tracing::instrument(level = "info", skip(storage, writer, ctx), fields(folder_id = %folder_id))]
-async fn send_index<S: Storage, W: AsyncWrite + Unpin>(
+async fn send_index<S: Storage>(
     storage: &Arc<S>,
-    writer: &mut W,
+    writer: &MessageWriter,
     folder_id: FolderId,
-    ctx: &ConnectionContext<'_>,
+    ctx: &ConnectionContext,
 ) -> Result<()> {
     let folder = ctx.retry("folder", || storage.folder(folder_id)).await?;
     let mut stream = ctx.retry("index", || folder.index(Sequence::ZERO)).await?;
@@ -474,20 +847,30 @@ async fn send_index<S: Storage, W: AsyncWrite + Unpin>(
         files,
         last_sequence: last_seq,
     };
-    send_typed_message(writer, MessageType::Index, &index).await
+    writer.send(MessageType::Index, &index).await
 }
 
-async fn apply_remote_index<S, W>(
+/// Apply a peer Index/IndexUpdate batch.
+///
+/// **Cancellation invariant:** `set_remote_state` MUST remain the last
+/// storage write in this function. `run_index_loop` may be cancelled
+/// mid-batch (shutdown, fatal error elsewhere); when that happens the
+/// per-file `apply_update` calls already made are persisted, but
+/// `max_sequence` is unchanged. On reconnect the peer resends the batch
+/// from the old `max_sequence` and `apply_update` no-ops on the
+/// already-applied files. Moving `set_remote_state` earlier would break
+/// this — partial application would advance the cursor and the unsent
+/// files would be skipped forever.
+async fn apply_remote_index<S>(
     inner: &Arc<Mutex<ConnectionInner<S>>>,
-    writer: &mut W,
+    writer: &MessageWriter,
     folder_id_str: &str,
     files: &[FileInfo],
     last_sequence: i64,
-    ctx: &ConnectionContext<'_>,
+    ctx: &ConnectionContext,
 ) -> Result<()>
 where
     S: Storage,
-    W: AsyncWrite + Unpin,
 {
     let (storage, peer_index_id) = {
         let conn = inner.lock();
@@ -575,14 +958,14 @@ where
 }
 
 #[tracing::instrument(level = "info", skip(inner, writer, ctx, index), fields(folder_id = %index.folder), err)]
-async fn handle_index<S: Storage, W: AsyncWrite + Unpin>(
+async fn handle_index<S: Storage>(
     inner: &Arc<Mutex<ConnectionInner<S>>>,
-    writer: &mut W,
+    writer: &MessageWriter,
     index: Index,
-    ctx: &ConnectionContext<'_>,
+    ctx: &ConnectionContext,
 ) -> Result<()> {
     tracing::debug!(
-        folder = %index.folder,
+        folder_id = %index.folder,
         files = index.files.len(),
         "received Index"
     );
@@ -598,14 +981,14 @@ async fn handle_index<S: Storage, W: AsyncWrite + Unpin>(
 }
 
 #[tracing::instrument(level = "debug", skip(inner, writer, ctx, update), fields(folder_id = %update.folder), err)]
-async fn handle_index_update<S: Storage, W: AsyncWrite + Unpin>(
+async fn handle_index_update<S: Storage>(
     inner: &Arc<Mutex<ConnectionInner<S>>>,
-    writer: &mut W,
+    writer: &MessageWriter,
     update: IndexUpdate,
-    ctx: &ConnectionContext<'_>,
+    ctx: &ConnectionContext,
 ) -> Result<()> {
     tracing::debug!(
-        folder = %update.folder,
+        folder_id = %update.folder,
         files = update.files.len(),
         "received IndexUpdate"
     );
@@ -620,17 +1003,17 @@ async fn handle_index_update<S: Storage, W: AsyncWrite + Unpin>(
     .await
 }
 
-async fn run_message_loop<S, R, W>(
-    inner: &Arc<Mutex<ConnectionInner<S>>>,
-    reader: &mut R,
-    writer: &mut W,
-    ctx: &ConnectionContext<'_>,
+async fn run_message_loop<S, R>(
+    inner: Arc<Mutex<ConnectionInner<S>>>,
+    mut reader: R,
+    writer: MessageWriter,
+    index_tx: ByteBudgetSender<IndexTaskMessage>,
+    ctx: ConnectionContext,
     ping_interval_duration: Duration,
 ) -> Result<CloseReason>
 where
     S: Storage,
     R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
 {
     let mut ping_interval = time::interval(ping_interval_duration);
     ping_interval.reset(); // Don't fire immediately
@@ -640,37 +1023,43 @@ where
             // Graceful shutdown
             _ = ctx.shutdown.cancelled() => {
                 let close = Close { reason: "shutdown requested".into() };
-                let _ = send_typed_message(writer, MessageType::Close, &close).await;
+                let _ = writer.send(MessageType::Close, &close).await;
                 return Ok(CloseReason::Local);
             }
 
             // Keepalive
             _ = ping_interval.tick() => {
                 let ping = Ping {};
-                send_typed_message(writer, MessageType::Ping, &ping).await?;
+                writer.send(MessageType::Ping, &ping).await?;
             }
 
             // Inbound message
-            msg = framing::read_message(reader) => {
+            msg = framing::read_message(&mut reader) => {
                 let msg = msg?;
                 ping_interval.reset();
 
                 match MessageType::try_from(msg.header.r#type) {
                     Ok(MessageType::Index) => {
+                        let body_len = msg.body.len();
                         let index = Index::decode(msg.body).map_err(|e| BepError::PeerBadMessage(format!("protobuf decode error: {e}")))?;
-                        handle_index(inner, writer, index, ctx).await?;
+                        if index_tx.send(IndexTaskMessage::Index(index), body_len).await.is_err() {
+                            return Err(BepError::Internal("index task closed".into()));
+                        }
                     }
                     Ok(MessageType::IndexUpdate) => {
+                        let body_len = msg.body.len();
                         let update = IndexUpdate::decode(msg.body).map_err(|e| BepError::PeerBadMessage(format!("protobuf decode error: {e}")))?;
-                        handle_index_update(inner, writer, update, ctx).await?;
+                        if index_tx.send(IndexTaskMessage::IndexUpdate(update), body_len).await.is_err() {
+                            return Err(BepError::Internal("index task closed".into()));
+                        }
                     }
                     Ok(MessageType::Request) => {
                         let request = Request::decode(msg.body).map_err(|e| BepError::PeerBadMessage(format!("protobuf decode error: {e}")))?;
-                        handle_request(inner, writer, request, ctx).await?;
+                        handle_request(&inner, &writer, request, &ctx).await?;
                     }
                     Ok(MessageType::Response) => {
                         let response = Response::decode(msg.body).map_err(|e| BepError::PeerBadMessage(format!("protobuf decode error: {e}")))?;
-                        handle_response(inner, writer, response, ctx).await?;
+                        handle_response(&inner, &writer, response, &ctx).await?;
                     }
                     Ok(MessageType::Ping) => {
                         // No-op; receipt already reset the timer
@@ -683,14 +1072,14 @@ where
                     Ok(MessageType::ClusterConfig) => {
                         let cc = ClusterConfig::decode(msg.body)
                             .map_err(|e| BepError::PeerBadMessage(format!("protobuf decode error: {e}")))?;
-                        handle_cluster_config_update(inner, writer, cc, ctx).await?;
+                        handle_cluster_config_update(&inner, &writer, cc, &ctx).await?;
                     }
                     Ok(MessageType::DownloadProgress) => {
                         let progress = DownloadProgress::decode(msg.body)
                             .map_err(|e| BepError::PeerBadMessage(format!("protobuf decode error: {e}")))?;
                         tracing::debug!(
-                            device = %ctx.remote_device,
-                            folder = %progress.folder,
+                            remote_device = %ctx.remote_device,
+                            folder_id = %progress.folder,
                             updates = progress.updates.len(),
                             "received download progress"
                         );
@@ -709,15 +1098,14 @@ where
 /// BEP allows ClusterConfig to be sent more than once to add or update
 /// folders. We snapshot the current state without holding the connection lock
 /// across awaits, run `process_peer_cc`, then merge the new entries back.
-async fn handle_cluster_config_update<S, W>(
+async fn handle_cluster_config_update<S>(
     inner: &Arc<Mutex<ConnectionInner<S>>>,
-    writer: &mut W,
+    writer: &MessageWriter,
     cc: ClusterConfig,
-    ctx: &ConnectionContext<'_>,
+    ctx: &ConnectionContext,
 ) -> Result<()>
 where
     S: Storage,
-    W: AsyncWrite + Unpin,
 {
     let (storage, current_mutual, our_cc_snap) = {
         let conn = inner.lock();
@@ -744,11 +1132,11 @@ where
     Ok(())
 }
 
-async fn handle_request<S: Storage, W: AsyncWrite + Unpin>(
+async fn handle_request<S: Storage>(
     inner: &Arc<Mutex<ConnectionInner<S>>>,
-    writer: &mut W,
+    writer: &MessageWriter,
     request: Request,
-    ctx: &ConnectionContext<'_>,
+    ctx: &ConnectionContext,
 ) -> Result<()> {
     let storage = {
         let conn = inner.lock();
@@ -763,7 +1151,7 @@ async fn handle_request<S: Storage, W: AsyncWrite + Unpin>(
             id = request.id,
             offset = request.offset,
             size = request.size,
-            folder = %request.folder,
+            folder_id = %request.folder,
             file = %request.name,
             "rejecting request with negative offset or size"
         );
@@ -793,14 +1181,14 @@ async fn handle_request<S: Storage, W: AsyncWrite + Unpin>(
         }
     };
 
-    send_typed_message(writer, MessageType::Response, &response).await
+    writer.send(MessageType::Response, &response).await
 }
 
-async fn handle_response<S: Storage, W: AsyncWrite + Unpin>(
+async fn handle_response<S: Storage>(
     inner: &Arc<Mutex<ConnectionInner<S>>>,
-    writer: &mut W,
+    writer: &MessageWriter,
     response: Response,
-    ctx: &ConnectionContext<'_>,
+    ctx: &ConnectionContext,
 ) -> Result<()> {
     let pending = {
         let mut conn = inner.lock();
@@ -813,7 +1201,7 @@ async fn handle_response<S: Storage, W: AsyncWrite + Unpin>(
                 tracing::warn!(
                     id = response.id,
                     code = response.code,
-                    folder = %block.folder.id(),
+                    folder_id = %block.folder.id(),
                     file = %block.name,
                     "peer returned error for block request"
                 );
@@ -832,7 +1220,7 @@ async fn handle_response<S: Storage, W: AsyncWrite + Unpin>(
             .await?;
 
             tracing::debug!(
-                folder = %block.folder.id(),
+                folder_id = %block.folder.id(),
                 file = %block.name,
                 offset = block.offset,
                 "stored block from peer"
@@ -862,24 +1250,24 @@ async fn handle_response<S: Storage, W: AsyncWrite + Unpin>(
 /// Pure messaging — no storage interaction. `fi` must already be committed to the
 /// index with its sequence number assigned (e.g. returned as `Applied(fi)` from
 /// `apply_update`, or as `Some(fi)` from `complete_file`).
-async fn send_index_update<W: AsyncWrite + Unpin>(
+async fn send_index_update(
     fi: &FileInfo,
     folder_id: FolderId,
-    writer: &mut W,
+    writer: &MessageWriter,
 ) -> Result<()> {
     let seq = fi.sequence;
     tracing::debug!(file = %fi.name, sequence = seq, "sending IndexUpdate");
-    send_typed_message(
-        writer,
-        MessageType::IndexUpdate,
-        &IndexUpdate {
-            folder: folder_id.to_string(),
-            files: vec![fi.clone()],
-            last_sequence: seq,
-            prev_sequence: 0,
-        },
-    )
-    .await
+    writer
+        .send(
+            MessageType::IndexUpdate,
+            &IndexUpdate {
+                folder: folder_id.to_string(),
+                files: vec![fi.clone()],
+                last_sequence: seq,
+                prev_sequence: 0,
+            },
+        )
+        .await
 }
 
 /// Call `complete_file` on storage and, if the file was committed, send a single-file
@@ -887,27 +1275,27 @@ async fn send_index_update<W: AsyncWrite + Unpin>(
 ///
 /// Returns without sending if the file still has pending or deferred block requests,
 /// or if `complete_file` returns `None` (version mismatch / not staged).
-async fn complete_and_notify<S: Storage, W: AsyncWrite + Unpin>(
+async fn complete_and_notify<S: Storage>(
     inner: &Arc<Mutex<ConnectionInner<S>>>,
     folder: &S::Folder,
     name: &str,
     version: Option<&crate::proto::bep::Vector>,
-    writer: &mut W,
-    ctx: &ConnectionContext<'_>,
+    writer: &MessageWriter,
+    ctx: &ConnectionContext,
 ) -> Result<()> {
     if let Some(fi) = maybe_complete_file(inner, folder, name, version, ctx).await? {
         let seq = fi.sequence;
-        send_typed_message(
-            writer,
-            MessageType::IndexUpdate,
-            &IndexUpdate {
-                folder: folder.id().to_string(),
-                files: vec![fi],
-                last_sequence: seq,
-                prev_sequence: 0,
-            },
-        )
-        .await?;
+        writer
+            .send(
+                MessageType::IndexUpdate,
+                &IndexUpdate {
+                    folder: folder.id().to_string(),
+                    files: vec![fi],
+                    last_sequence: seq,
+                    prev_sequence: 0,
+                },
+            )
+            .await?;
     }
     Ok(())
 }
@@ -917,32 +1305,30 @@ async fn maybe_complete_file<S: Storage>(
     folder: &S::Folder,
     name: &str,
     version: Option<&crate::proto::bep::Vector>,
-    ctx: &ConnectionContext<'_>,
+    ctx: &ConnectionContext,
 ) -> Result<Option<FileInfo>> {
     let should_complete = {
         let conn = inner.lock();
         let folder_id = folder.id();
-        let has_pending = conn
+        !conn
             .pending_requests
             .values()
-            .any(|p| p.folder.id() == folder_id && p.name == name);
-        let has_deferred = conn
-            .deferred_blocks
-            .iter()
-            .any(|d| d.block.folder.id() == folder_id && d.block.name == name);
-        !has_pending && !has_deferred
+            .any(|p| p.folder.id() == folder_id && p.name == name)
+            && !conn
+                .deferred_blocks
+                .iter()
+                .any(|d| d.block.folder.id() == folder_id && d.block.name == name)
     };
-
-    if should_complete {
-        let committed = ctx
-            .retry("complete_file", || folder.complete_file(name, version))
-            .await?;
-        if committed.is_some() {
-            tracing::info!(folder = %folder.id(), file = %name, "file transfer complete, promoted to index");
-        }
-        return Ok(committed);
+    if !should_complete {
+        return Ok(None);
     }
-    Ok(None)
+    let committed = ctx
+        .retry("complete_file", || folder.complete_file(name, version))
+        .await?;
+    if committed.is_some() {
+        tracing::info!(folder_id = %folder.id(), file = %name, "file transfer complete, promoted to index");
+    }
+    Ok(committed)
 }
 
 /// Submit a single block `Request` to the peer, or defer it if the pipeline
@@ -954,23 +1340,22 @@ async fn maybe_complete_file<S: Storage>(
 /// If `pending_requests` is at `max_pending_requests`, pushes a
 /// `DeferredRequest` onto the back of `deferred_blocks` instead. The deferred
 /// queue is drained from the front by `drain_deferred` as responses come in.
-async fn submit_or_defer_block<S, W>(
+async fn submit_or_defer_block<S>(
     inner: &Arc<Mutex<ConnectionInner<S>>>,
-    writer: &mut W,
+    writer: &MessageWriter,
     block: FileBlock<S::Folder>,
     size: i32,
     block_no: i32,
 ) -> Result<()>
 where
     S: Storage,
-    W: AsyncWrite + Unpin,
 {
     let request = {
         let mut conn = inner.lock();
 
         if conn.pending_requests.len() >= conn.max_pending_requests {
             tracing::debug!(
-                folder = %block.folder.id(),
+                folder_id = %block.folder.id(),
                 file = %block.name,
                 block_no,
                 max = conn.max_pending_requests,
@@ -999,13 +1384,13 @@ where
         req
     };
 
-    send_typed_message(writer, MessageType::Request, &request).await
+    writer.send(MessageType::Request, &request).await
 }
 
-async fn drain_deferred<S: Storage, W: AsyncWrite + Unpin>(
+async fn drain_deferred<S: Storage>(
     inner: &Arc<Mutex<ConnectionInner<S>>>,
-    writer: &mut W,
-    ctx: &ConnectionContext<'_>,
+    writer: &MessageWriter,
+    ctx: &ConnectionContext,
 ) -> Result<()> {
     loop {
         let deferred = {
@@ -1034,7 +1419,7 @@ async fn drain_deferred<S: Storage, W: AsyncWrite + Unpin>(
 
         if reused {
             tracing::debug!(
-                folder = %deferred.block.folder.id(),
+                folder_id = %deferred.block.folder.id(),
                 file = %deferred.block.name,
                 block_no = deferred.block_no,
                 "deferred block already present, skipping"
@@ -1068,14 +1453,14 @@ async fn drain_deferred<S: Storage, W: AsyncWrite + Unpin>(
 }
 
 #[tracing::instrument(level = "debug", skip(inner, writer, folder, ctx, file), fields(file = %file.name), err)]
-async fn request_blocks<S: Storage, W: AsyncWrite + Unpin>(
+async fn request_blocks<S: Storage>(
     inner: &Arc<Mutex<ConnectionInner<S>>>,
-    writer: &mut W,
+    writer: &MessageWriter,
     folder: &S::Folder,
     file: &FileInfo,
-    ctx: &ConnectionContext<'_>,
+    ctx: &ConnectionContext,
 ) -> Result<()> {
-    tracing::debug!(file = %file.name, total_blocks = file.blocks.len(), "requesting blocks");
+    tracing::debug!(total_blocks = file.blocks.len(), "requesting blocks");
     for (i, block) in file.blocks.iter().enumerate() {
         // Skip if we already have this block (e.g. from a rename/move).
         let reused = ctx
@@ -1083,10 +1468,10 @@ async fn request_blocks<S: Storage, W: AsyncWrite + Unpin>(
                 folder.reuse_block(&file.name, block.offset, &block.hash, block.size)
             })
             .await?;
-        tracing::debug!(file = %file.name, block_no = i, reused, "reuse_block");
+        tracing::debug!(block_no = i, reused, "reuse_block");
         if reused {
             tracing::debug!(
-                folder = %folder.id(), file = %file.name, block_no = i,
+                folder_id = %folder.id(), block_no = i,
                 "block already present, skipping request"
             );
             continue;
@@ -1109,19 +1494,6 @@ async fn request_blocks<S: Storage, W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn send_typed_message<W: AsyncWrite + Unpin, M: Message>(
-    writer: &mut W,
-    msg_type: MessageType,
-    msg: &M,
-) -> Result<()> {
-    let header = Header {
-        r#type: msg_type as i32,
-        compression: MessageCompression::None as i32,
-    };
-    let body = msg.encode_to_vec();
-    framing::write_message(writer, &header, &body, false).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1130,5 +1502,19 @@ mod tests {
     fn close_reason_debug() {
         let r = CloseReason::Local;
         assert!(format!("{r:?}").contains("Local"));
+    }
+
+    #[tokio::test]
+    async fn message_writer_send_returns_writer_closed_when_channel_is_closed() {
+        let (tx, rx) = byte_budget_channel(1, 1024);
+        let writer = MessageWriter { tx };
+
+        // Drop the receiver to close the channel
+        drop(rx);
+
+        let msg = Ping {};
+        let res = writer.send(MessageType::Ping, &msg).await;
+
+        assert!(matches!(res, Err(BepError::WriterClosed)));
     }
 }

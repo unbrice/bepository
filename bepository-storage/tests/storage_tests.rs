@@ -507,3 +507,96 @@ async fn object_store_list_error_propagates_as_transient_io() {
         "List error should map to TransientIo, got: {result:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// New tests: seq-at-stage-time invariants
+// ---------------------------------------------------------------------------
+
+/// Concurrent complete_file calls on the same staged file must produce a
+/// consistent committed state: exactly one seq_key, all callers that return
+/// Some(_) carry the same sequence number.
+#[tokio::test]
+async fn concurrent_complete_is_consistent() {
+    let (_storage, folder) = setup_folder("concurrent").await;
+    let file = make_file("concur.txt", &[(1, 1)], false);
+
+    folder.apply_update(&file, &REMOTE_DEV).await.unwrap();
+
+    // Fire 8 concurrent complete_file calls.
+    let n = 8usize;
+    let mut handles = Vec::with_capacity(n);
+    for _ in 0..n {
+        let folder = folder.clone();
+        let ver = file.version.clone();
+        handles.push(tokio::spawn(async move {
+            folder
+                .complete_file("concur.txt", ver.as_ref())
+                .await
+                .expect("complete_file must not error")
+        }));
+    }
+    let results: Vec<Option<_>> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.expect("task panicked"))
+        .collect();
+
+    // Collect all sequences returned by Some(_) results.
+    let seqs: Vec<i64> = results
+        .iter()
+        .filter_map(|r| r.as_ref())
+        .map(|fi| fi.sequence)
+        .collect();
+
+    // At least one caller must have committed.
+    assert!(!seqs.is_empty(), "at least one caller should return Some");
+
+    // All Some(_) results must carry the same sequence.
+    let first_seq = seqs[0];
+    for &s in &seqs {
+        assert_eq!(s, first_seq, "all successful callers must return same seq");
+    }
+
+    // The committed file must be visible.
+    let committed = folder.get_file("concur.txt").await.unwrap();
+    assert_eq!(committed.sequence, first_seq);
+}
+
+/// Stage v1, then stage v2 (overwriting v1 in inbox) without completing v1.
+/// Completing v1 must be a no-op and v2 must commit cleanly at the next seq.
+#[tokio::test]
+async fn restage_overwrites_inbox_and_v1_complete_is_noop() {
+    let (_storage, folder) = setup_folder("restage").await;
+    let v1 = make_file("gap.txt", &[(1, 1)], false);
+    let v2 = make_file("gap.txt", &[(1, 2)], false);
+
+    folder.apply_update(&v1, &REMOTE_DEV).await.unwrap();
+
+    let epoch = folder.epoch().unwrap();
+    let v1_staged = folder.get_inbox_file(epoch, "gap.txt").await;
+    assert!(v1_staged.is_some(), "v1 should be staged");
+
+    // v2 arrives — overwrites the inbox entry.
+    folder.apply_update(&v2, &REMOTE_DEV).await.unwrap();
+
+    // Completing v1 must be a no-op because inbox now holds v2.
+    let v1_result = folder
+        .complete_file("gap.txt", v1.version.as_ref())
+        .await
+        .unwrap();
+    assert!(v1_result.is_none(), "completing stale v1 must be a no-op");
+
+    // Completing v2 must succeed.
+    let v2_result = folder
+        .complete_file("gap.txt", v2.version.as_ref())
+        .await
+        .unwrap()
+        .expect("v2 must commit");
+
+    let v2_seq = v2_result.sequence;
+    assert!(v2_seq > 0, "v2 must have a positive sequence");
+
+    let committed = folder.get_file("gap.txt").await.unwrap();
+    assert_eq!(committed.version, v2.version);
+    assert_eq!(committed.sequence, v2_seq);
+}

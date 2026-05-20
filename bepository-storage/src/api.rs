@@ -1212,6 +1212,24 @@ impl StorageInspectorForTests for SlateFolder {
 }
 
 impl SlateFolder {
+    /// Write raw bytes to a key in the underlying DB. For testing only.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn put_raw(&self, key: Vec<u8>, value: Vec<u8>) {
+        use slatedb::config::PutOptions;
+        use slatedb::config::WriteOptions;
+        self.store
+            .db
+            .put_with_options(key, value, &PutOptions::default(), &WriteOptions::default())
+            .await
+            .expect("put_raw");
+    }
+
+    /// Return the current epoch (test helper).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn epoch(&self) -> Option<bepository_lock::Epoch> {
+        self.epoch
+    }
+
     fn require_epoch(&self) -> Result<Epoch, StorageError> {
         self.epoch.ok_or_else(|| {
             StorageError::Standby("epoch not set: call activate() before this operation".into())
