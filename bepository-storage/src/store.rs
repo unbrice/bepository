@@ -444,24 +444,6 @@ impl FolderStore {
         Ok(count)
     }
 
-    /// Return all inbox entries for a specific epoch.
-    pub async fn inbox_files(&self, epoch: Epoch) -> Result<Vec<FileInfo>, StorageError> {
-        let prefix = store_keys::inbox_key(epoch, "");
-        let mut iter = self.db.scan_prefix(&prefix).await.map_err(slate_err)?;
-
-        let mut files = Vec::new();
-        while let Some(kv) = iter.next().await.map_err(slate_err)? {
-            let inbox_entry = Inbox::decode(kv.value)
-                .map_err(|e| StorageError::Corruption(format!("decode inbox Inbox: {e}")))?;
-            let fi = inbox_entry
-                .file_info
-                .ok_or_else(|| StorageError::Corruption("missing file_info in Inbox".into()))?
-                .try_into()?;
-            files.push(fi);
-        }
-        Ok(files)
-    }
-
     /// Return a specific inbox entry.
     #[cfg(any(test, feature = "test-utils"))]
     pub async fn get_inbox_file(
