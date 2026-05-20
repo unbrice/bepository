@@ -262,7 +262,8 @@ impl SlateStorage {
 
         let mut builder =
             DbReaderBuilder::new(folder_sk.to_string(), self.inner.object_store.clone())
-                .with_checkpoint_id(id);
+                .with_checkpoint_id(id)
+                .with_filter_policies(crate::store_keys::make_filter_policies());
         if let Some(cache) = db_cache {
             builder = builder.with_db_cache(cache);
         }
@@ -925,16 +926,25 @@ impl Activated {
 
         let mut compactor_builder = CompactorBuilder::new(path.clone(), self.object_store.clone())
             .with_runtime(self.runtime.clone())
-            .with_compaction_filter_supplier(supplier);
+            .with_compaction_filter_supplier(supplier)
+            .with_filter_policies(crate::store_keys::make_filter_policies());
         if full_compaction {
             compactor_builder = compactor_builder
                 .with_scheduler_supplier(Arc::new(FullCompactionSchedulerSupplier));
         }
 
+        // Shorten poll interval for one-shot compaction so the scheduler
+        // triggers within ~1s instead of the 60s default.
+        let mut settings = make_db_settings();
+        if full_compaction && let Some(c) = settings.compactor_options.as_mut() {
+            c.poll_interval = Duration::from_secs(1);
+        }
+
         let db = Db::builder(path.clone(), self.object_store.clone())
             .with_gc_runtime(self.runtime.clone())
             .with_db_cache(db_cache)
-            .with_settings(make_db_settings())
+            .with_settings(settings)
+            .with_filter_policies(crate::store_keys::make_filter_policies())
             .with_compactor_builder(compactor_builder)
             .build()
             .await
@@ -1034,7 +1044,31 @@ impl Activated {
 
         let store = self.open_folder_store(sk.as_str(), true).await?;
 
-        // Closing flushes the memtable and waits for the compactor to finish.
+        // Db::close() cancels background tasks. Wait for L0 to drain before
+        // closing to ensure the compaction isn't aborted mid-upload.
+        //
+        // TODO: Polling L0 emptiness is a proxy for compaction completion.
+        // Replace with a proper completion signal once SlateDB exposes one.
+        let admin = AdminBuilder::new(sk.to_string(), self.object_store.clone()).build();
+        let timeout = Duration::from_secs(3600);
+        let start = std::time::Instant::now();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        loop {
+            let view = admin
+                .read_compactor_state_view()
+                .await
+                .map_err(|e| StorageError::TransientIo(format!("read compactor state: {e}")))?;
+            if view.manifest().l0().is_empty() {
+                break;
+            }
+            if start.elapsed() > timeout {
+                return Err(StorageError::TransientIo(
+                    "compaction timed out after 1h".into(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+
         store.close().await?;
         Ok(())
     }
@@ -1391,36 +1425,44 @@ async fn make_block_cache(cache_dir: Option<PathBuf>) -> Arc<dyn DbCache> {
 
 /// Creates per-folder SlateDB settings for cold/archival workloads.
 ///
-/// Tuned for battery efficiency: fewer wakeups, serialized I/O, and longer
-/// intervals between polls and flushes. `max_unflushed_bytes` stays at 4 MiB
-/// so individual flush uploads remain bounded (avoids timeouts on large files).
+/// Optimized for slow (≥10 Mbps) uplinks with a 60s compactor cadence.
+///
+/// Background:
+/// - `l0_sst_size_bytes`: Bounds foreground stall duration (stall = size / speed).
+/// - `max_unflushed_bytes`: Burst capacity before back-pressure pauses the writer.
 fn make_db_settings() -> Settings {
     Settings {
-        // WAL flush: 60s instead of 100ms default. The 4 MiB unflushed-bytes
-        // cap still triggers size-based flushes for large file ingestion.
+        // WAL flush interval. Size-based flush still fires at `l0_sst_size_bytes`.
         flush_interval: Some(Duration::from_secs(60)),
-        // Backpressure threshold: keeps individual L0 SST uploads small so
-        // large file ingestion never blocks for longer than a single ~4 MiB
-        // upload on a slow connection.
-        max_unflushed_bytes: 4 * 1024 * 1024,
-        // Single-writer setup: no need to detect remote manifest changes often.
+        // Memtable freeze threshold. Sized to 8 MiB.
+        l0_sst_size_bytes: 8 * 1024 * 1024,
+        // Memory ceiling for frozen memtables. Allows ~8 memtables in flight (64 MiB).
+        max_unflushed_bytes: 64 * 1024 * 1024,
+        // Manifest poll interval. Long to minimize battery/request costs.
         manifest_poll_interval: Duration::from_secs(120),
-        // Serialize L0 SST uploads to avoid CPU/radio bursts. Cold storage
-        // doesn't need flush throughput.
+        // Serializes L0 flushes to avoid bandwidth contention and timeouts on slow links.
         l0_flush_parallelism: 1,
-        // More L0 headroom: with slower compaction polling the L0 backlog can
-        // grow before compaction catches up, so raise the stall threshold.
-        l0_max_ssts: 16,
+        // Back-pressure threshold. Caps L0 at 64 MiB. Higher values increase
+        // burst capacity but slow down `read_dir` scans on `n/` keys.
+        l0_max_ssts: 64,
         compactor_options: Some(CompactorOptions {
-            // Wake up 12x less often to check whether compaction is needed.
+            // Battery floor: each tick triggers a GCS manifest GET that keeps
+            // the radio awake even when there is nothing to compact.
             poll_interval: Duration::from_secs(60),
-            // Serial compaction: halves CPU burst, fine for cold/archival use.
+            // Serial compaction: bounds CPU and network bursts. Fine for
+            // cold/archival; L0 headroom above absorbs flushes that arrive
+            // during a compaction cycle.
             max_concurrent_compactions: 1,
-            // Fewer parallel fetch tasks reduces network bursts during compaction.
+            // Bound parallel L0 fetches during compaction. Two is enough to
+            // overlap download with merge work without saturating the link.
             max_fetch_tasks: 2,
-            // 64 MiB SSTs upload in ~51s at 10 Mbps upload.
-            // Default 256 MiB would take 3+ minutes on the same connection.
-            max_sst_size: 64 * 1024 * 1024,
+            // L1+ output chunk size. Compactor uploads are background work,
+            // so per-SST upload time only affects compaction wall-clock, not
+            // writer latency — pick the largest size that still completes
+            // each upload within a single GCS retry window on the slow link
+            // (~107 s @ 10 Mbps; ~11 s @ 100 Mbps). The 256 MiB default
+            // exceeds 3 min on a slow link and risks transient timeouts.
+            max_sst_size: 128 * 1024 * 1024,
             ..CompactorOptions::default()
         }),
         ..Default::default()

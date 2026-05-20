@@ -14,6 +14,11 @@
 //!   dx/<devid_32>                     — remote device index state
 //!   in/<epoch_base32>/<dir>//<basename> — inbox staging area
 
+use std::sync::Arc;
+
+use bytes::Bytes;
+use slatedb::{BloomFilterPolicy, FilterPolicy, PrefixExtractor, PrefixTarget};
+
 use bepository_bep::error::StorageError;
 
 /// Hash length in bytes (SHA-256).
@@ -138,6 +143,50 @@ pub fn block_ref_key(dir: &str, hash: &[u8; HASH_LEN]) -> Vec<u8> {
     key.extend_from_slice(hash);
     key.extend_from_slice(b"/ref");
     key
+}
+
+/// Length of the bloom-filter prefix extracted from `br/` keys: the literal
+/// `br/` plus the full 32-byte hash. Lets `scan_prefix(br/<hash>/...)` consult
+/// the per-SST bloom filter — without it, prefix scans would have to fetch
+/// each candidate SST's index block to test membership, which is the hot path
+/// during initial sync where most lookups return empty.
+const BR_FILTER_PREFIX_LEN: usize = BLOCK_REV_PREFIX.len() + HASH_LEN;
+
+/// Filter extractor that hashes the `br/<hash>` prefix of every reverse-ref
+/// key into the bloom filter. Keys outside the `br/` family return `None` and
+/// are not added to the prefix filter; they remain covered by point-key
+/// filtering via `with_whole_key_filtering(true)`.
+#[derive(Debug, Default)]
+pub struct BrPrefixExtractor;
+
+impl PrefixExtractor for BrPrefixExtractor {
+    fn name(&self) -> &str {
+        "bep-br-35"
+    }
+
+    fn prefix_len(&self, target: &PrefixTarget) -> Option<usize> {
+        let bytes: &Bytes = match target {
+            PrefixTarget::Point(b) | PrefixTarget::Prefix(b) => b,
+        };
+        (bytes.len() >= BR_FILTER_PREFIX_LEN && bytes.starts_with(BLOCK_REV_PREFIX))
+            .then_some(BR_FILTER_PREFIX_LEN)
+    }
+}
+
+/// Filter policies for SSTs. These must match across writer and reader components.
+///
+/// Registers both whole-key and prefix-aware bloom filters. SlateDB selects the
+/// policy by name; keeping both ensures that SSTs written with either policy
+/// remain decodable without falling back to expensive index fetches.
+///
+/// 1. `BloomFilterPolicy::new(10)`: Default whole-key bloom (`_bf`).
+/// 2. `BloomFilterPolicy` + `BrPrefixExtractor`: Accelerates `scan_prefix("br/<hash>/")`.
+#[must_use]
+pub fn make_filter_policies() -> Vec<Arc<dyn FilterPolicy>> {
+    vec![
+        Arc::new(BloomFilterPolicy::new(10)),
+        Arc::new(BloomFilterPolicy::new(10).with_prefix_extractor(Arc::new(BrPrefixExtractor))),
+    ]
 }
 
 // --- Block reverse ref key: br/<hash_32>/<dir>//<basename> ---

@@ -624,7 +624,6 @@ impl FolderStore {
         while let Some(kv) = iter.next().await.map_err(slate_err)? {
             if let Some((_hash, name)) = store_keys::parse_block_reverse_key(&kv.key) {
                 let dir = store_keys::dirname(&name).to_string();
-                // Verify canonical data actually exists at this directory.
                 let data_key = store_keys::block_data_key(&dir, hash);
                 if self.db.get(&data_key).await.map_err(slate_err)?.is_some() {
                     return Ok(Some(dir));
