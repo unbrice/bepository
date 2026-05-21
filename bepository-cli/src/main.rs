@@ -85,7 +85,7 @@ impl CacheProvider for CacheArgs {
 #[derive(clap::Args)]
 struct StorageCli {
     /// The path or URI to the SlateDB storage (e.g., s3://bucket/path, file:///tmp/sync).
-    #[arg(env = "BEPOSITORY_STORAGE_URI")]
+    #[arg(long, short = 's', env = "BEPOSITORY_STORAGE_URI")]
     storage_uri: String,
     #[command(flatten)]
     cache: CacheArgs,
@@ -114,18 +114,19 @@ enum Commands {
     /// on an already-initialized store is a no-op.
     /// Acquires the distributed lock to prevent races with serve.
     ///
-    /// Example: bepository init s3://my-bucket/backup
+    /// Example: bepository init -s s3://my-bucket/backup
     Init {
         #[command(flatten)]
         storage: StorageCli,
     },
-    /// Placeholder for future folder removal.
+    /// Permanently remove a folder and its data from storage.
     ///
-    /// Acquires the distributed lock but does not yet remove data.
+    /// Acquires the distributed lock and recursively deletes all object store
+    /// keys associated with the folder.
     RemoveFolder {
         #[command(flatten)]
         storage: StorageCli,
-        /// The folder label to remove.
+        /// The folder ID to remove (as shown in Syncthing).
         folder: String,
     },
     /// Retrieves the Device ID of this bepository instance.
@@ -139,7 +140,7 @@ enum Commands {
     ///
     /// Automatically accepts and registers all folders proposed by the peer.
     ///
-    /// Example: bepository serve s3://my-bucket/backup L773...
+    /// Example: bepository serve -s s3://my-bucket/backup L773...
     Serve {
         #[command(flatten)]
         storage: StorageCli,
@@ -163,9 +164,9 @@ enum Commands {
     /// in-memory storage does not persist checkpoints across restarts.
     ///
     /// Examples:
-    ///   bepository checkpoint s3://bucket/path every 1h ttl 7d
-    ///   bepository checkpoint s3://bucket/path every 1h remove
-    ///   bepository checkpoint s3://bucket/path list
+    ///   bepository checkpoint -s s3://bucket/path every 1h ttl 7d
+    ///   bepository checkpoint -s s3://bucket/path every 1h remove
+    ///   bepository checkpoint -s s3://bucket/path list
     Checkpoint {
         #[command(flatten)]
         storage: StorageCli,
@@ -224,7 +225,7 @@ enum CheckpointAction {
     /// Requires BEPOSITORY_DAV_PASSWORD to be set (non-empty). The env var is
     /// cleared from the process environment immediately after reading.
     ///
-    /// Example: BEPOSITORY_DAV_PASSWORD=secret bepository checkpoint s3://bucket/path serve 127.0.0.1:8080
+    /// Example: BEPOSITORY_DAV_PASSWORD=secret bepository checkpoint -s s3://bucket/path serve 127.0.0.1:8080
     Serve {
         /// Listen address, e.g. 127.0.0.1:8080 or 0.0.0.0:8080
         addr: String,
@@ -1026,13 +1027,17 @@ async fn cmd_remove_folder(
     runtime: tokio::runtime::Handle,
 ) -> Result<()> {
     let (store, _, db) = storage.open(false, runtime)?;
+    let folder_id = FolderId::new(&folder);
     with_admin_lock(store, &db, holder, 60, || async {
         // Verify the folder exists before claiming success.
         let folders = db.list_folders().context("failed to list folders")?;
-        if !folders.iter().any(|(id, _, _)| id.as_str() == folder) {
+        if !folders.iter().any(|(id, _, _)| *id == folder_id) {
             return Err(anyhow!("Folder '{folder}' is not registered."));
         }
-        println!("Folder '{folder}' removal is not yet implemented.");
+        db.remove_folder(folder_id)
+            .await
+            .context("failed to remove folder")?;
+        println!("Folder '{folder}' removed.");
         Ok(())
     })
     .await?;

@@ -13,6 +13,7 @@ use bytes::Bytes;
 use foyer::{
     BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCacheBuilder, PsyncIoEngineConfig,
 };
+use futures::StreamExt;
 use futures::stream::{self, Stream};
 use object_store::ObjectStore;
 use parking_lot::{Mutex, RwLock};
@@ -590,6 +591,51 @@ impl SlateStorage {
         &self,
     ) -> Result<Vec<(FolderId, FolderLabel, FolderStorageKey)>, StorageError> {
         self.activated()?.list_folders()
+    }
+
+    /// Permanently remove a folder from storage.
+    ///
+    /// This deletes all object store keys under the folder's prefix and
+    /// removes it from the metadata registry.
+    pub async fn remove_folder(&self, id: FolderId) -> Result<(), StorageError> {
+        let act = self.activated()?;
+        let (sk, _) = act.resolve_folder(id)?;
+
+        // Close and evict any cached store handle to stop background tasks.
+        {
+            let mut stores = act.stores.write().await;
+            if let Some(store) = stores.remove(sk.as_str()) {
+                store.close().await?;
+            }
+        }
+
+        // Recursively delete all objects under the folder's prefix.
+        let prefix = object_store::path::Path::from(sk.as_str());
+        let mut objects = act.object_store.list(Some(&prefix));
+        while let Some(obj) = objects.next().await {
+            let obj = obj.map_err(|e| {
+                StorageError::TransientIo(format!("list objects for deletion: {e}"))
+            })?;
+            act.object_store.delete(&obj.location).await.map_err(|e| {
+                StorageError::TransientIo(format!("delete object {}: {e}", obj.location))
+            })?;
+        }
+
+        // Remove the entry from the metadata registry.
+        self.modify_meta(|m| {
+            let key = m
+                .folders
+                .iter()
+                .find(|(_, entry)| entry.id == id)
+                .map(|(k, _)| k.clone());
+            if let Some(k) = key {
+                m.folders.remove(&k);
+            }
+            Ok(())
+        })
+        .await?;
+
+        Ok(())
     }
 
     /// Populate checkpoint schedules with defaults if none are configured.

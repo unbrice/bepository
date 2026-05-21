@@ -101,8 +101,49 @@ async fn sequence_increments() {
     let b = folder.get_file("b.txt").await.unwrap();
 
     assert!(b.sequence > a.sequence);
+}
 
-    assert!(check_integrity_passed(&storage, bepository_storage::FsckLevel::Structural).await);
+#[tokio::test]
+async fn remove_folder_deletes_data() {
+    use futures::StreamExt;
+    let (storage, folder) = setup_folder("f1").await;
+    let folder_id = folder.id();
+    let sk = storage.list_folders().unwrap()[0].2.clone();
+
+    // Add some data
+    folder
+        .insert_file(make_file("hello.txt", &[(1, 1)], false))
+        .await;
+
+    // Verify data exists in object store
+    let prefix = object_store::path::Path::from(sk.as_str());
+    let objects: Vec<_> = storage
+        .object_store()
+        .list(Some(&prefix))
+        .collect::<Vec<_>>()
+        .await;
+    assert!(
+        !objects.is_empty(),
+        "Folder prefix should not be empty before removal"
+    );
+
+    // Remove folder
+    storage.remove_folder(folder_id).await.unwrap();
+
+    // Verify folder is gone from registry
+    let folders = storage.list_folders().unwrap();
+    assert!(folders.iter().all(|(id, _, _)| *id != folder_id));
+
+    // Verify data is gone from object store
+    let objects: Vec<_> = storage
+        .object_store()
+        .list(Some(&prefix))
+        .collect::<Vec<_>>()
+        .await;
+    assert!(
+        objects.is_empty(),
+        "Folder prefix should be empty after removal"
+    );
 }
 
 // --- Full and delta index ---

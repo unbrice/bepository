@@ -25,6 +25,7 @@ fn test_cli_init_and_get_id() {
     // 1. Initial GetId should fail
     let mut cmd = Command::cargo_bin("bepository").unwrap();
     cmd.arg("get-id")
+        .arg("--storage-uri")
         .arg(&storage_uri)
         .assert()
         .failure()
@@ -33,6 +34,7 @@ fn test_cli_init_and_get_id() {
     // 2. Init should succeed
     let mut cmd = Command::cargo_bin("bepository").unwrap();
     cmd.arg("init")
+        .arg("--storage-uri")
         .arg(&storage_uri)
         .assert()
         .success()
@@ -42,6 +44,7 @@ fn test_cli_init_and_get_id() {
     // 3. GetId should now succeed
     let mut cmd = Command::cargo_bin("bepository").unwrap();
     cmd.arg("get-id")
+        .arg("--storage-uri")
         .arg(&storage_uri)
         .assert()
         .success()
@@ -55,11 +58,16 @@ fn test_cli_fsck() {
 
     // Init first
     let mut cmd = Command::cargo_bin("bepository").unwrap();
-    cmd.arg("init").arg(&storage_uri).assert().success();
+    cmd.arg("init")
+        .arg("--storage-uri")
+        .arg(&storage_uri)
+        .assert()
+        .success();
 
     // Run fsck
     let mut cmd = Command::cargo_bin("bepository").unwrap();
     cmd.arg("fsck")
+        .arg("--storage-uri")
         .arg(&storage_uri)
         .assert()
         .success()
@@ -68,6 +76,7 @@ fn test_cli_fsck() {
     // Run fsck with regenerate-id
     let mut cmd = Command::cargo_bin("bepository").unwrap();
     cmd.arg("fsck")
+        .arg("--storage-uri")
         .arg(&storage_uri)
         .arg("--regenerate-id")
         .assert()
@@ -77,6 +86,7 @@ fn test_cli_fsck() {
     // Run fsck with --compact
     let mut cmd = Command::cargo_bin("bepository").unwrap();
     cmd.arg("fsck")
+        .arg("--storage-uri")
         .arg(&storage_uri)
         .arg("--compact")
         .assert()
