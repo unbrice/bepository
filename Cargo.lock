@@ -403,7 +403,7 @@ dependencies = [
 
 [[package]]
 name = "bepository-bep"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "aliri_braid",
  "async-trait",
@@ -427,7 +427,7 @@ dependencies = [
 
 [[package]]
 name = "bepository-cli"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -462,7 +462,7 @@ dependencies = [
 
 [[package]]
 name = "bepository-dav"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "base64 0.22.1",
  "bepository-storage",
@@ -484,7 +484,7 @@ dependencies = [
 
 [[package]]
 name = "bepository-e2etest"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "bepository-harness",
  "libc",
@@ -494,7 +494,7 @@ dependencies = [
 
 [[package]]
 name = "bepository-harness"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "bepository-bep",
  "prost",
@@ -515,7 +515,7 @@ dependencies = [
 
 [[package]]
 name = "bepository-lock"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "futures",
@@ -532,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "bepository-storage"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -571,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "bepository-testserver"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "bepository-bep",
  "bepository-harness",
@@ -590,7 +590,7 @@ dependencies = [
 
 [[package]]
 name = "bepository-tls"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "bepository-bep",
  "rcgen",
