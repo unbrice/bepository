@@ -17,13 +17,13 @@ build:
     {{cargo}} build --all-features
 
 release:
-    {{cargo}} build --release --all-features
+    {{cargo}} build --release
 
 build-cli:
     {{cargo}} build --bin bepository --all-features
 
 release-cli:
-    {{cargo}} build --release --bin bepository --all-features
+    {{cargo}} build --release --bin bepository
 
 # Ensure syncthing binary is available (downloads if not in PATH and not already fetched)
 fetch-syncthing:

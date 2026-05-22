@@ -23,6 +23,7 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use uuid::Uuid;
@@ -958,24 +959,34 @@ fn init_tracing(trace_level: Option<String>) -> Result<()> {
         .with_default_directive(effective_level.parse()?)
         .from_env_lossy();
 
-    let registry = tracing_subscriber::registry().with(filter);
+    let registry = tracing_subscriber::registry();
+
+    #[cfg(feature = "tokio-console")]
+    let registry = registry.with(
+        console_subscriber::ConsoleLayer::builder()
+            .with_default_env()
+            .spawn(),
+    );
 
     if is_terminal {
-        let console_layer = tracing_subscriber::fmt::layer()
+        let terminal_layer = tracing_subscriber::fmt::layer()
             .with_ansi(true)
             .with_target(false)
-            .compact();
-        registry.with(console_layer).init();
+            .compact()
+            .with_filter(filter);
+        registry.with(terminal_layer).init();
     } else {
         match tracing_journald::layer() {
             Ok(journald_layer) => {
+                let journald_layer = journald_layer.with_filter(filter);
                 registry.with(journald_layer).init();
             }
             Err(e) => {
                 eprintln!("Failed to connect to journald: {e}. Falling back to stderr.");
                 let fallback_layer = tracing_subscriber::fmt::layer()
                     .with_ansi(false)
-                    .with_writer(std::io::stderr);
+                    .with_writer(std::io::stderr)
+                    .with_filter(filter);
                 registry.with(fallback_layer).init();
             }
         }
