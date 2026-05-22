@@ -7,7 +7,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use object_store::memory::InMemory;
 
-use bepository_bep::proto::bep::BlockInfo;
+use bepository_bep::proto::bep::{BlockInfo, Counter, FileInfo, Vector};
 use bepository_bep::storage::{
     Sequence, Storage, StorageFolder, StorageInspectorForTests, UpdateResult,
 };
@@ -28,6 +28,36 @@ async fn make_storage() -> SlateStorage {
         .await
         .unwrap();
     s
+}
+
+pub fn make_file_with_blocks_of_size(
+    name: &str,
+    counters: &[(u64, u64)],
+    block_hashes: &[[u8; 32]],
+    block_size: i32,
+) -> FileInfo {
+    FileInfo {
+        name: name.into(),
+        version: Some(Vector {
+            counters: counters
+                .iter()
+                .map(|&(id, value)| Counter { id, value })
+                .collect(),
+        }),
+        blocks: block_hashes
+            .iter()
+            .enumerate()
+            .map(|(i, hash)| BlockInfo {
+                offset: (i64::try_from(i).expect("block index overflow")) * (i64::from(block_size)),
+                size: block_size,
+                hash: hash.to_vec(),
+            })
+            .collect(),
+        block_size,
+        size: (i64::try_from(block_hashes.len()).expect("block count overflow"))
+            * (i64::from(block_size)),
+        ..Default::default()
+    }
 }
 
 async fn setup_folder(id: &str) -> (SlateStorage, SlateFolder) {
@@ -88,7 +118,7 @@ async fn get_missing_file() {
 
 #[tokio::test]
 async fn sequence_increments() {
-    let (storage, folder) = setup_folder("f1").await;
+    let (_storage, folder) = setup_folder("f1").await;
 
     folder
         .insert_file(make_file("a.txt", &[(1, 1)], false))
@@ -351,29 +381,39 @@ async fn block_deduplication() {
 
     // Two files sharing the same block hash.
     folder
-        .insert_file(make_file_with_blocks("photos/a.jpg", &[(1, 1)], &[hash]))
+        .insert_file(make_file_with_blocks_of_size(
+            "photos/a.jpg",
+            &[(1, 1)],
+            &[hash],
+            4096,
+        ))
         .await;
     folder
-        .insert_file(make_file_with_blocks("backup/a.jpg", &[(1, 1)], &[hash]))
+        .insert_file(make_file_with_blocks_of_size(
+            "backup/a.jpg",
+            &[(1, 1)],
+            &[hash],
+            4096,
+        ))
         .await;
 
-    let data = Bytes::from_static(b"shared block data");
+    let data = Bytes::from(vec![0xEE; 4096]);
     folder.insert_block("photos/a.jpg", 0, data.clone()).await;
 
     // Both should be readable. For the second file, the engine would call `reuse_block`.
     assert!(
         folder
-            .reuse_block("backup/a.jpg", 0, &hash, 1024)
+            .reuse_block("backup/a.jpg", 0, &hash, 4096)
             .await
             .unwrap()
     );
 
     let read1 = folder
-        .read_block("photos/a.jpg", 0, 1024, &hash)
+        .read_block("photos/a.jpg", 0, 4096, &hash)
         .await
         .unwrap();
     let read2 = folder
-        .read_block("backup/a.jpg", 0, 1024, &hash)
+        .read_block("backup/a.jpg", 0, 4096, &hash)
         .await
         .unwrap();
     assert_eq!(read1, data);
@@ -477,14 +517,19 @@ async fn block_visibility_during_gc() {
     let hash = [0xAA; 32];
 
     folder
-        .insert_file(make_file_with_blocks("a.txt", &[(1, 1)], &[hash]))
+        .insert_file(make_file_with_blocks_of_size(
+            "a.txt",
+            &[(1, 1)],
+            &[hash],
+            4096,
+        ))
         .await;
     folder
-        .insert_block("a.txt", 0, Bytes::from_static(b"live data"))
+        .insert_block("a.txt", 0, Bytes::from(vec![0xAA; 4096]))
         .await;
 
     // Baseline: block is visible.
-    assert!(folder.has_block("a.txt", 0, &hash, 1024).await.unwrap());
+    assert!(folder.has_block("a.txt", 0, &hash, 4096).await.unwrap());
 }
 
 // ---------------------------------------------------------------------------
@@ -640,4 +685,593 @@ async fn restage_overwrites_inbox_and_v1_complete_is_noop() {
     let committed = folder.get_file("gap.txt").await.unwrap();
     assert_eq!(committed.version, v2.version);
     assert_eq!(committed.sequence, v2_seq);
+}
+
+#[tokio::test]
+async fn test_segment_extractor_compatibility_and_reopen() {
+    let object_store = Arc::new(InMemory::new());
+    let folder_id = FolderId::from("reopen-test");
+    let folder_label = FolderLabel::from("ReopenTest");
+
+    // 1. Create a storage, register folder (which initializes DB with bep-segment extractor)
+    let folder_storage_path = {
+        let s = SlateStorage::new(
+            object_store.clone(),
+            None,
+            tokio::runtime::Handle::current(),
+        );
+        s.activate(bepository_lock::Epoch::new(1).unwrap())
+            .await
+            .unwrap();
+        let sk = s.register_folder(folder_id, &folder_label).await.unwrap();
+        let path = sk.to_string();
+        // Insert a file to ensure some writes happen and manifest/SSTs are written
+        let folder = s.folder(folder_id).await.unwrap();
+        folder
+            .insert_file(make_file("hello.txt", &[(1, 1)], false))
+            .await;
+        s.close().await.unwrap();
+        path
+    };
+
+    // 2. Reopen using the same SlateStorage (which uses BepSegmentExtractor). This should succeed.
+    {
+        let s = SlateStorage::new(
+            object_store.clone(),
+            None,
+            tokio::runtime::Handle::current(),
+        );
+        s.activate(bepository_lock::Epoch::new(2).unwrap())
+            .await
+            .unwrap();
+        let folder = s.folder(folder_id).await.unwrap();
+        let stored = folder.get_file("hello.txt").await.unwrap();
+        assert_eq!(stored.name, "hello.txt");
+        s.close().await.unwrap();
+    }
+
+    // 3. Try to open the same database using a different segment extractor name.
+    // This should fail because the segment extractor name stored in the manifest is "bep-segment",
+    // and SlateDB validates this on open.
+    {
+        use slatedb::PrefixExtractor;
+        use slatedb::PrefixTarget;
+
+        #[derive(Debug, Default)]
+        struct DummyExtractor;
+
+        impl PrefixExtractor for DummyExtractor {
+            fn name(&self) -> &str {
+                "different-segment-extractor-name"
+            }
+
+            fn prefix_len(&self, target: &PrefixTarget) -> Option<usize> {
+                let bytes: &Bytes = match target {
+                    PrefixTarget::Point(b) | PrefixTarget::Prefix(b) => b,
+                };
+                (bytes.len() >= 2).then_some(2)
+            }
+        }
+
+        // Open with dummy extractor
+        let db_result = slatedb::Db::builder(folder_storage_path, object_store)
+            .with_segment_extractor(Arc::new(DummyExtractor))
+            .build()
+            .await;
+
+        let err = match db_result {
+            Ok(_) => panic!("Expected database open to fail with mismatched segment extractor"),
+            Err(e) => e,
+        };
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("segment_extractor") || err_msg.contains("extractor"),
+            "Error message should mention extractor mismatch, got: {err_msg}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_inline_block_dedup_bypass() {
+    let (_storage, folder) = setup_folder("inline-dedup-bypass").await;
+
+    let hash = [0x77; 32];
+
+    // Create two files sharing the same block hash but with tiny (inline) blocks (e.g. 100 bytes)
+    folder
+        .insert_file(make_file_with_blocks_of_size(
+            "a.txt",
+            &[(1, 1)],
+            &[hash],
+            100,
+        ))
+        .await;
+    folder
+        .insert_file(make_file_with_blocks_of_size(
+            "b.txt",
+            &[(1, 1)],
+            &[hash],
+            100,
+        ))
+        .await;
+
+    // Store block for a.txt (should inline)
+    let data = Bytes::from(vec![0x77; 100]);
+    folder.insert_block("a.txt", 0, data.clone()).await;
+
+    // Both should bypass deduplication. reuse_block for the second file should return false.
+    let reused = folder.reuse_block("b.txt", 0, &hash, 100).await.unwrap();
+    assert!(!reused, "inline block should bypass reuse_block/dedup");
+
+    // Write the block to b.txt directly
+    folder.insert_block("b.txt", 0, data.clone()).await;
+
+    // Both should be readable, and they have separate inline copies
+    let read1 = folder.read_block("a.txt", 0, 100, &hash).await.unwrap();
+    let read2 = folder.read_block("b.txt", 0, 100, &hash).await.unwrap();
+    assert_eq!(read1, data);
+    assert_eq!(read2, data);
+
+    // Verify inline block has_block queries
+    assert!(
+        folder.has_block("a.txt", 0, &hash, 100).await.unwrap(),
+        "inline block should exist in file metadata"
+    );
+    assert!(
+        folder.has_block("b.txt", 0, &hash, 100).await.unwrap(),
+        "inline block should exist in file metadata"
+    );
+
+    // Verify no reverse ref key is written for this hash in the DB (querying as a separated block)
+    assert!(
+        !folder.has_block("a.txt", 0, &hash, 4096).await.unwrap(),
+        "inline block should not have br/ row in DB"
+    );
+}
+
+#[tokio::test]
+async fn test_checkpoint_block_survival_after_compaction() {
+    use bepository_storage::snapshot::SnapshotFs;
+
+    let (storage, folder) = setup_folder("checkpoint-compaction").await;
+    let hash = [0x99; 32];
+    let file = make_file_with_blocks_of_size("photos/a.jpg", &[(1, 1)], &[hash], 4096);
+
+    folder.insert_file(file).await;
+
+    let data = Bytes::from(vec![0x99; 4096]);
+    folder.insert_block("photos/a.jpg", 0, data.clone()).await;
+
+    // Retrieve allocated blockseq from file metadata
+    let raw_val = folder
+        .get_raw(&bepository_storage::store_keys::file_key("photos/a.jpg"))
+        .await
+        .unwrap();
+    let file =
+        <bepository_storage::proto::storage::File as prost::Message>::decode(&raw_val[..]).unwrap();
+    let file_info = file.file_info.unwrap();
+    let seq = file_info.blocks[0]
+        .blockseq
+        .expect("blockseq must be allocated");
+
+    // Verify raw block data key exists in the database
+    let bd_key = bepository_storage::store_keys::block_data_seq_key(seq);
+    assert!(folder.get_raw(&bd_key).await.is_some());
+
+    // Create a checkpoint
+    storage
+        .create_checkpoints(
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+
+    // Get the snapshot reference
+    let snapshots = storage.list_snapshots().await.unwrap();
+    let snap = snapshots
+        .iter()
+        .find(|s| s.folder_label.as_str() == "LabelForcheckpoint-compaction")
+        .expect("Snapshot should exist for folder");
+
+    // Delete the file from the head index (un-reference the block)
+    let mut deleted_file = make_file_with_blocks_of_size("photos/a.jpg", &[(1, 2)], &[hash], 4096);
+    deleted_file.deleted = true;
+    deleted_file.blocks.clear();
+    deleted_file.size = 0;
+    folder.insert_file(deleted_file).await;
+
+    // Verify head has the file marked as deleted
+    assert!(folder.get_file("photos/a.jpg").await.unwrap().deleted);
+
+    // Run full compaction
+    storage.compact(folder.id()).await.unwrap();
+
+    // After compaction the active DB no longer references the orphaned
+    // bd/<seq> row, so a `get` against the active manifest returns None.
+    // The underlying data still lives in the SSTs pinned by the checkpoint's
+    // manifest and remains readable through the checkpoint reader below.
+    let _ = bd_key;
+
+    // Verify block is still readable from the checkpoint snapshot (survival via SlateDB checkpoint SST pinning)
+    let read_snap = storage
+        .read_bytes(snap, "photos/a.jpg", 0, 4096)
+        .await
+        .unwrap();
+    assert_eq!(read_snap, data);
+}
+
+#[tokio::test]
+async fn test_orphaned_block_data_dropped_after_compaction() {
+    let (storage, folder) = setup_folder("orphaned-compaction").await;
+    let hash = [0x88; 32];
+    let file = make_file_with_blocks_of_size("photos/b.jpg", &[(1, 1)], &[hash], 4096);
+
+    folder.insert_file(file).await;
+
+    let data = Bytes::from(vec![0x88; 4096]);
+    folder.insert_block("photos/b.jpg", 0, data.clone()).await;
+
+    // Retrieve allocated blockseq from file metadata
+    let raw_val = folder
+        .get_raw(&bepository_storage::store_keys::file_key("photos/b.jpg"))
+        .await
+        .unwrap();
+    let file =
+        <bepository_storage::proto::storage::File as prost::Message>::decode(&raw_val[..]).unwrap();
+    let file_info = file.file_info.unwrap();
+    let seq = file_info.blocks[0]
+        .blockseq
+        .expect("blockseq must be allocated");
+
+    // Verify raw block data key exists in the database
+    let bd_key = bepository_storage::store_keys::block_data_seq_key(seq);
+    assert!(folder.get_raw(&bd_key).await.is_some());
+
+    // Delete the file from the head index (un-reference the block)
+    let mut deleted_file = make_file_with_blocks_of_size("photos/b.jpg", &[(1, 2)], &[hash], 4096);
+    deleted_file.deleted = true;
+    deleted_file.blocks.clear();
+    deleted_file.size = 0;
+    folder.insert_file(deleted_file).await;
+
+    // Run full compaction (no checkpoints exist, so the orphaned block should be dropped)
+    storage.compact(folder.id()).await.unwrap();
+    let folder = storage.folder(folder.id()).await.unwrap();
+
+    // The raw block data key must be physically deleted from the database
+    assert!(folder.get_raw(&bd_key).await.is_none());
+}
+
+#[tokio::test]
+async fn block_roundtrip_various_sizes() {
+    let (_storage, folder) = setup_folder("roundtrip-sizes").await;
+
+    let test_cases = vec![
+        ("f_1", vec![0x11; 1]),
+        ("f_4095", vec![0x22; 4095]),
+        ("f_4096", vec![0x33; 4096]),
+        ("f_128k", vec![0x44; 128 * 1024]),
+        ("f_1m", vec![0x55; 1024 * 1024]),
+    ];
+
+    for (name, data) in &test_cases {
+        use sha2::{Digest, Sha256};
+        let hash = Sha256::digest(data);
+        let block_size = i32::try_from(data.len()).unwrap();
+        let hash_arr: [u8; 32] = hash.as_slice().try_into().unwrap();
+
+        let file = make_file_with_blocks_of_size(name, &[(1, 1)], &[hash_arr], block_size);
+        folder.insert_file(file).await;
+
+        let bytes_data = Bytes::from(data.clone());
+        folder.insert_block(name, 0, bytes_data.clone()).await;
+
+        // Verify read_block works.
+        let read = folder
+            .read_block(name, 0, block_size, &hash_arr)
+            .await
+            .unwrap();
+        assert_eq!(read, bytes_data);
+
+        // Fetch raw File from database.
+        let raw_val = folder
+            .get_raw(&bepository_storage::store_keys::file_key(name))
+            .await
+            .unwrap();
+        let file_proto =
+            <bepository_storage::proto::storage::File as prost::Message>::decode(&raw_val[..])
+                .unwrap();
+        let file_info = file_proto.file_info.unwrap();
+        let block_info = &file_info.blocks[0];
+
+        let dir = bepository_storage::store_keys::dirname(name);
+        let bd_key = block_info
+            .blockseq
+            .map(bepository_storage::store_keys::block_data_seq_key);
+        let b_key = bepository_storage::store_keys::block_pointer_key(dir, &hash_arr);
+        let br_key = bepository_storage::store_keys::block_reverse_key(&hash_arr, name);
+
+        if data.len() < 4096 {
+            // Inline block
+            assert_eq!(block_info.inline_data.as_ref().unwrap(), data);
+            assert!(block_info.blockseq.is_none());
+            // No bd/, b/, or br/ rows should exist.
+            if let Some(ref k) = bd_key {
+                assert!(folder.get_raw(k).await.is_none());
+            }
+            assert!(folder.get_raw(&b_key).await.is_none());
+            assert!(folder.get_raw(&br_key).await.is_none());
+        } else {
+            // Separated block
+            assert!(block_info.inline_data.is_none());
+            let seq = block_info.blockseq.unwrap();
+            assert!(seq >= 1024);
+            // bd/, b/, and br/ rows should exist.
+            let db_data = folder.get_raw(bd_key.as_ref().unwrap()).await.unwrap();
+            assert_eq!(db_data, *data);
+            assert!(folder.get_raw(&b_key).await.is_some());
+            assert!(folder.get_raw(&br_key).await.is_some());
+        }
+    }
+}
+
+#[tokio::test]
+async fn blockseq_stable_across_compaction() {
+    let (storage, folder) = setup_folder("blockseq-stability").await;
+    let hash = [0x55; 32];
+    let file = make_file_with_blocks_of_size("stable.txt", &[(1, 1)], &[hash], 4096);
+    folder.insert_file(file).await;
+
+    let data = Bytes::from(vec![0x55; 4096]);
+    folder.insert_block("stable.txt", 0, data.clone()).await;
+
+    // Get blockseq
+    let raw_val = folder
+        .get_raw(&bepository_storage::store_keys::file_key("stable.txt"))
+        .await
+        .unwrap();
+    let file_proto =
+        <bepository_storage::proto::storage::File as prost::Message>::decode(&raw_val[..]).unwrap();
+    let file_info = file_proto.file_info.unwrap();
+    let seq = file_info.blocks[0].blockseq.expect("must have blockseq");
+
+    let bd_key = bepository_storage::store_keys::block_data_seq_key(seq);
+    let original_db_data = folder.get_raw(&bd_key).await.unwrap();
+    assert_eq!(original_db_data, data);
+
+    // Force compaction
+    storage.compact(folder.id()).await.unwrap();
+    let folder = storage.folder(folder.id()).await.unwrap();
+
+    // Confirm bd/<seq> resolves to the same value
+    let post_compaction_db_data = folder.get_raw(&bd_key).await.unwrap();
+    assert_eq!(post_compaction_db_data, data);
+
+    // Confirm reading the block still works
+    let read = folder
+        .read_block("stable.txt", 0, 4096, &hash)
+        .await
+        .unwrap();
+    assert_eq!(read, data);
+}
+
+#[tokio::test]
+async fn inline_block_survives_compaction_intact() {
+    let (storage, folder) = setup_folder("inline-survives-compaction").await;
+
+    // A block of size 5000 (which is >= 4096 and would normally be separated).
+    // We manually construct it as inline in FileInfo.
+    let data = vec![0x66; 5000];
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(&data);
+    let hash_arr: [u8; 32] = hash.as_slice().try_into().unwrap();
+
+    let file_info = bepository_storage::proto::storage::FileInfo {
+        name: "frozen.txt".into(),
+        size: 5000,
+        blocks: vec![bepository_storage::proto::storage::BlockInfo {
+            hash: hash_arr.to_vec(),
+            offset: 0,
+            size: 5000,
+            inline_data: Some(data.clone()),
+            blockseq: None,
+        }],
+        block_size: 5000,
+        sequence: 1,
+        ..Default::default()
+    };
+
+    let file_proto = bepository_storage::proto::storage::File {
+        file_info: Some(file_info),
+    };
+
+    // Manually write file metadata to DB.
+    let file_key = bepository_storage::store_keys::file_key("frozen.txt");
+    folder
+        .put_raw(file_key.clone(), prost::Message::encode_to_vec(&file_proto))
+        .await;
+
+    // Verify it can be read back using read_block.
+    let read = folder
+        .read_block("frozen.txt", 0, 5000, &hash_arr)
+        .await
+        .unwrap();
+    assert_eq!(read, data);
+
+    // Force compaction.
+    storage.compact(folder.id()).await.unwrap();
+    let folder = storage.folder(folder.id()).await.unwrap();
+
+    // Verify metadata still has inline_data and no blockseq.
+    let raw_val = folder.get_raw(&file_key).await.unwrap();
+    let read_file_proto =
+        <bepository_storage::proto::storage::File as prost::Message>::decode(&raw_val[..]).unwrap();
+    let read_file_info = read_file_proto.file_info.unwrap();
+    let read_block_info = &read_file_info.blocks[0];
+
+    assert_eq!(read_block_info.inline_data.as_ref().unwrap(), &data);
+    assert!(read_block_info.blockseq.is_none());
+
+    // Verify it can still be read back.
+    let read_post = folder
+        .read_block("frozen.txt", 0, 5000, &hash_arr)
+        .await
+        .unwrap();
+    assert_eq!(read_post, data);
+}
+
+#[tokio::test]
+async fn crash_before_flush_leaves_no_orphans() {
+    let object_store = Arc::new(object_store::memory::InMemory::new());
+    let folder_id = FolderId::from("crash-test");
+    let folder_label = FolderLabel::from("CrashTest");
+
+    let hash = [0x77; 32];
+    let data = Bytes::from(vec![0x77; 4096]);
+
+    let seq = {
+        // 1. Activate storage at Epoch 1.
+        let s = SlateStorage::new(
+            object_store.clone(),
+            None,
+            tokio::runtime::Handle::current(),
+        );
+        s.activate(bepository_lock::Epoch::new(1).unwrap())
+            .await
+            .unwrap();
+        s.register_folder(folder_id, &folder_label).await.unwrap();
+        let folder = s.folder(folder_id).await.unwrap();
+
+        // Stage file in the inbox.
+        let file = make_file_with_blocks_of_size("crash.txt", &[(1, 1)], &[hash], 4096);
+        folder.apply_update(&file, &REMOTE_DEV).await.unwrap();
+
+        // Write the block. This allocates a seqno and writes bd/<seqno> + b/ + br/
+        folder.insert_block("crash.txt", 0, data.clone()).await;
+
+        // Retrieve the seqno.
+        let epoch = folder.epoch().unwrap();
+        let inbox_key = bepository_storage::store_keys::inbox_key(epoch, "crash.txt");
+        let raw_inbox = folder.get_raw(&inbox_key).await.unwrap();
+        let inbox =
+            <bepository_storage::proto::storage::Inbox as prost::Message>::decode(&raw_inbox[..])
+                .unwrap();
+        let staged = inbox.file_info.unwrap();
+        let seq = staged.blocks[0].blockseq.expect("must have blockseq");
+
+        // Verify bd/<seq> exists.
+        let bd_key = bepository_storage::store_keys::block_data_seq_key(seq);
+        assert!(folder.get_raw(&bd_key).await.is_some());
+
+        // Close storage without calling complete_file.
+        s.close().await.unwrap();
+        seq
+    };
+
+    // 2. Re-open storage at Epoch 2 (simulating restart).
+    let s = SlateStorage::new(
+        object_store.clone(),
+        None,
+        tokio::runtime::Handle::current(),
+    );
+    s.activate(bepository_lock::Epoch::new(2).unwrap())
+        .await
+        .unwrap();
+    let folder = s.folder(folder_id).await.unwrap();
+
+    // The old inbox entry is still there. We run gc_inbox to clear stale inbox entries (< Epoch 2).
+    s.gc_inbox().await.unwrap();
+
+    // Verify inbox file is gone.
+    let old_inbox_key = bepository_storage::store_keys::inbox_key(
+        bepository_lock::Epoch::new(1).unwrap(),
+        "crash.txt",
+    );
+    assert!(folder.get_raw(&old_inbox_key).await.is_none());
+
+    // Run compaction. Since no committed files reference the block, and the inbox entry was deleted,
+    // the blockseq is orphaned.
+    s.compact(folder_id).await.unwrap();
+
+    // Verify that bd/<seq> is deleted/dropped by compaction.
+    let bd_key = bepository_storage::store_keys::block_data_seq_key(seq);
+    let folder_reopened = s.folder(folder_id).await.unwrap();
+    assert!(folder_reopened.get_raw(&bd_key).await.is_none());
+
+    // Now, stage and write the block again in Epoch 2, and complete it.
+    let file = make_file_with_blocks_of_size("crash.txt", &[(1, 1)], &[hash], 4096);
+    folder_reopened
+        .apply_update(&file, &REMOTE_DEV)
+        .await
+        .unwrap();
+    folder_reopened
+        .insert_block("crash.txt", 0, data.clone())
+        .await;
+
+    folder_reopened
+        .complete_file("crash.txt", file.version.as_ref())
+        .await
+        .unwrap();
+
+    // Verify it is committed and readable.
+    let committed = folder_reopened.get_file("crash.txt").await.unwrap();
+    assert_eq!(committed.name, "crash.txt");
+    let read = folder_reopened
+        .read_block("crash.txt", 0, 4096, &hash)
+        .await
+        .unwrap();
+    assert_eq!(read, data);
+
+    s.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn inline_blocks_excluded_from_gc_liveness() {
+    let (storage, folder) = setup_folder("inline-gc-liveness").await;
+
+    // 1. Insert an inline block (hash H, size 100).
+    let hash = [0xaa; 32];
+    let data = vec![0xaa; 100];
+    let file = make_file_with_blocks_of_size("inline_file.txt", &[(1, 1)], &[hash], 100);
+    folder.insert_file(file).await;
+    folder
+        .insert_block("inline_file.txt", 0, Bytes::from(data))
+        .await;
+
+    // Confirm it's inline.
+    let raw_val = folder
+        .get_raw(&bepository_storage::store_keys::file_key("inline_file.txt"))
+        .await
+        .unwrap();
+    let file_proto =
+        <bepository_storage::proto::storage::File as prost::Message>::decode(&raw_val[..]).unwrap();
+    let file_info = file_proto.file_info.unwrap();
+    assert!(file_info.blocks[0].inline_data.is_some());
+    assert!(file_info.blocks[0].blockseq.is_none());
+
+    // 2. Manually write b/<dir>/H and br/H/... keys in the database.
+    let dir = bepository_storage::store_keys::dirname("inline_file.txt");
+    let b_key = bepository_storage::store_keys::block_pointer_key(dir, &hash);
+    let br_key = bepository_storage::store_keys::block_reverse_key(&hash, "inline_file.txt");
+
+    let block_ref = bepository_storage::proto::storage::BlockRef { seqno: 9999 };
+    folder
+        .put_raw(b_key.clone(), prost::Message::encode_to_vec(&block_ref))
+        .await;
+    folder.put_raw(br_key.clone(), Vec::new()).await;
+
+    // Verify they are present.
+    assert!(folder.get_raw(&b_key).await.is_some());
+    assert!(folder.get_raw(&br_key).await.is_some());
+
+    // 3. Run compaction. Since inline blocks contribute nothing to dual-bloom GC filter,
+    // these manually injected b/ and br/ keys (which are NOT referenced by any separated blockseq)
+    // must be dropped by compaction.
+    storage.compact(folder.id()).await.unwrap();
+    let folder = storage.folder(folder.id()).await.unwrap();
+
+    // Verify they are dropped.
+    assert!(folder.get_raw(&b_key).await.is_none());
+    assert!(folder.get_raw(&br_key).await.is_none());
 }

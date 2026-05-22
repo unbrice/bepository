@@ -4,14 +4,15 @@ syntax = "proto3";
 // buf:lint:ignore PACKAGE_DIRECTORY_MATCH
 package storage;
 
-// Points to the directory where canonical block data lives (cross-dir dedup).
+// Points to the sequence number where the block data is stored.
 message BlockRef {
-  string source_dir = 1;
+  uint64 seqno = 1;
 }
 
 // Our folder index metadata, stored at key "ix".
 message FolderIndexMeta {
   int64 max_sequence = 2; // highest assigned sequence in this folder
+  optional uint64 next_blockseq = 3;
 }
 
 // Remote device index tracking, stored at key "dx/<devid_32>".
@@ -63,6 +64,9 @@ message BlockInfo {
   int64 offset = 1;
   int32 size = 2;
   reserved 4;
+
+  optional uint64 blockseq = 5;
+  optional bytes inline_data = 6;
 }
 
 message Vector {

@@ -38,7 +38,9 @@ use bepository_bep::storage::{Sequence, Storage, StorageFolder, UpdateResult, bl
 use bepository_bep::{Ordering, compare};
 use bepository_lock::Epoch;
 
-use crate::compaction::{FullCompactionSchedulerSupplier, GcFilterSupplier};
+use crate::compaction::{
+    BepCompactionSchedulerSupplier, FullCompactionSchedulerSupplier, GcFilterSupplier,
+};
 use crate::meta::{self, CheckpointSchedule, FolderEntry, Meta, MetaIdentity};
 use crate::store::{CompactionState, FolderStore};
 use bepository_tls::Identity;
@@ -965,10 +967,55 @@ impl Activated {
         let store_slot = Arc::new(std::sync::OnceLock::<Arc<FolderStore>>::new());
 
         let supplier = Arc::new(GcFilterSupplier::new(
+            path.clone(),
             store_slot.clone(),
             gc.clone(),
             self.epoch,
         ));
+
+        // Shorten the compactor's scheduler tick for the one-shot
+        // `compact()` path so the first job is proposed within ~1 s
+        // instead of the 60 s default we use in steady state.
+        let mut settings = make_db_settings();
+        if full_compaction && let Some(c) = settings.compactor_options.as_mut() {
+            c.poll_interval = Duration::from_secs(1);
+        }
+
+        // `l0_max_ssts` is the per-segment ceiling at which the flusher
+        // refuses to dispatch the next immutable memtable. For the `bd/`
+        // segment under sustained sync on a slow uplink the saturation
+        // math is:
+        //
+        //   * a size-tiered compaction job for `bd/` triggers at
+        //     `min_compaction_sources` (32) L0 SSTs and pins those 32
+        //     source SSTs in `manifest.l0()` until the manifest commit;
+        //   * the job rewrites ~32 × `l0_sst_size_bytes` ≈ 256 MiB; on a
+        //     ~2.5 MB/s effective uplink that is ~100 s wall-clock;
+        //   * during the in-flight window new memtable freezes keep
+        //     landing one L0 SST per freeze into `bd/`. With 8 MiB
+        //     freezes and ~2.5 MB/s upload the freeze cadence is also
+        //     ~3 s, so ~32 new SSTs arrive before the sources are
+        //     released.
+        //
+        // So under sustained sync `bd/`'s effective L0 grows to roughly
+        // `2 * min_compaction_sources` (= 64) before the in-flight job
+        // commits. If `l0_max_ssts` is tighter than that, every cycle
+        // the flusher's per-segment `can_dispatch` refuses new imms;
+        // writes stall on `max_unflushed_bytes` backpressure until the
+        // commit lands.
+        if let Some(opts) = settings.compactor_options.as_ref() {
+            let scheduler = slatedb::config::SizeTieredCompactionSchedulerOptions::from(
+                &opts.scheduler_options,
+            );
+            debug_assert!(
+                settings.l0_max_ssts >= 2 * scheduler.min_compaction_sources,
+                "l0_max_ssts ({}) must be >= 2 * min_compaction_sources ({}): a bd/ \
+                 compaction pins its source SSTs until commit while new L0 SSTs \
+                 continue to land",
+                settings.l0_max_ssts,
+                scheduler.min_compaction_sources,
+            );
+        }
 
         let mut compactor_builder = CompactorBuilder::new(path.clone(), self.object_store.clone())
             .with_runtime(self.runtime.clone())
@@ -977,26 +1024,26 @@ impl Activated {
         if full_compaction {
             compactor_builder = compactor_builder
                 .with_scheduler_supplier(Arc::new(FullCompactionSchedulerSupplier));
+        } else {
+            compactor_builder = compactor_builder
+                .with_scheduler_supplier(Arc::new(BepCompactionSchedulerSupplier::new()));
         }
-
-        // Shorten poll interval for one-shot compaction so the scheduler
-        // triggers within ~1s instead of the 60s default.
-        let mut settings = make_db_settings();
-        if full_compaction && let Some(c) = settings.compactor_options.as_mut() {
-            c.poll_interval = Duration::from_secs(1);
+        if let Some(ref opts) = settings.compactor_options {
+            compactor_builder = compactor_builder.with_options(opts.clone());
         }
 
         let db = Db::builder(path.clone(), self.object_store.clone())
             .with_gc_runtime(self.runtime.clone())
             .with_db_cache(db_cache)
             .with_settings(settings)
+            .with_segment_extractor(Arc::new(crate::store_keys::BepSegmentExtractor))
             .with_filter_policies(crate::store_keys::make_filter_policies())
             .with_compactor_builder(compactor_builder)
             .build()
             .await
             .map_err(|e| StorageError::TransientIo(format!("open slatedb: {e}")))?;
 
-        let store = Arc::new(FolderStore::new(db, gc));
+        let store = Arc::new(FolderStore::new(db, gc).await?);
         let _ = store_slot.set(store.clone());
         Ok(store)
     }
@@ -1104,7 +1151,15 @@ impl Activated {
                 .read_compactor_state_view()
                 .await
                 .map_err(|e| StorageError::TransientIo(format!("read compactor state: {e}")))?;
-            if view.manifest().l0().is_empty() {
+            let manifest = view.manifest();
+            let mut l0_empty = manifest.l0().is_empty();
+            for segment in manifest.segments() {
+                if !segment.l0().is_empty() {
+                    l0_empty = false;
+                    break;
+                }
+            }
+            if l0_empty {
                 break;
             }
             if start.elapsed() > timeout {
@@ -1224,11 +1279,19 @@ impl StorageInspectorForTests for SlateFolder {
     /// Insert a block into the index (for test setup).
     async fn insert_block(&self, name: &str, offset: i64, data: Bytes) {
         // Look up the file to find the block hash matching this offset.
-        if let Ok(Some(fi)) = self.store.get_file(name).await {
+        let mut file_info = None;
+        if let Some(epoch) = self.epoch {
+            file_info = self.store.get_inbox_file(epoch, name).await.ok().flatten();
+        }
+        if file_info.is_none() {
+            file_info = self.store.get_file(name).await.ok().flatten();
+        }
+
+        if let Some(fi) = file_info {
             for block in &fi.blocks {
                 if block.offset == offset && block.hash.len() == 32 {
                     self.store
-                        .store_block(name, &block.hash, &data)
+                        .store_block(self.epoch, name, &block.hash, &data)
                         .await
                         .expect("store block");
                     return;
@@ -1239,7 +1302,7 @@ impl StorageInspectorForTests for SlateFolder {
         use sha2::{Digest, Sha256};
         let hash = Sha256::digest(&data);
         self.store
-            .store_block(name, &hash, &data)
+            .store_block(self.epoch, name, &hash, &data)
             .await
             .expect("store block");
     }
@@ -1263,17 +1326,46 @@ impl SlateFolder {
     pub async fn put_raw(&self, key: Vec<u8>, value: Vec<u8>) {
         use slatedb::config::PutOptions;
         use slatedb::config::WriteOptions;
+        // `await_durable: false` — the test caller wraps this with whatever
+        // durability it actually needs (close-the-store, explicit flush, or
+        // compaction round-trip). Waiting for WAL durability *per put_raw
+        // call* costs up to one `flush_interval` (60 s) per call against the
+        // ambient `make_db_settings()`, since the tiny writes never trip the
+        // size-based flush. With multiple `put_raw` calls in a row the test
+        // would spend minutes parked on the WAL-flush ticker.
+        let write_opts = WriteOptions {
+            await_durable: false,
+            ..Default::default()
+        };
         self.store
             .db
-            .put_with_options(key, value, &PutOptions::default(), &WriteOptions::default())
+            .put_with_options(key, value, &PutOptions::default(), &write_opts)
             .await
             .expect("put_raw");
+    }
+
+    /// Read raw bytes for a key from the underlying DB. For testing only.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn get_raw(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.store
+            .db
+            .get(key)
+            .await
+            .expect("get_raw")
+            .map(|b| b.to_vec())
     }
 
     /// Return the current epoch (test helper).
     #[cfg(any(test, feature = "test-utils"))]
     pub fn epoch(&self) -> Option<bepository_lock::Epoch> {
         self.epoch
+    }
+
+    /// Return the underlying store (test helper).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[allow(dead_code)]
+    pub(crate) fn store(&self) -> &Arc<FolderStore> {
+        &self.store
     }
 
     fn require_epoch(&self) -> Result<Epoch, StorageError> {
@@ -1425,7 +1517,7 @@ impl StorageFolder for SlateFolder {
         hash: &[u8],
         data: Bytes,
     ) -> Result<(), StorageError> {
-        self.store.store_block(name, hash, &data).await
+        self.store.store_block(self.epoch, name, hash, &data).await
     }
 
     async fn reuse_block(
@@ -1433,19 +1525,38 @@ impl StorageFolder for SlateFolder {
         name: &str,
         _offset: i64,
         hash: &[u8],
-        _size: i32,
+        size: i32,
     ) -> Result<bool, StorageError> {
-        self.store.reuse_block(name, hash).await
+        if size < 4096 {
+            return Ok(false);
+        }
+        self.store.reuse_block(self.epoch, name, hash).await
     }
 
     async fn has_block(
         &self,
-        _file: &str,
-        _offset: i64,
+        file: &str,
+        offset: i64,
         hash: &[u8],
-        _size: i32,
+        size: i32,
     ) -> Result<bool, StorageError> {
-        self.store.has_block(hash).await
+        let is_inline = size < 4096;
+        if is_inline {
+            match self.store.get_file_to_update(self.epoch, file).await {
+                Ok((file_info, _, _)) => {
+                    for block in &file_info.blocks {
+                        if block.offset == offset && block.hash == hash {
+                            return Ok(block.inline_data.is_some());
+                        }
+                    }
+                    Ok(false)
+                }
+                Err(StorageError::NotFound(_)) => Ok(false),
+                Err(e) => Err(e),
+            }
+        } else {
+            self.store.has_block(hash).await
+        }
     }
 }
 
@@ -1502,13 +1613,20 @@ fn make_db_settings() -> Settings {
         l0_sst_size_bytes: 8 * 1024 * 1024,
         // Memory ceiling for frozen memtables. Allows ~8 memtables in flight (64 MiB).
         max_unflushed_bytes: 64 * 1024 * 1024,
-        // Manifest poll interval. Long to minimize battery/request costs.
-        manifest_poll_interval: Duration::from_secs(120),
+        // Manifest poll interval. Bounds the worst-case wake-up latency
+        // after the in-process compactor commits a manifest update that
+        // drops L0 SSTs: the flusher only learns about that drop via the
+        // periodic re-read. 10 s is a conservative middle ground while we
+        // think about a proper fix (see OVERVIEW.md "Caveats").
+        manifest_poll_interval: Duration::from_secs(10),
         // Serializes L0 flushes to avoid bandwidth contention and timeouts on slow links.
         l0_flush_parallelism: 1,
-        // Back-pressure threshold. Caps L0 at 64 MiB. Higher values increase
-        // burst capacity but slow down `read_dir` scans on `n/` keys.
-        l0_max_ssts: 64,
+        // Per-segment L0 ceiling at which the flusher stops dispatching imms.
+        // Must clear the bd/ worst case of `2 * min_compaction_sources` (= 64
+        // under the slow-uplink saturation math; see `open_folder_store`).
+        // 512 leaves ample margin for unusual write bursts; the memory cost
+        // is only the in-RAM filter+index per SST, a few MB total.
+        l0_max_ssts: 512,
         compactor_options: Some(CompactorOptions {
             // Battery floor: each tick triggers a GCS manifest GET that keeps
             // the radio awake even when there is nothing to compact.
@@ -1527,6 +1645,23 @@ fn make_db_settings() -> Settings {
             // (~107 s @ 10 Mbps; ~11 s @ 100 Mbps). The 256 MiB default
             // exceeds 3 min on a slow link and risks transient timeouts.
             max_sst_size: 128 * 1024 * 1024,
+            // Raise size-tiered scheduler's L0 trigger from the default 4 to 32.
+            // Affects the `bd/` segment only: it routes through size-tiered
+            // (the other segments use full compaction in `BepCompactionScheduler`
+            // and ignore this knob). `bd/` rows are written in monotonically
+            // increasing seqno order, so its L0 SSTs have disjoint key ranges
+            // and reads only ever consult one SST at a time — compaction buys
+            // it nothing for read amplification, only for GC of orphaned rows
+            // and manifest size. Compacting every 4 L0 SSTs (~32 MiB) under a
+            // sustained sync starves memtable flushes (the compactor monopolises
+            // the one available L0-flush slot via `l0_flush_parallelism = 1`);
+            // 32 fires roughly 8× less often while staying well below the
+            // `l0_max_ssts = 64` per-segment backpressure ceiling.
+            scheduler_options: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("min_compaction_sources".to_string(), "32".to_string());
+                m
+            },
             ..CompactorOptions::default()
         }),
         ..Default::default()

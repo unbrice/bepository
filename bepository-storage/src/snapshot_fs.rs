@@ -11,7 +11,7 @@ use uuid::Uuid;
 use bepository_bep::ids::{FolderLabel, FolderLabelRef};
 
 use crate::api::{FolderStorageKey, SlateStorage};
-use crate::proto::storage::{BlockRef, File, FileInfo};
+use crate::proto::storage::{BlockInfo, File, FileInfo};
 use crate::snapshot::{FsEntry, SnapshotError, SnapshotFs, SnapshotRef};
 use crate::store_keys;
 
@@ -171,8 +171,7 @@ impl SnapshotFs for SlateStorage {
             return Ok(Bytes::new());
         }
 
-        let dir = store_keys::dirname(path);
-        copy_range_from_blocks(&reader, dir, &fi, offset, len).await
+        copy_range_from_blocks(&reader, &fi, offset, len).await
     }
 }
 
@@ -206,7 +205,6 @@ fn relative_under(dir: &str, full_name: &str) -> Option<String> {
 /// fast paths.
 async fn copy_range_from_blocks(
     reader: &DbReader,
-    dir: &str,
     fi: &FileInfo,
     offset: u64,
     len: usize,
@@ -236,13 +234,7 @@ async fn copy_range_from_blocks(
             .map_err(|_| SnapshotError::Io("block size exceeds usize max".into()))?;
         let take = blk_size.saturating_sub(skip).min(remaining);
 
-        let hash: &[u8; store_keys::HASH_LEN] = block
-            .hash
-            .as_slice()
-            .try_into()
-            .map_err(|_| SnapshotError::Io("invalid block hash length".into()))?;
-
-        let data = read_block_from_reader(reader, dir, hash).await?;
+        let data = read_block_from_reader(reader, block).await?;
         out.extend_from_slice(&data[skip..skip + take]);
         remaining -= take;
         if remaining == 0 {
@@ -259,33 +251,19 @@ fn snap_io<E: std::fmt::Display>(ctx: &'static str) -> impl Fn(E) -> SnapshotErr
     move |e| SnapshotError::Io(format!("{ctx}: {e}"))
 }
 
-/// Read block data from a `DbReader`, following cross-directory dedup refs.
+/// Read block data from a `DbReader` based on its `BlockInfo`.
 async fn read_block_from_reader(
     reader: &DbReader,
-    dir: &str,
-    hash: &[u8; store_keys::HASH_LEN],
+    block: &BlockInfo,
 ) -> Result<Bytes, SnapshotError> {
-    // Try direct block data.
-    let data_key = store_keys::block_data_key(dir, hash);
-    if let Some(data) = reader
-        .get(&data_key)
-        .await
-        .map_err(snap_io("read snapshot key"))?
-    {
-        return Ok(data);
+    if let Some(inline_data) = &block.inline_data {
+        return Ok(Bytes::from(inline_data.clone()));
     }
-
-    // Try dedup reference: b/<dir>/<hash>/ref → BlockRef { source_dir }.
-    let ref_key = store_keys::block_ref_key(dir, hash);
-    if let Some(ref_bytes) = reader
-        .get(&ref_key)
-        .await
-        .map_err(snap_io("read snapshot key"))?
-    {
-        let block_ref = BlockRef::decode(ref_bytes).map_err(snap_io("decode block ref"))?;
-        let canonical_key = store_keys::block_data_key(&block_ref.source_dir, hash);
+    if let Some(seq) = block.blockseq {
+        store_keys::validate_block_seq(seq).map_err(snap_io("invalid block seq"))?;
+        let data_key = store_keys::block_data_seq_key(seq);
         if let Some(data) = reader
-            .get(&canonical_key)
+            .get(&data_key)
             .await
             .map_err(snap_io("read snapshot key"))?
         {
@@ -295,7 +273,7 @@ async fn read_block_from_reader(
 
     Err(SnapshotError::Io(format!(
         "block not found: {}",
-        hex::encode(hash)
+        hex::encode(&block.hash)
     )))
 }
 

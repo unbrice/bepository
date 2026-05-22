@@ -261,7 +261,7 @@ async fn check_block_entries(
     errors: &mut Vec<String>,
 ) -> Result<(), StorageError> {
     for kv in block_kvs {
-        if let Some(hash) = store_keys::parse_block_ref_key(&kv.key) {
+        if let Some(hash) = store_keys::parse_block_pointer_key(&kv.key) {
             let Ok(block_ref) = BlockRef::decode(kv.value.clone()) else {
                 errors.push(format!(
                     "Failed to decode BlockRef for {} in dir {dir}",
@@ -269,28 +269,43 @@ async fn check_block_entries(
                 ));
                 continue;
             };
-            let target_key = store_keys::block_data_key(&block_ref.source_dir, &hash);
-            if db.get(&target_key).await.map_err(slate_err)?.is_none() {
+            if let Err(e) = store_keys::validate_block_seq(block_ref.seqno) {
                 errors.push(format!(
-                    "BlockRef for {} in {dir} points to missing target in dir {}",
-                    hex::encode(hash),
-                    block_ref.source_dir
+                    "Invalid sequence number for block {} in dir {dir}: {e}",
+                    hex::encode(hash)
                 ));
+                continue;
             }
-            expected.remove(&hash);
-        } else if let Some(hash) = store_keys::parse_block_data_key(&kv.key) {
-            if level == FsckLevel::Full {
-                let mut hasher = Sha256::new();
-                hasher.update(&kv.value);
-                let computed = hasher.finalize();
-                if computed[..] != hash[..] {
+            let data_key = store_keys::block_data_seq_key(block_ref.seqno);
+            match db.get(&data_key).await.map_err(slate_err)? {
+                None => {
                     errors.push(format!(
-                        "Data checksum mismatch for block {} in dir {dir}",
-                        hex::encode(hash)
+                        "Block pointer for {} in {dir} points to missing sequence data at seqno {}",
+                        hex::encode(hash),
+                        block_ref.seqno
                     ));
+                }
+                Some(data) => {
+                    if level == FsckLevel::Full {
+                        let mut hasher = Sha256::new();
+                        hasher.update(&data);
+                        let computed = hasher.finalize();
+                        if computed[..] != hash[..] {
+                            errors.push(format!(
+                                "Data checksum mismatch for block {} in dir {dir} (seqno {})",
+                                hex::encode(hash),
+                                block_ref.seqno
+                            ));
+                        }
+                    }
                 }
             }
             expected.remove(&hash);
+        } else {
+            errors.push(format!(
+                "Unexpected key in block segment for dir {dir}: {}",
+                String::from_utf8_lossy(&kv.key)
+            ));
         }
     }
     Ok(())
@@ -359,10 +374,36 @@ mod tests {
                 manifest_poll_interval: std::time::Duration::from_millis(100),
                 ..Default::default()
             })
+            .with_segment_extractor(Arc::new(crate::store_keys::BepSegmentExtractor))
             .build()
             .await
             .unwrap();
         FolderStore::new(db, Arc::new(crate::store::CompactionState::new()))
+            .await
+            .unwrap()
+    }
+
+    async fn helper_put_block(
+        store: &FolderStore,
+        dir: &str,
+        hash: &[u8; 32],
+        data: &[u8],
+        seq: u64,
+    ) {
+        let block_ref = BlockRef { seqno: seq };
+        store
+            .db
+            .put(
+                store_keys::block_pointer_key(dir, hash),
+                block_ref.encode_to_vec(),
+            )
+            .await
+            .unwrap();
+        store
+            .db
+            .put(store_keys::block_data_seq_key(seq), data)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -376,6 +417,7 @@ mod tests {
                 offset: 0,
                 size: 4,
                 hash: vec![0u8; 32],
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -393,11 +435,14 @@ mod tests {
             .put(store_keys::seq_key(1).unwrap(), file_info.name.as_bytes())
             .await
             .unwrap();
-        store
-            .db
-            .put(store_keys::block_data_key("dir1", &[0u8; 32]), b"data")
-            .await
-            .unwrap();
+        helper_put_block(
+            &store,
+            "dir1",
+            &[0u8; 32],
+            b"data",
+            store_keys::MIN_BLOCK_SEQ,
+        )
+        .await;
         store
             .db
             .put(
@@ -424,6 +469,7 @@ mod tests {
                 offset: 0,
                 size: 4,
                 hash: vec![1u8; 32],
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -496,6 +542,7 @@ mod tests {
                 offset: 0,
                 size: 4,
                 hash: hash.to_vec(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -513,11 +560,7 @@ mod tests {
             .put(store_keys::seq_key(1).unwrap(), file_info.name.as_bytes())
             .await
             .unwrap();
-        store
-            .db
-            .put(store_keys::block_data_key("", &hash), b"corrupt")
-            .await
-            .unwrap();
+        helper_put_block(&store, "", &hash, b"corrupt", store_keys::MIN_BLOCK_SEQ).await;
         store
             .db
             .put(store_keys::block_reverse_key(&hash, &file_info.name), b"")
@@ -547,7 +590,10 @@ mod tests {
     async fn test_check_folder_integrity_max_sequence_monotonicity() {
         let store = test_store().await;
 
-        let meta = FolderIndexMeta { max_sequence: 10 };
+        let meta = FolderIndexMeta {
+            max_sequence: 10,
+            next_blockseq: None,
+        };
         store
             .db
             .put(store_keys::IX_KEY, meta.encode_to_vec())
@@ -578,7 +624,10 @@ mod tests {
             .unwrap();
         assert!(errors.is_empty(), "Expected no errors, got: {errors:?}");
 
-        let meta_invalid = FolderIndexMeta { max_sequence: 3 };
+        let meta_invalid = FolderIndexMeta {
+            max_sequence: 3,
+            next_blockseq: None,
+        };
         store
             .db
             .put(store_keys::IX_KEY, meta_invalid.encode_to_vec())
@@ -593,7 +642,10 @@ mod tests {
                 .any(|e| e.contains("max_sequence 3 in ix is less than highest s/ key 5"))
         );
 
-        let meta_valid_for_s = FolderIndexMeta { max_sequence: 5 };
+        let meta_valid_for_s = FolderIndexMeta {
+            max_sequence: 5,
+            next_blockseq: None,
+        };
         store
             .db
             .put(store_keys::IX_KEY, meta_valid_for_s.encode_to_vec())
@@ -634,6 +686,7 @@ mod tests {
                 offset: 0,
                 size: 4,
                 hash: vec![1u8; 32],
+                ..Default::default()
             }],
             ..Default::default()
         };

@@ -4,15 +4,20 @@
 
 //! Key encoding/decoding for the per-folder SlateDB key layout.
 //!
-//! Key prefixes:
-//!   n/<dir>//<basename>              — primary file index (FileInfo)
-//!   s/<seq_be8>                       — sequence → name mapping
-//!   b/<dir>/<hash_32>                 — block data (dir-scoped)
-//!   b/<dir>/<hash_32>/ref             — block reference (cross-dir dedup)
-//!   br/<hash_32>/<dir>//<basename>    — reverse block refs
-//!   ix                                — our FolderIndexMeta
-//!   dx/<devid_32>                     — remote device index state
-//!   in/<epoch_base32>/<dir>//<basename> — inbox staging area
+//! Every key starts with a uniform 2-byte tag. Byte 0 partitions the keyspace
+//! into two RFC-0024 segments — `b` for block-data, `m` for everything else —
+//! so each memtable freeze produces at most one L0 SST per side instead of one
+//! per key class. Byte 1 disambiguates the class within its segment.
+//!
+//! Key layout (uniform 2-byte tag, no trailing `/` on the tag):
+//!   bd<seq_be8>                        — block data (block segment)
+//!   mb<dir>/<hash_32>                  — block pointer (BlockRef)
+//!   mr<hash_32>/<dir>//<basename>      — reverse block refs
+//!   mn<dir>//<basename>                — primary file index (FileInfo)
+//!   ms<seq_be8>                        — sequence → name mapping
+//!   mi<epoch_base32>/<dir>//<basename> — inbox staging area
+//!   md<devid_32>                       — remote device index state
+//!   mx                                 — our FolderIndexMeta singleton
 
 use std::sync::Arc;
 
@@ -29,13 +34,26 @@ pub const DEVID_LEN: usize = 32;
 
 // --- Prefix constants ---
 
-pub const FILE_PREFIX: &[u8] = b"n/";
-pub const SEQ_PREFIX: &[u8] = b"s/";
-pub const BLOCK_PREFIX: &[u8] = b"b/";
-pub const BLOCK_REV_PREFIX: &[u8] = b"br/";
-pub const IX_KEY: &[u8] = b"ix";
-pub const DEVICE_PREFIX: &[u8] = b"dx/";
-pub const INBOX_PREFIX: &[u8] = b"in/";
+pub const FILE_PREFIX: &[u8] = b"mn";
+pub const SEQ_PREFIX: &[u8] = b"ms";
+pub const BLOCK_PREFIX: &[u8] = b"mb";
+pub const BLOCK_REV_PREFIX: &[u8] = b"mr";
+pub const IX_KEY: &[u8] = b"mx";
+pub const DEVICE_PREFIX: &[u8] = b"md";
+pub const INBOX_PREFIX: &[u8] = b"mi";
+pub const BLOCK_DATA_PREFIX: &[u8] = b"bd";
+
+// --- Segment prefixes (RFC-0024) ---
+//
+// The segment extractor partitions the keyspace on byte 0: every key in a
+// segment shares its first byte. These are the values it returns, used by
+// the scheduler/compaction code to filter `CompactionSpec` per segment.
+
+/// Segment prefix for block-data keys (`bd<…>`).
+pub const BLOCK_SEGMENT_PREFIX: &[u8] = b"b";
+/// Segment prefix for metadata keys (`mn<…>`, `mb<…>`, `mr<…>`, `ms<…>`,
+/// `mi<…>`, `md<…>`, `mx`).
+pub const METADATA_SEGMENT_PREFIX: &[u8] = b"m";
 
 // --- Name splitting helpers ---
 
@@ -65,7 +83,7 @@ fn join_name(dir: &str, basename: &str) -> String {
     }
 }
 
-// --- File key: n/<dir>//<basename> ---
+// --- File key: mn<dir>//<basename> ---
 
 #[must_use]
 pub fn file_key(name: &str) -> Vec<u8> {
@@ -86,7 +104,7 @@ pub fn parse_file_key(key: &[u8]) -> Option<String> {
     Some(join_name(dir, basename))
 }
 
-// --- Sequence key: s/<seq_be8> ---
+// --- Sequence key: ms<seq_be8> ---
 
 /// Sequence key length: 2 (prefix) + 8 (big-endian u64) = 10.
 pub const SEQ_KEY_LEN: usize = 10;
@@ -96,8 +114,8 @@ pub fn seq_key(seq: i64) -> Result<[u8; SEQ_KEY_LEN], StorageError> {
         StorageError::Internal(format!("sequence numbers must be non-negative, got {seq}"))
     })?;
     let mut key = [0u8; SEQ_KEY_LEN];
-    key[0] = b's';
-    key[1] = b'/';
+    key[0] = b'm';
+    key[1] = b's';
     key[2..].copy_from_slice(&seq_u.to_be_bytes());
     Ok(key)
 }
@@ -111,19 +129,19 @@ pub fn parse_seq_key(key: &[u8]) -> Option<u64> {
     Some(u64::from_be_bytes(bytes))
 }
 
-/// The upper-bound key for scanning all `s/` entries.
-/// "t" > "s/" lexicographically.
-pub const SEQ_SCAN_END: &[u8] = b"t";
+/// The upper-bound key for scanning all `ms<…>` entries.
+/// "mt" > "ms<…>" lexicographically and is the smallest 2-byte tag past `ms`.
+pub const SEQ_SCAN_END: &[u8] = b"mt";
 
 /// Build a scan start key for sequences > `since`.
 pub fn seq_scan_start(since: i64) -> Result<[u8; SEQ_KEY_LEN], StorageError> {
     seq_key(since + 1)
 }
 
-// --- Block data key: b/<dir>/<hash_32> ---
+// --- Block pointer key: mb<dir>/<hash_32> ---
 
 #[must_use]
-pub fn block_data_key(dir: &str, hash: &[u8; HASH_LEN]) -> Vec<u8> {
+pub fn block_pointer_key(dir: &str, hash: &[u8; HASH_LEN]) -> Vec<u8> {
     let mut key = Vec::with_capacity(2 + dir.len() + 1 + HASH_LEN);
     key.extend_from_slice(BLOCK_PREFIX);
     key.extend_from_slice(dir.as_bytes());
@@ -132,28 +150,54 @@ pub fn block_data_key(dir: &str, hash: &[u8; HASH_LEN]) -> Vec<u8> {
     key
 }
 
-// --- Block ref key: b/<dir>/<hash_32>/ref ---
+// --- Block data key: bd<blockseq_be8> ---
 
-#[must_use]
-pub fn block_ref_key(dir: &str, hash: &[u8; HASH_LEN]) -> Vec<u8> {
-    let mut key = Vec::with_capacity(2 + dir.len() + 1 + HASH_LEN + 4);
-    key.extend_from_slice(BLOCK_PREFIX);
-    key.extend_from_slice(dir.as_bytes());
-    key.push(b'/');
-    key.extend_from_slice(hash);
-    key.extend_from_slice(b"/ref");
+/// Block data key length: 2 (prefix) + 8 (big-endian u64) = 10.
+pub const BLOCK_DATA_KEY_LEN: usize = 10;
+
+pub fn block_data_seq_key(seq: u64) -> [u8; BLOCK_DATA_KEY_LEN] {
+    let mut key = [0u8; BLOCK_DATA_KEY_LEN];
+    key[0] = b'b';
+    key[1] = b'd';
+    key[2..].copy_from_slice(&seq.to_be_bytes());
     key
 }
 
-/// Length of the bloom-filter prefix extracted from `br/` keys: the literal
-/// `br/` plus the full 32-byte hash. Lets `scan_prefix(br/<hash>/...)` consult
-/// the per-SST bloom filter — without it, prefix scans would have to fetch
-/// each candidate SST's index block to test membership, which is the hot path
-/// during initial sync where most lookups return empty.
+/// Minimum valid block sequence number. Values below this floor represent corruption.
+pub const MIN_BLOCK_SEQ: u64 = 1024;
+
+/// Validate a block sequence number. Must be >= MIN_BLOCK_SEQ.
+pub fn validate_block_seq(seq: u64) -> Result<(), StorageError> {
+    if seq < MIN_BLOCK_SEQ {
+        return Err(StorageError::Corruption(format!(
+            "invalid block sequence number: {seq} (must be >= {MIN_BLOCK_SEQ})"
+        )));
+    }
+    Ok(())
+}
+
+#[must_use]
+pub fn parse_block_data_seq_key(key: &[u8]) -> Option<u64> {
+    if key.len() != BLOCK_DATA_KEY_LEN || !key.starts_with(BLOCK_DATA_PREFIX) {
+        return None;
+    }
+    let bytes: [u8; 8] = key[2..10].try_into().ok()?;
+    let seq = u64::from_be_bytes(bytes);
+    if seq < MIN_BLOCK_SEQ {
+        return None;
+    }
+    Some(seq)
+}
+
+/// Length of the bloom-filter prefix extracted from `mr<…>` keys: the literal
+/// `mr` tag plus the full 32-byte hash. Lets `scan_prefix(mr<hash>/...)`
+/// consult the per-SST bloom filter — without it, prefix scans would have to
+/// fetch each candidate SST's index block to test membership, which is the
+/// hot path during initial sync where most lookups return empty.
 const BR_FILTER_PREFIX_LEN: usize = BLOCK_REV_PREFIX.len() + HASH_LEN;
 
-/// Filter extractor that hashes the `br/<hash>` prefix of every reverse-ref
-/// key into the bloom filter. Keys outside the `br/` family return `None` and
+/// Filter extractor that hashes the `mr<hash>` prefix of every reverse-ref
+/// key into the bloom filter. Keys outside the `mr` family return `None` and
 /// are not added to the prefix filter; they remain covered by point-key
 /// filtering via `with_whole_key_filtering(true)`.
 #[derive(Debug, Default)]
@@ -161,7 +205,7 @@ pub struct BrPrefixExtractor;
 
 impl PrefixExtractor for BrPrefixExtractor {
     fn name(&self) -> &str {
-        "bep-br-35"
+        "bep-mr-34"
     }
 
     fn prefix_len(&self, target: &PrefixTarget) -> Option<usize> {
@@ -173,6 +217,35 @@ impl PrefixExtractor for BrPrefixExtractor {
     }
 }
 
+/// Two-segment extractor: every key is routed to either the `b` (block-data)
+/// segment or the `m` (metadata) segment based on its first byte. Each
+/// memtable freeze therefore produces at most two L0 SSTs — one per side —
+/// rather than one per key class.
+///
+/// Returning `Some(1)` (rather than the 2-byte tag length) is what makes the
+/// collapse work: all metadata key classes share the same one-byte prefix
+/// `m`, so they all land in the same segment. The 2-byte tags exist solely
+/// to disambiguate classes within a segment for the parsers; segmentation
+/// only cares about byte 0.
+#[derive(Debug, Default)]
+pub struct BepSegmentExtractor;
+
+impl PrefixExtractor for BepSegmentExtractor {
+    fn name(&self) -> &str {
+        "bep-segment-v2"
+    }
+
+    fn prefix_len(&self, target: &PrefixTarget) -> Option<usize> {
+        let bytes: &Bytes = match target {
+            PrefixTarget::Point(b) | PrefixTarget::Prefix(b) => b,
+        };
+        match bytes.first() {
+            Some(&b'b') | Some(&b'm') => Some(1),
+            _ => None,
+        }
+    }
+}
+
 /// Filter policies for SSTs. These must match across writer and reader components.
 ///
 /// Registers both whole-key and prefix-aware bloom filters. SlateDB selects the
@@ -180,7 +253,7 @@ impl PrefixExtractor for BrPrefixExtractor {
 /// remain decodable without falling back to expensive index fetches.
 ///
 /// 1. `BloomFilterPolicy::new(10)`: Default whole-key bloom (`_bf`).
-/// 2. `BloomFilterPolicy` + `BrPrefixExtractor`: Accelerates `scan_prefix("br/<hash>/")`.
+/// 2. `BloomFilterPolicy` + `BrPrefixExtractor`: Accelerates `scan_prefix("mr<hash>/")`.
 #[must_use]
 pub fn make_filter_policies() -> Vec<Arc<dyn FilterPolicy>> {
     vec![
@@ -189,7 +262,7 @@ pub fn make_filter_policies() -> Vec<Arc<dyn FilterPolicy>> {
     ]
 }
 
-// --- Block reverse ref key: br/<hash_32>/<dir>//<basename> ---
+// --- Block reverse ref key: mr<hash_32>/<dir>//<basename> ---
 
 #[must_use]
 pub fn block_reverse_key(hash: &[u8; HASH_LEN], name: &str) -> Vec<u8> {
@@ -230,7 +303,7 @@ pub fn parse_block_reverse_key(key: &[u8]) -> Option<([u8; HASH_LEN], String)> {
     Some((hash, join_name(dir, basename)))
 }
 
-// --- Inbox key: in/<epoch_base32>/<dir>//<basename> ---
+// --- Inbox key: mi<epoch_base32>/<dir>//<basename> ---
 // Epoch is 8-character Crockford Base32 (same encoding as epoch filenames in
 // bepository-lock), keeping keys human-readable and lexicographically ordered.
 
@@ -266,32 +339,28 @@ pub fn parse_inbox_key(key: &[u8]) -> Option<(bepository_lock::Epoch, String)> {
     Some((epoch, join_name(dir, basename)))
 }
 
-// --- Device key: dx/<devid_32> ---
+// --- Device key: md<devid_32> ---
 
-/// Device state key length: 3 (prefix) + 32 (device ID) = 35.
-pub const DEVICE_KEY_LEN: usize = 35;
+/// Device state key length: 2 (prefix) + 32 (device ID) = 34.
+pub const DEVICE_KEY_LEN: usize = 34;
 
 #[must_use]
 pub fn device_key(devid: &[u8; DEVID_LEN]) -> [u8; DEVICE_KEY_LEN] {
     let mut key = [0u8; DEVICE_KEY_LEN];
-    key[0] = b'd';
-    key[1] = b'x';
-    key[2] = b'/';
-    key[3..].copy_from_slice(devid);
+    key[0] = b'm';
+    key[1] = b'd';
+    key[2..].copy_from_slice(devid);
     key
 }
 
-/// Parse a block data key `b/<dir>/<hash_32>`, returning the 32-byte hash.
+/// Parse a block pointer key `mb<dir>/<hash_32>`, returning the 32-byte hash.
 ///
-/// Matches keys that start with `b/` and end with exactly 32 raw bytes after
-/// a `/`, but do NOT end with `/ref`.
+/// Matches keys that start with `mb` and end with exactly 32 raw bytes after
+/// a `/`.
 #[must_use]
-pub fn parse_block_data_key(key: &[u8]) -> Option<[u8; HASH_LEN]> {
+pub fn parse_block_pointer_key(key: &[u8]) -> Option<[u8; HASH_LEN]> {
     // Minimum: b/ + / + HASH_LEN
-    if key.len() < BLOCK_PREFIX.len() + 1 + HASH_LEN
-        || !key.starts_with(BLOCK_PREFIX)
-        || key.ends_with(b"/ref")
-    {
+    if key.len() < BLOCK_PREFIX.len() + 1 + HASH_LEN || !key.starts_with(BLOCK_PREFIX) {
         return None;
     }
     if key[key.len() - HASH_LEN - 1] != b'/' {
@@ -300,25 +369,7 @@ pub fn parse_block_data_key(key: &[u8]) -> Option<[u8; HASH_LEN]> {
     key[key.len() - HASH_LEN..].try_into().ok()
 }
 
-/// Parse a block ref key `b/<dir>/<hash_32>/ref`, returning the 32-byte hash.
-#[must_use]
-pub fn parse_block_ref_key(key: &[u8]) -> Option<[u8; HASH_LEN]> {
-    // Minimum: b/ + / + HASH_LEN + /ref
-    if key.len() < BLOCK_PREFIX.len() + 1 + HASH_LEN + 4
-        || !key.starts_with(BLOCK_PREFIX)
-        || !key.ends_with(b"/ref")
-    {
-        return None;
-    }
-    let hash_end = key.len() - 4;
-    // Verify the character before the hash is /
-    if key[hash_end - HASH_LEN - 1] != b'/' {
-        return None;
-    }
-    key[hash_end - HASH_LEN..hash_end].try_into().ok()
-}
-
-/// Extract the directory from a file key `n/<dir>//<basename>` (borrowing).
+/// Extract the directory from a file key `mn<dir>//<basename>` (borrowing).
 #[must_use]
 pub fn file_key_dir(key: &[u8]) -> Option<&str> {
     let rest = key.strip_prefix(FILE_PREFIX)?;
@@ -327,18 +378,13 @@ pub fn file_key_dir(key: &[u8]) -> Option<&str> {
     Some(dir)
 }
 
-/// Extract the directory from a block data or ref key
-/// (`b/<dir>/<hash_32>` or `b/<dir>/<hash_32>/ref`) (borrowing).
+/// Extract the directory from a block pointer key `mb<dir>/<hash_32>` (borrowing).
 #[must_use]
 pub fn block_key_dir(key: &[u8]) -> Option<&str> {
     if !key.starts_with(BLOCK_PREFIX) {
         return None;
     }
-    let suffix_len = if key.ends_with(b"/ref") {
-        1 + HASH_LEN + 4 // /<hash>/ref
-    } else {
-        1 + HASH_LEN // /<hash>
-    };
+    let suffix_len = 1 + HASH_LEN; // /<hash>
     let prefix_len = BLOCK_PREFIX.len();
     if key.len() < prefix_len + suffix_len {
         return None;
@@ -409,41 +455,26 @@ mod tests {
     }
 
     #[test]
-    fn block_data_key_round_trip() {
+    fn block_pointer_key_round_trip() {
         let hash = [0xBB; HASH_LEN];
-        let key = block_data_key("docs", &hash);
-        let parsed = parse_block_data_key(&key).unwrap();
+        let key = block_pointer_key("docs", &hash);
+        let parsed = parse_block_pointer_key(&key).unwrap();
         assert_eq!(parsed, hash);
     }
 
     #[test]
-    fn block_data_key_root_round_trip() {
+    fn block_pointer_key_root_round_trip() {
         let hash = [0xDD; HASH_LEN];
-        let key = block_data_key("", &hash);
-        let parsed = parse_block_data_key(&key).unwrap();
+        let key = block_pointer_key("", &hash);
+        let parsed = parse_block_pointer_key(&key).unwrap();
         assert_eq!(parsed, hash);
     }
 
     #[test]
-    fn block_data_key_rejects_ref_key() {
-        let hash = [0xBB; HASH_LEN];
-        let key = block_ref_key("docs", &hash);
-        assert!(parse_block_data_key(&key).is_none());
-    }
-
-    #[test]
-    fn block_ref_key_round_trip() {
-        let hash = [0xCC; HASH_LEN];
-        let key = block_ref_key("photos", &hash);
-        let parsed = parse_block_ref_key(&key).unwrap();
-        assert_eq!(parsed, hash);
-    }
-
-    #[test]
-    fn block_ref_key_rejects_data_key() {
-        let hash = [0xCC; HASH_LEN];
-        let key = block_data_key("photos", &hash);
-        assert!(parse_block_ref_key(&key).is_none());
+    fn block_data_seq_key_round_trip() {
+        let key = block_data_seq_key(12345);
+        let parsed = parse_block_data_seq_key(&key).unwrap();
+        assert_eq!(parsed, 12345);
     }
 
     #[test]
@@ -474,23 +505,16 @@ mod tests {
     }
 
     #[test]
-    fn block_key_dir_data() {
+    fn block_key_dir_pointer() {
         let hash = [0xBB; HASH_LEN];
-        let key = block_data_key("photos", &hash);
+        let key = block_pointer_key("photos", &hash);
         assert_eq!(block_key_dir(&key).unwrap(), "photos");
-    }
-
-    #[test]
-    fn block_key_dir_ref() {
-        let hash = [0xCC; HASH_LEN];
-        let key = block_ref_key("photos/2024", &hash);
-        assert_eq!(block_key_dir(&key).unwrap(), "photos/2024");
     }
 
     #[test]
     fn block_key_dir_empty_dir() {
         let hash = [0xAA; HASH_LEN];
-        let key = block_data_key("", &hash);
+        let key = block_pointer_key("", &hash);
         assert_eq!(block_key_dir(&key).unwrap(), "");
     }
 
@@ -502,5 +526,92 @@ mod tests {
         let original = paths;
         paths.sort_by_key(|&p| file_key(p));
         assert_eq!(paths, original);
+    }
+
+    #[test]
+    fn test_bep_segment_extractor_segments_are_antichain() {
+        // The extractor produces exactly two segment prefixes: `b` and `m`.
+        // They are 1-byte and pairwise non-nesting by construction.
+        let extractor = BepSegmentExtractor;
+        let b_seg = extractor.prefix_len(&PrefixTarget::Point(Bytes::from_static(
+            b"bd\0\0\0\0\0\0\0\x10",
+        )));
+        let m_seg = extractor.prefix_len(&PrefixTarget::Point(Bytes::from_static(b"mx")));
+        assert_eq!(b_seg, Some(1));
+        assert_eq!(m_seg, Some(1));
+    }
+
+    #[test]
+    fn test_bep_segment_extractor_collapses_to_two_segments() {
+        let extractor = BepSegmentExtractor;
+        let epoch = bepository_lock::Epoch::new(1).unwrap();
+        let hash = [42u8; HASH_LEN];
+        let devid = [7u8; DEVID_LEN];
+
+        // (key, expected first-byte of segment prefix) — every metadata key
+        // class collapses to `m`; the only `b` keys are block data.
+        let test_cases: Vec<(Vec<u8>, u8)> = vec![
+            (file_key("dir/file.txt"), b'm'),
+            (seq_key(100).unwrap().to_vec(), b'm'),
+            (block_pointer_key("dir", &hash), b'm'),
+            (block_data_seq_key(12345).to_vec(), b'b'),
+            (block_reverse_key(&hash, "dir/file.txt"), b'm'),
+            (IX_KEY.to_vec(), b'm'),
+            (device_key(&devid).to_vec(), b'm'),
+            (inbox_key(epoch, "dir/file.txt"), b'm'),
+        ];
+
+        for (key, expected_first) in test_cases {
+            let key_bytes = Bytes::from(key);
+
+            // Point: must return Some(1) and the extracted byte must match.
+            let point_len = extractor.prefix_len(&PrefixTarget::Point(key_bytes.clone()));
+            assert_eq!(
+                point_len,
+                Some(1),
+                "Point prefix len mismatch for key {key_bytes:?}"
+            );
+            assert_eq!(
+                key_bytes[0], expected_first,
+                "Segment byte mismatch for key {key_bytes:?}"
+            );
+
+            // Prefix at the extracted length: same answer.
+            let exact_prefix = key_bytes.slice(0..1);
+            let prefix_len_exact = extractor.prefix_len(&PrefixTarget::Prefix(exact_prefix));
+            assert_eq!(
+                prefix_len_exact,
+                Some(1),
+                "Prefix target (exact) len mismatch for key {key_bytes:?}"
+            );
+
+            // Prefix longer than the extracted length: still Some(1).
+            if key_bytes.len() > 1 {
+                let longer_prefix = key_bytes.slice(0..2);
+                let prefix_len_longer = extractor.prefix_len(&PrefixTarget::Prefix(longer_prefix));
+                assert_eq!(
+                    prefix_len_longer,
+                    Some(1),
+                    "Prefix target (longer) len mismatch for key {key_bytes:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_bep_segment_extractor_rejects_foreign_first_byte() {
+        let extractor = BepSegmentExtractor;
+        // Any key whose first byte is not `b` or `m` is outside this layout
+        // and must yield `None` — slatedb will reject the write, which is
+        // the desired loud failure mode (key constructors only emit `b…` /
+        // `m…`, so this triggers only on a bug).
+        assert_eq!(
+            extractor.prefix_len(&PrefixTarget::Point(Bytes::from_static(b"x"))),
+            None
+        );
+        assert_eq!(
+            extractor.prefix_len(&PrefixTarget::Point(Bytes::from_static(b""))),
+            None
+        );
     }
 }

@@ -28,7 +28,8 @@ use fastbloom::AtomicBloomFilter;
 
 /// Tracks which block hashes are known-live for a single active compaction job.
 struct CompactionJobState {
-    known_live: Arc<AtomicBloomFilter>,
+    known_live_hashes: Arc<AtomicBloomFilter>,
+    known_live_seqs: Arc<AtomicBloomFilter>,
 }
 
 /// Handle to an active compaction job.
@@ -63,9 +64,16 @@ impl CompactionState {
 
     /// Register a new compaction job.
     /// Returns a handle used to keep the job active.
-    pub fn register(self: &Arc<Self>, known_live: Arc<AtomicBloomFilter>) -> CompactionJob {
+    pub fn register(
+        self: &Arc<Self>,
+        known_live_hashes: Arc<AtomicBloomFilter>,
+        known_live_seqs: Arc<AtomicBloomFilter>,
+    ) -> CompactionJob {
         let job_id = self.next_job.fetch_add(1, Ordering::Relaxed);
-        let job = CompactionJobState { known_live };
+        let job = CompactionJobState {
+            known_live_hashes,
+            known_live_seqs,
+        };
         self.jobs.write().insert(job_id, job);
         CompactionJob {
             gc: self.clone(),
@@ -78,32 +86,44 @@ impl CompactionState {
         self.jobs.write().remove(&job_id);
     }
 
-    /// Record that a block hash was written, so all active compactions know it's live.
-    pub fn record_block_write(&self, hash: &[u8; 32]) {
+    /// Record that a block was written, so all active compactions know it's live.
+    pub fn record_block_write(&self, hash: &[u8; 32], seq: Option<u64>) {
         let jobs = self.jobs.read();
         for job in jobs.values() {
-            job.known_live.insert(hash);
+            job.known_live_hashes.insert(hash);
+            if let Some(s) = seq {
+                job.known_live_seqs.insert(&s);
+            }
         }
     }
 
     /// Check whether a block hash is considered live by all active compactions.
     ///
     /// Returns `true` if there are no active compactions, or if every active
-    /// compaction recognises the hash (via known_live or written_since).
+    /// compaction recognises the hash.
     pub fn is_block_safe(&self, hash: &[u8; 32]) -> bool {
         let jobs = self.jobs.read();
         if jobs.is_empty() {
             return true;
         }
-        jobs.values().all(|job| job.known_live.contains(hash))
+        jobs.values()
+            .all(|job| job.known_live_hashes.contains(hash))
     }
 
     /// Check whether a specific compaction's known_live set contains a hash,
     /// also considering blocks written since that compaction started.
-    pub fn known_live_contains(&self, job_id: u64, hash: &[u8; 32]) -> bool {
+    pub fn known_live_hash_contains(&self, job_id: u64, hash: &[u8; 32]) -> bool {
         let jobs = self.jobs.read();
         jobs.get(&job_id)
-            .is_none_or(|job| job.known_live.contains(hash))
+            .is_none_or(|job| job.known_live_hashes.contains(hash))
+    }
+
+    /// Check whether a specific compaction's known_live set contains a seq,
+    /// also considering blocks written since that compaction started.
+    pub fn known_live_seq_contains(&self, job_id: u64, seq: u64) -> bool {
+        let jobs = self.jobs.read();
+        jobs.get(&job_id)
+            .is_none_or(|job| job.known_live_seqs.contains(&seq))
     }
 }
 
@@ -137,17 +157,21 @@ pub(crate) struct FolderStore {
     name_locks: LockPool<String>,
     /// Guards the `IX_KEY` RMW and its batch write. Held briefly,
     /// in-memory only. Compaction preserves `ix`.
-    seq_lock: Mutex<()>,
+    seq_lock: Arc<Mutex<()>>,
+    blockseq: SeqAllocator,
 }
 
 impl FolderStore {
-    pub fn new(db: Db, gc: Arc<CompactionState>) -> Self {
-        Self {
+    pub async fn new(db: Db, gc: Arc<CompactionState>) -> Result<Self, StorageError> {
+        let seq_lock = Arc::new(Mutex::new(()));
+        let blockseq = SeqAllocator::load(Arc::new(db.clone()), seq_lock.clone()).await?;
+        Ok(Self {
             db,
             gc,
             name_locks: LockPool::new(),
-            seq_lock: Mutex::new(()),
-        }
+            seq_lock,
+            blockseq,
+        })
     }
 
     /// Acquire the per-name lock.
@@ -251,7 +275,7 @@ impl FolderStore {
     async fn commit_with_new_seq(
         &self,
         locked_filename: &LockedFileName<'_>,
-        file: FileInfo,
+        mut stored: crate::proto::storage::FileInfo,
         mut batch: WriteBatch,
     ) -> Result<(i64, FileInfo), StorageError> {
         let name = locked_filename.name();
@@ -272,17 +296,17 @@ impl FolderStore {
         let seq = meta.max_sequence;
         batch.put(store_keys::IX_KEY, meta.encode_to_vec());
 
-        let mut stored = file;
         stored.sequence = seq;
 
         let file_wrapper = File {
-            file_info: Some(stored.clone().into()),
+            file_info: Some(stored.clone()),
         };
         batch.put(store_keys::file_key(name), file_wrapper.encode_to_vec());
         batch.put(store_keys::seq_key(seq)?, name.as_bytes());
 
         self.write_non_durable(batch).await?;
-        Ok((seq, stored))
+        let committed_bep = stored.try_into()?;
+        Ok((seq, committed_bep))
     }
 
     /// Insert or update a file in the index. Handles sequence bookkeeping.
@@ -293,7 +317,7 @@ impl FolderStore {
     pub async fn put_file(&self, file: &FileInfo) -> Result<i64, StorageError> {
         let locked_filename = self.lock_filename(&file.name).await;
         let (seq, _) = self
-            .commit_with_new_seq(&locked_filename, file.clone(), WriteBatch::new())
+            .commit_with_new_seq(&locked_filename, file.clone().into(), WriteBatch::new())
             .await?;
         Ok(seq)
     }
@@ -381,25 +405,25 @@ impl FolderStore {
         let locked_filename = self.lock_filename(name).await;
 
         let inbox_key = store_keys::inbox_key(epoch, locked_filename.name());
-        let staged: FileInfo = match self.db.get(&inbox_key).await.map_err(slate_err)? {
-            Some(bytes) => {
-                let inbox = Inbox::decode(bytes)
-                    .map_err(|e| StorageError::Corruption(format!("decode staged Inbox: {e}")))?;
-                inbox
-                    .file_info
-                    .ok_or_else(|| {
+        let staged: crate::proto::storage::FileInfo =
+            match self.db.get(&inbox_key).await.map_err(slate_err)? {
+                Some(bytes) => {
+                    let inbox = Inbox::decode(bytes).map_err(|e| {
+                        StorageError::Corruption(format!("decode staged Inbox: {e}"))
+                    })?;
+                    inbox.file_info.ok_or_else(|| {
                         StorageError::Corruption(format!(
                             "missing file_info in staged Inbox for {name}"
                         ))
                     })?
-                    .try_into()?
-            }
-            None => return Ok(None), // Idempotent
-        };
+                }
+                None => return Ok(None), // Idempotent
+            };
 
         // If the inbox entry has been overwritten by a newer version (e.g. from an
         // incoming IndexUpdate while older blocks were still downloading), do not commit.
-        if staged.version.as_ref() != expected_version {
+        let staged_bep_version: Option<Vector> = staged.version.clone().map(Into::into);
+        if staged_bep_version.as_ref() != expected_version {
             return Ok(None);
         }
 
@@ -497,10 +521,46 @@ impl FolderStore {
 
     /// Store block data with cross-directory dedup.
     ///
-    /// All writes (data or ref + reverse ref) go through a single `WriteBatch`
+    /// All writes (data or pointer + reverse ref) go through a single `WriteBatch`
+    /// to avoid races between concurrent `store_block` calls with the same hash.
+    pub(crate) async fn get_file_to_update(
+        &self,
+        epoch: Option<Epoch>,
+        name: &str,
+    ) -> Result<(crate::proto::storage::FileInfo, Vec<u8>, bool), StorageError> {
+        if let Some(ep) = epoch {
+            let key = store_keys::inbox_key(ep, name);
+            if let Some(bytes) = self.db.get(&key).await.map_err(slate_err)? {
+                let inbox = Inbox::decode(bytes)
+                    .map_err(|e| StorageError::Corruption(format!("decode staged Inbox: {e}")))?;
+                if let Some(fi) = inbox.file_info {
+                    return Ok((fi, key, true));
+                }
+            }
+        }
+
+        // Fall back to main index
+        let key = store_keys::file_key(name);
+        if let Some(bytes) = self.db.get(&key).await.map_err(slate_err)? {
+            let file_wrapper = File::decode(bytes)
+                .map_err(|e| StorageError::Corruption(format!("decode File: {e}")))?;
+            if let Some(fi) = file_wrapper.file_info {
+                return Ok((fi, key, false));
+            }
+        }
+
+        Err(StorageError::NotFound(format!(
+            "file not found in inbox or main index: {name}"
+        )))
+    }
+
+    /// Store block data with cross-directory dedup.
+    ///
+    /// All writes (data or pointer + reverse ref) go through a single `WriteBatch`
     /// to avoid races between concurrent `store_block` calls with the same hash.
     pub async fn store_block(
         &self,
+        epoch: Option<Epoch>,
         name: &str,
         hash: &[u8],
         data: &[u8],
@@ -512,52 +572,126 @@ impl FolderStore {
         let dir = store_keys::dirname(name);
         let mut batch = WriteBatch::new();
 
-        // Check if block already exists somewhere (via reverse ref scan).
-        let existing_dir = self.find_block_dir(hash_arr).await?;
-
-        match existing_dir {
-            Some(canonical_dir) if canonical_dir != dir => {
-                // Block exists in another directory — write a reference.
-                let ref_key = store_keys::block_ref_key(dir, hash_arr);
-                let block_ref = BlockRef {
-                    source_dir: canonical_dir,
-                };
-                batch.put(ref_key, block_ref.encode_to_vec());
+        let is_inline = data.len() < 4096;
+        if is_inline {
+            // Find and update the FileInfo in inbox or main index.
+            let (mut file_info, key_to_update, is_inbox) =
+                self.get_file_to_update(epoch, name).await?;
+            let mut updated_any = false;
+            for block in &mut file_info.blocks {
+                if block.hash == hash {
+                    block.inline_data = Some(data.to_vec());
+                    block.blockseq = None;
+                    updated_any = true;
+                }
             }
-            Some(_) => {
-                // Block already exists in the same directory — no-op for data.
+            if !updated_any {
+                return Err(StorageError::NotFound(format!(
+                    "block with hash {} not found in file {}",
+                    hex::encode(hash),
+                    name
+                )));
+            }
+
+            if is_inbox {
+                let inbox_wrapper = Inbox {
+                    file_info: Some(file_info),
+                };
+                batch.put(key_to_update, inbox_wrapper.encode_to_vec());
+            } else {
+                let file_wrapper = File {
+                    file_info: Some(file_info),
+                };
+                batch.put(key_to_update, file_wrapper.encode_to_vec());
+            }
+            self.write_non_durable(batch).await?;
+            return Ok(());
+        }
+
+        // Check if block already exists somewhere (via reverse ref scan).
+        let existing = self.find_block_dir(hash_arr).await?;
+
+        let seq = match existing {
+            Some((canonical_dir, block_ref)) => {
+                if canonical_dir != dir {
+                    // Block exists in another directory — write a reference pointer pointing to same seqno.
+                    let local_pointer_key = store_keys::block_pointer_key(dir, hash_arr);
+                    batch.put(local_pointer_key, block_ref.encode_to_vec());
+                }
+                block_ref.seqno
             }
             None => {
-                // New block — write the actual data.
-                let data_key = store_keys::block_data_key(dir, hash_arr);
+                // New block — write the actual data to bd/<seqno> and a pointer to b/<dir>/<hash>.
+                let seq = self.blockseq.allocate().await?;
+                let data_key = store_keys::block_data_seq_key(seq);
                 batch.put(data_key, data);
+
+                let pointer_key = store_keys::block_pointer_key(dir, hash_arr);
+                let block_ref = BlockRef { seqno: seq };
+                batch.put(pointer_key, block_ref.encode_to_vec());
+                seq
             }
-        }
+        };
 
         // Always write the reverse ref.
         let rev_key = store_keys::block_reverse_key(hash_arr, name);
         batch.put(rev_key, []);
 
+        // Find and update the FileInfo in inbox or main index.
+        let (mut file_info, key_to_update, is_inbox) = self.get_file_to_update(epoch, name).await?;
+        let mut updated_any = false;
+        for block in &mut file_info.blocks {
+            if block.hash == hash {
+                block.blockseq = Some(seq);
+                block.inline_data = None;
+                updated_any = true;
+            }
+        }
+        if !updated_any {
+            return Err(StorageError::NotFound(format!(
+                "block with hash {} not found in file {}",
+                hex::encode(hash),
+                name
+            )));
+        }
+
+        if is_inbox {
+            let inbox_wrapper = Inbox {
+                file_info: Some(file_info),
+            };
+            batch.put(key_to_update, inbox_wrapper.encode_to_vec());
+        } else {
+            let file_wrapper = File {
+                file_info: Some(file_info),
+            };
+            batch.put(key_to_update, file_wrapper.encode_to_vec());
+        }
+
         self.write_non_durable(batch).await?;
-        self.gc.record_block_write(hash_arr);
+        self.gc.record_block_write(hash_arr, Some(seq));
         Ok(())
     }
 
     /// Record that a block is now also used by the given file.
     ///
     /// If the block is already stored somewhere in the folder, writes a
-    /// reference (or a no-op if it's already in the same directory) and returns
+    /// pointer (or a no-op if it's already in the same directory) and returns
     /// `true`. If the block is missing, returns `false`.
-    pub async fn reuse_block(&self, name: &str, hash: &[u8]) -> Result<bool, StorageError> {
+    pub async fn reuse_block(
+        &self,
+        epoch: Option<Epoch>,
+        name: &str,
+        hash: &[u8],
+    ) -> Result<bool, StorageError> {
         let hash_arr: &[u8; store_keys::HASH_LEN] = hash
             .try_into()
             .map_err(|_| StorageError::InvalidInput("block hash must be 32 bytes".into()))?;
 
         // Check if block already exists somewhere.
-        let existing_dir = self.find_block_dir(hash_arr).await?;
+        let existing = self.find_block_dir(hash_arr).await?;
 
-        let canonical_dir = match existing_dir {
-            Some(d) => d,
+        let (canonical_dir, block_ref) = match existing {
+            Some((d, r)) => (d, r),
             None => return Ok(false),
         };
 
@@ -565,45 +699,79 @@ impl FolderStore {
         let mut batch = WriteBatch::new();
 
         if canonical_dir != dir {
-            // Block exists in another directory — write a reference.
-            let ref_key = store_keys::block_ref_key(dir, hash_arr);
-            let block_ref = BlockRef {
-                source_dir: canonical_dir,
-            };
-            batch.put(ref_key, block_ref.encode_to_vec());
+            // Block exists in another directory — write a reference pointer pointing to same seqno.
+            let local_pointer_key = store_keys::block_pointer_key(dir, hash_arr);
+            batch.put(local_pointer_key, block_ref.encode_to_vec());
         }
 
         // Always write/update the reverse ref.
         let rev_key = store_keys::block_reverse_key(hash_arr, name);
         batch.put(rev_key, []);
 
+        // Find and update the FileInfo in inbox or main index.
+        let (mut file_info, key_to_update, is_inbox) = self.get_file_to_update(epoch, name).await?;
+        let mut updated_any = false;
+        for block in &mut file_info.blocks {
+            if block.hash == hash {
+                block.blockseq = Some(block_ref.seqno);
+                block.inline_data = None;
+                updated_any = true;
+            }
+        }
+        if !updated_any {
+            return Err(StorageError::NotFound(format!(
+                "block with hash {} not found in file {}",
+                hex::encode(hash),
+                name
+            )));
+        }
+
+        if is_inbox {
+            let inbox_wrapper = Inbox {
+                file_info: Some(file_info),
+            };
+            batch.put(key_to_update, inbox_wrapper.encode_to_vec());
+        } else {
+            let file_wrapper = File {
+                file_info: Some(file_info),
+            };
+            batch.put(key_to_update, file_wrapper.encode_to_vec());
+        }
+
         self.write_non_durable(batch).await?;
-        self.gc.record_block_write(hash_arr);
+        self.gc.record_block_write(hash_arr, Some(block_ref.seqno));
         Ok(true)
     }
 
     /// Read block data, chasing references if needed.
     pub async fn read_block(&self, name: &str, hash: &[u8]) -> Result<Bytes, StorageError> {
-        let hash_arr: &[u8; store_keys::HASH_LEN] = hash
+        let _hash_arr: &[u8; store_keys::HASH_LEN] = hash
             .try_into()
             .map_err(|_| StorageError::InvalidInput("block hash must be 32 bytes".into()))?;
 
-        let dir = store_keys::dirname(name);
-
-        // Try direct data first.
-        let data_key = store_keys::block_data_key(dir, hash_arr);
-        if let Some(data) = self.db.get(&data_key).await.map_err(slate_err)? {
-            return Ok(data);
-        }
-
-        // Try reference.
-        let ref_key = store_keys::block_ref_key(dir, hash_arr);
-        if let Some(ref_bytes) = self.db.get(&ref_key).await.map_err(slate_err)? {
-            let block_ref = BlockRef::decode(ref_bytes)
-                .map_err(|e| StorageError::Corruption(format!("decode BlockRef: {e}")))?;
-            let canonical_key = store_keys::block_data_key(&block_ref.source_dir, hash_arr);
-            if let Some(data) = self.db.get(&canonical_key).await.map_err(slate_err)? {
-                return Ok(data);
+        // 1. Try to read from main file index
+        if let Some(bytes) = self
+            .db
+            .get(store_keys::file_key(name))
+            .await
+            .map_err(slate_err)?
+        {
+            let file_wrapper = File::decode(bytes)
+                .map_err(|e| StorageError::Corruption(format!("decode File: {e}")))?;
+            if let Some(fi) = file_wrapper.file_info {
+                for block in fi.blocks {
+                    if block.hash == hash {
+                        if let Some(inline_data) = block.inline_data {
+                            return Ok(Bytes::from(inline_data));
+                        } else if let Some(seq) = block.blockseq {
+                            store_keys::validate_block_seq(seq)?;
+                            let data_key = store_keys::block_data_seq_key(seq);
+                            if let Some(data) = self.db.get(&data_key).await.map_err(slate_err)? {
+                                return Ok(data);
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -638,10 +806,26 @@ impl FolderStore {
     /// in the candidate directory before returning it. When a compaction GC is
     /// active, also checks that the hash is safe (recognised by all active
     /// known_live filters or written since the snapshot).
+    ///
+    /// TODO: remove the `bd/<seq>` existence check at the end of the loop.
+    /// It is load-bearing today because the dual-bloom GC builds
+    /// `known_live_hashes` and `known_live_seqs` in **separate compaction
+    /// jobs with separate snapshots** — a metadata-segment job whose
+    /// snapshot still sees a file F can `Keep b/<H>` while a later
+    /// block-segment job whose snapshot has lost F can `Drop bd/<S>`,
+    /// leaving a pointer without data. The defensive get keeps that state
+    /// from poisoning dedup (it falls through to the new-block branch,
+    /// which self-heals by allocating a fresh seqno and re-writing the
+    /// bytes). Once the two jobs share a snapshot epoch — or otherwise
+    /// prove "`b/` outlives `bd/`" is unreachable — this branch can return
+    /// `Some((dir, block_ref))` without the second `db.get` and save one
+    /// block-segment lookup per dedup hit. See the "find_block_dir
+    /// defensive `bd/<seq>` existence check" caveat in
+    /// `bepository-storage/OVERVIEW.md`.
     async fn find_block_dir(
         &self,
         hash: &[u8; store_keys::HASH_LEN],
-    ) -> Result<Option<String>, StorageError> {
+    ) -> Result<Option<(String, BlockRef)>, StorageError> {
         // If a compaction is about to GC this hash, pretend it doesn't exist
         // so the caller writes full data (which then gets recorded via
         // record_block_write).
@@ -655,9 +839,15 @@ impl FolderStore {
         while let Some(kv) = iter.next().await.map_err(slate_err)? {
             if let Some((_hash, name)) = store_keys::parse_block_reverse_key(&kv.key) {
                 let dir = store_keys::dirname(&name).to_string();
-                let data_key = store_keys::block_data_key(&dir, hash);
-                if self.db.get(&data_key).await.map_err(slate_err)?.is_some() {
-                    return Ok(Some(dir));
+                let pointer_key = store_keys::block_pointer_key(&dir, hash);
+                if let Some(ref_bytes) = self.db.get(&pointer_key).await.map_err(slate_err)? {
+                    let block_ref = BlockRef::decode(ref_bytes)
+                        .map_err(|e| StorageError::Corruption(format!("decode BlockRef: {e}")))?;
+                    store_keys::validate_block_seq(block_ref.seqno)?;
+                    let data_key = store_keys::block_data_seq_key(block_ref.seqno);
+                    if self.db.get(&data_key).await.map_err(slate_err)?.is_some() {
+                        return Ok(Some((dir, block_ref)));
+                    }
                 }
             }
         }
@@ -682,5 +872,114 @@ pub(crate) fn slate_err(e: slatedb::Error) -> StorageError {
         ErrorKind::Data => StorageError::Corruption(format!("slatedb data error: {e}")),
         ErrorKind::Invalid => StorageError::InvalidInput(format!("slatedb invalid: {e}")),
         _ => StorageError::TransientIo(format!("slatedb: {e}")),
+    }
+}
+
+/// A range of sequence numbers reserved in RAM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SeqRange {
+    pub(crate) next: u64,
+    pub(crate) end: u64,
+}
+
+/// Bounded block sequence allocator. Bumps the persisted high water mark in `ix`
+/// by batches of N to avoid database writes on the block hot path.
+pub struct SeqAllocator {
+    pub(crate) db: Arc<Db>,
+    pub(crate) seq_lock: Arc<Mutex<()>>,
+    pub(crate) state: parking_lot::Mutex<SeqRange>,
+}
+
+/// Reservation batch size. Amortizes the cost of durable disk writes.
+/// Worst-case crash waste is bounded by N - 1.
+const RESERVATION_N: u64 = 256;
+
+impl SeqAllocator {
+    pub async fn load(db: Arc<Db>, seq_lock: Arc<Mutex<()>>) -> Result<Self, StorageError> {
+        let ix_bytes = db.get(store_keys::IX_KEY).await.map_err(slate_err)?;
+        let persisted = match ix_bytes {
+            Some(bytes) => {
+                let meta = FolderIndexMeta::decode(bytes).map_err(|e| {
+                    StorageError::Corruption(format!("decode FolderIndexMeta: {e}"))
+                })?;
+                meta.next_blockseq.unwrap_or(0)
+            }
+            None => 0,
+        };
+
+        Ok(Self {
+            db,
+            seq_lock,
+            state: parking_lot::Mutex::new(SeqRange {
+                next: persisted,
+                end: persisted,
+            }),
+        })
+    }
+
+    pub async fn allocate(&self) -> Result<u64, StorageError> {
+        // Fast path: check if we have remaining sequences in the current reservation.
+        {
+            let mut state = self.state.lock();
+            if state.next < state.end {
+                let seq = state.next;
+                state.next += 1;
+                return Ok(seq);
+            }
+        }
+
+        // Slow path: acquire the async seq_lock to serialize refill operations.
+        let _guard = self.seq_lock.lock().await;
+
+        // Double check: check if someone else did the refill while we waited for seq_lock.
+        {
+            let mut state = self.state.lock();
+            if state.next < state.end {
+                let seq = state.next;
+                state.next += 1;
+                return Ok(seq);
+            }
+        }
+
+        // Refill the reservation.
+        let ix_bytes = self.db.get(store_keys::IX_KEY).await.map_err(slate_err)?;
+        let mut meta = match ix_bytes {
+            Some(bytes) => FolderIndexMeta::decode(bytes)
+                .map_err(|e| StorageError::Corruption(format!("decode FolderIndexMeta: {e}")))?,
+            None => FolderIndexMeta::default(),
+        };
+
+        let base = meta
+            .next_blockseq
+            .unwrap_or(0)
+            .max(store_keys::MIN_BLOCK_SEQ);
+        let next_limit = base + RESERVATION_N;
+        meta.next_blockseq = Some(next_limit);
+
+        // Write the new reservation without waiting on the auto-flush timer
+        // (which may be tens of seconds), then trigger an immediate flush.
+        let options = WriteOptions {
+            await_durable: false,
+            ..Default::default()
+        };
+        self.db
+            .put_with_options(
+                store_keys::IX_KEY,
+                meta.encode_to_vec(),
+                &PutOptions::default(),
+                &options,
+            )
+            .await
+            .map_err(slate_err)?;
+        self.db.flush().await.map_err(slate_err)?;
+
+        // Update local state and hand out the first sequence.
+        {
+            let mut state = self.state.lock();
+            state.next = base + 1;
+            state.end = next_limit;
+        }
+
+        Ok(base)
     }
 }

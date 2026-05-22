@@ -154,17 +154,50 @@ connections.
 
 ### Write path
 
-- **Flush interval & size:** Tuned for frequent flushes (e.g., 60s, 4MB) to
-  bound L0 SST upload times.
-- **Parallelism:** Serialized L0 uploads as cold storage does not need high
-  flush throughput.
+- **Flush interval & size:** Tuned for frequent flushes (60 s,
+  `l0_sst_size_bytes = 8 MiB`) to bound L0 SST upload times.
+- **Parallelism:** Serialized L0 uploads (`l0_flush_parallelism = 1`) as cold
+  storage does not need high flush throughput.
+- **L0 headroom (`l0_max_ssts`):** Set to `512` to clear the worst-case L0
+  occupancy of the `bd/` segment under sustained sync on a slow uplink.
+
+  The per-segment math (under sustained sync on a slow uplink):
+
+  - **Trigger:** size-tiered compaction on `bd/` fires at
+    `min_compaction_sources` = 32 L0 SSTs.
+  - **Pin window:** those 32 source SSTs remain in `manifest.l0()` until the
+    manifest commit — about ~100 s wall-clock to rewrite ~32 × 8 MiB ≈ 256 MiB
+    at a ~2.5 MB/s effective uplink.
+  - **Arrivals:** during the pin window new memtable freezes land one L0 SST per
+    freeze in `bd/` at a similar ~3 s cadence, so ~32 new SSTs accumulate before
+    the sources are released.
+
+  Effective L0 peak ≈ `2 × min_compaction_sources` = 64.
+
+  If `l0_max_ssts` is tighter than that peak, the flusher's per-segment
+  `can_dispatch` refuses to dispatch the next immutable memtable, and writes
+  block on `max_unflushed_bytes` backpressure for the duration of the in-flight
+  compaction. 512 puts the ceiling well above the worst case with margin to
+  spare; the memory cost is only the in-RAM filter+index for each L0 SST, a few
+  MB total.
+
+  *Note:* this prevents *entering* the saturation stall. There is a separate
+  slatedb-side recovery latency — the compactor and the in-process flusher
+  tracker share no direct state path; the flusher only learns about compactor L0
+  drops via periodic manifest re-read (gated by
+  `Settings::manifest_poll_interval`). If `l0_max_ssts` were ever reached,
+  exiting the stall would wait up to one poll interval. At the current
+  configuration the cap is unreachable in practice, so the wake-up latency is
+  not on the hot path.
 
 ### Compactor
 
-- **Poll interval:** Reduced to minimize idle wake-ups.
-- **Max SST size:** Tuned down so uploads complete within connection timeout
-  budgets.
-- **Concurrency:** Serialized to reduce CPU burst.
+- **Poll interval:** Lengthened to 60 s (slatedb default is 5 s) so the
+  compactor wakes the radio less often when there is no work.
+- **Max SST size:** Tuned down to 128 MiB so each compaction-output upload
+  completes within a single GCS retry window on the slow link.
+- **Concurrency:** Serialized (`max_concurrent_compactions = 1`) to reduce CPU
+  burst.
 
 ## Compaction GC
 
@@ -201,3 +234,117 @@ or skipping.
   safely rewriting it.
 - **Crash safety:** Bloom filters are in-memory. SlateDB handles crash recovery
   independently. s are in-memory. SlateDB handles crash recovery independently.
+
+## Caveats and follow-ups
+
+These are known suboptimalities or deferred design decisions. Each is explicitly
+*not* on the critical path for the current release but is worth revisiting.
+
+### `manifest_poll_interval = 10 s` is a placeholder
+
+`Settings::manifest_poll_interval` governs how often the in-process writer
+re-reads the manifest from object storage. In single-writer mode this is the
+*only* path by which the writer's flusher tracker learns that the in-process
+compactor has dropped L0 SSTs — the compactor and the flusher tracker share no
+direct in-memory state. So this knob also bounds the worst-case stall after a
+saturation event: if `can_dispatch` ever refuses an imm because of L0
+saturation, the flusher waits up to one poll interval for the next re-read
+before it can resume dispatching.
+
+The slatedb library default is 1 s. We previously used 120 s to minimise battery
+and request cost; under the saturation math in the L0 headroom section that
+turned out to be load-bearing for a stall floor we did hit. With
+`l0_max_ssts = 512` the cap is unreachable in practice, so the stall floor is
+mostly theoretical — but 120 s would still be the recovery time if it ever did
+hit.
+
+10 s is a defensive compromise: a short enough floor that any future saturation
+would surface quickly, with a modest GET-per-hour cost (~360/h even at idle). It
+is *almost certainly* not the right answer:
+
+- on a foreground-active device 1 s would be free and consistent with the
+  library default;
+- on a battery-powered idle device even 360 GETs/h is wasteful — most of those
+  GETs see no change.
+
+The architecturally correct fix is upstream: have the slatedb compactor notify
+the in-process flusher tracker directly when it commits a manifest update with
+reduced L0 counts, so the writer doesn't depend on the periodic re-read at all.
+That would let us keep `manifest_poll_interval` high without the stall-floor
+risk. File against slatedb when revisiting.
+
+### `find_block_dir` defensive `bd/<seq>` existence check
+
+`bepository-storage/src/store.rs` `find_block_dir` (see the `TODO(phase-7)` doc
+comment on the function) ends each candidate iteration with a defensive
+`db.get(bd/<block_ref.seqno>)` before returning a hit. It is load-bearing today
+because the dual-bloom GC builds `known_live_hashes` and `known_live_seqs` in
+separate compaction jobs with potentially-different snapshots, leaving a
+"pointer outlives data" window that the defensive `get` self-heals by falling
+through to the new-block branch.
+
+Once the dual-bloom GC shares a snapshot epoch across the two jobs (or otherwise
+proves "`b/` outlives `bd/`" is unreachable), the second `db.get` is pure
+overhead — one extra block-segment lookup per dedup hit on the write hot path.
+Acceptance: a test that constructs the "pointer survives, data dropped"
+interleaving and shows it cannot occur, then remove the check and re-measure
+dedup throughput.
+
+### Skip refetching blocks already present in the prior version of a file
+
+When the master sends an updated `FileInfo` for a name already tracked, the
+inbox / commit path currently treats every block on the new block list as
+something that *may* need to be fetched from the master and re-stored. For each
+block whose `(hash, offset, size)` triple appears unchanged between the old `n/`
+entry and the incoming one, we should:
+
+1. skip the network fetch entirely,
+2. reuse the existing `BlockInfo` (carrying its `blockseq` for separated blocks
+   or its inline `bytes` for inline blocks) directly in the new `n/` entry, and
+3. skip emitting a fresh `br/` reverse ref since the existing one already covers
+   this name.
+
+This is per-file dedup-by-prior-version, distinct from the cross-file cross-dir
+dedup that `reuse_block` already does via the `b/<dir>/<hash>` lookup. The
+seqno-keyed layout makes it especially cheap: the prior `BlockInfo.blockseq` is
+compaction-stable and the pointed-at `bd/<seq>` row is guaranteed live by virtue
+of the old `n/` entry still referencing it.
+
+Lives in the commit path (likely `bepository-bep` / inbox machinery), not in the
+storage crate. Acceptance: a test that commits version v1 of a file, then
+commits v2 sharing N of v1's blocks, and asserts no network fetches for those N
+blocks (and no `bd/<new_seq>` rows allocated for them).
+
+### Reconsider whether a custom compaction scheduler is justified
+
+Phase 10 produced two numbers: block-segment bottom-run rewrite bytes/cycle
+under a realistic overwrite/delete pattern, and metadata- segment tombstone
+backlog (bytes of soft-deleted `n/`, stale `in/<old-epoch>`, and `s/<seq>` below
+`peer_floor` that have not yet reached the bottom SR) under the same workload.
+Use them to decide what the production scheduler should be.
+
+Phase 8 landed three custom-scheduler code paths:
+`FullCompactionSchedulerSupplier` (admin one-shot `compact()`),
+`BepCompactionSchedulerSupplier` (the production per-segment policy —
+size-tiered forwarded for `bd/`, full compaction for every other segment), and
+`BepCompactionScheduler` itself. The prior justification for all three was a
+priori, not measured. The GC filter is per-row and runs on every key that flows
+through any compaction, so stock size-tiered is *correct* for both segments; the
+block segment's settle-and-stay property comes from the segment extractor +
+seqno ordering (cold high-key SRs stop being re-selected), not from any custom
+policy. The only thing full compaction on the metadata segment buys is faster
+tombstone reclamation.
+
+**Decide from the numbers:** if Phase 10's tombstone backlog stays within budget
+under stock size-tiered, delete `BepCompactionScheduler*` and
+`FullCompactionSchedulerSupplier`, drop the second DB-open in `compact()`, and
+either reimplement `compact()` as `admin.submit_compaction(spec)` against the
+running compactor (if forced GC is still wanted as an admin tool) or remove it
+entirely. If the backlog exceeds budget, keep a per-segment scheduler — but the
+design note that introduces it should cite the Phase 10 number that forced the
+choice.
+
+Acceptance: either (a) a tracked delete of `BepCompactionScheduler*` and
+`FullCompactionSchedulerSupplier`, with a one-paragraph design-doc update
+recording the Phase 10 figures that justified going stock; or (b) a per-segment
+scheduler whose design-doc justification quotes those same figures.

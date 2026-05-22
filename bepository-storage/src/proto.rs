@@ -152,6 +152,8 @@ impl From<bep::BlockInfo> for storage::BlockInfo {
             hash: b.hash,
             offset: b.offset,
             size: b.size,
+            blockseq: None,
+            inline_data: None,
         }
     }
 }

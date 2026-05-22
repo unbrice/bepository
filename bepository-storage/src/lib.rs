@@ -21,3 +21,6 @@ pub use fsck::FsckLevel;
 pub use meta::CheckpointSchedule;
 pub use snapshot::{FsEntry, SnapshotError, SnapshotFs, SnapshotRef};
 pub use snapshot_fs::SlateSnapshotRef;
+
+#[cfg(any(test, feature = "test-utils"))]
+pub use store::SeqAllocator;

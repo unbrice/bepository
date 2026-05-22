@@ -58,7 +58,7 @@ fn bepository_run(args: &[&str]) -> std::process::Output {
 
 /// Run `bepository init` and return the device ID.
 fn bepository_init(storage_uri: &str) -> String {
-    let output = bepository_run(&["init", storage_uri]);
+    let output = bepository_run(&["init", "-s", storage_uri]);
     assert!(
         output.status.success(),
         "init failed: {}",
@@ -78,7 +78,7 @@ fn bepository_init(storage_uri: &str) -> String {
 
 /// Forcibly clear the distributed lock on storage.
 fn bepository_clear_lock(storage_uri: &str) {
-    let _ = bepository_run(&["fsck", storage_uri, "--clear-lock"]);
+    let _ = bepository_run(&["fsck", "-s", storage_uri, "--clear-lock"]);
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +97,7 @@ impl BepositoryProcess {
         let child = Command::new(bepository_binary())
             .args([
                 "serve",
+                "-s",
                 storage_uri,
                 peer_device_id,
                 "--listen",
