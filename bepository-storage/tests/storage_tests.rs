@@ -24,6 +24,9 @@ async fn make_storage() -> SlateStorage {
         None,
         tokio::runtime::Handle::current(),
     );
+    // Tests that trigger `compact()` shouldn't wait a full prod 60 s tick
+    // before the compactor picks up the submitted job.
+    s.set_compactor_poll_interval(std::time::Duration::from_millis(100));
     s.activate(bepository_lock::Epoch::new(1).unwrap())
         .await
         .unwrap();

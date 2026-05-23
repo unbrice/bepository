@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use linear_map::LinearMap;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -19,7 +19,10 @@ use object_store::ObjectStore;
 use parking_lot::{Mutex, RwLock};
 use secrecy::SecretSlice;
 use slatedb::admin::AdminBuilder;
-use slatedb::config::{CheckpointOptions, CheckpointScope, CompactorOptions, Settings};
+use slatedb::compactor::{CompactionSpec, SourceId};
+use slatedb::config::{
+    CheckpointOptions, CheckpointScope, CompactorOptions, FlushOptions, FlushType, Settings,
+};
 use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
 use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
 use slatedb::db_cache::{CachedEntry, DbCache};
@@ -38,9 +41,7 @@ use bepository_bep::storage::{Sequence, Storage, StorageFolder, UpdateResult, bl
 use bepository_bep::{Ordering, compare};
 use bepository_lock::Epoch;
 
-use crate::compaction::{
-    BepCompactionSchedulerSupplier, FullCompactionSchedulerSupplier, GcFilterSupplier,
-};
+use crate::compaction::{GcFilterSupplier, StoreSlot};
 use crate::meta::{self, CheckpointSchedule, FolderEntry, Meta, MetaIdentity};
 use crate::store::{CompactionState, FolderStore};
 use bepository_tls::Identity;
@@ -118,6 +119,10 @@ struct SlateStorageInner {
     /// When set, each folder gets a subdirectory based on the resolved device ID.
     cache_provider: Option<Arc<dyn CacheProvider + Send + Sync>>,
     runtime: tokio::runtime::Handle,
+    /// Override for the SlateDB compactor `poll_interval`. `None` means use the
+    /// default from `make_db_settings`. Snapshotted into [`Activated`] at
+    /// `activate()` time; mutating it later has no effect.
+    compactor_poll_interval: Mutex<Option<Duration>>,
     activated: std::sync::OnceLock<Arc<Activated>>,
 }
 
@@ -164,6 +169,9 @@ struct Activated {
     cache_provider: Option<Arc<dyn CacheProvider + Send + Sync>>,
     runtime: tokio::runtime::Handle,
     db_cache: tokio::sync::OnceCell<Arc<dyn DbCache>>,
+    /// Snapshot of [`SlateStorageInner::compactor_poll_interval`] taken in
+    /// `activate()`. `None` keeps `make_db_settings`'s default.
+    compactor_poll_interval: Option<Duration>,
 }
 
 /// Provides the base directory for the Foyer block cache, computed from the device ID.
@@ -191,9 +199,22 @@ impl SlateStorage {
                 readers: Mutex::new(HashMap::new()),
                 cache_provider,
                 runtime,
+                compactor_poll_interval: Mutex::new(None),
                 activated: std::sync::OnceLock::new(),
             }),
         }
+    }
+
+    /// Override the SlateDB compactor `poll_interval` for every folder opened
+    /// after this call. Must be called *before* [`activate()`] — the value is
+    /// snapshotted at activation time. Use to make `compact()` start work
+    /// within seconds (short-lived processes like `fsck-compact`, tests)
+    /// instead of waiting up to the production default (~60 s, tuned as a
+    /// battery floor).
+    ///
+    /// [`activate()`]: SlateStorage::activate
+    pub fn set_compactor_poll_interval(&self, interval: Duration) {
+        *self.inner.compactor_poll_interval.lock() = Some(interval);
     }
 
     fn activated(&self) -> Result<&Activated, StorageError> {
@@ -223,6 +244,7 @@ impl SlateStorage {
             cache_provider: self.inner.cache_provider.clone(),
             runtime: self.inner.runtime.clone(),
             db_cache: tokio::sync::OnceCell::new(),
+            compactor_poll_interval: *self.inner.compactor_poll_interval.lock(),
         });
         self.inner
             .activated
@@ -498,12 +520,11 @@ impl SlateStorage {
     /// Requires `activate()` — the GC filter needs the current epoch to
     /// distinguish live inbox entries from stale ones.
     ///
-    /// Any cached handle for this folder is closed first, then a temporary
-    /// DB is opened with [`FullCompactionSchedulerSupplier`] which merges all
-    /// L0 SSTs and sorted runs into one sorted run on the first compactor
-    /// poll. Every key passes through the GC filter, physically reclaiming
-    /// orphaned blocks. The temporary handle is closed immediately after —
-    /// it is never inserted into the store cache.
+    /// Snapshots the manifest via the admin handle and submits one
+    /// full-merge spec per non-empty segment to the running compactor, then
+    /// waits until those source SSTs/SRs have been consumed. Every key in
+    /// each submitted spec passes through the GC filter, physically
+    /// reclaiming orphaned blocks.
     #[tracing::instrument(level = "info", skip_all, fields(folder_id = %folder_id))]
     pub async fn compact(&self, folder_id: FolderId) -> Result<(), StorageError> {
         self.activated()?.compact(folder_id).await
@@ -951,20 +972,14 @@ impl Activated {
     }
 
     /// Open a SlateDB instance for `folder_sk` with the standard cold-archive
-    /// configuration. When `full_compaction` is true, additionally installs
-    /// `FullCompactionSchedulerSupplier` (used by `compact()` for one-shot GC runs).
-    /// Returns the wrapped `FolderStore`. Does **not** insert into the cache —
-    /// callers decide the lifetime.
-    async fn open_folder_store(
-        &self,
-        folder_sk: &str,
-        full_compaction: bool,
-    ) -> Result<Arc<FolderStore>, StorageError> {
+    /// configuration. Returns the wrapped `FolderStore`. Does **not** insert
+    /// into the cache — callers decide the lifetime.
+    async fn open_folder_store(&self, folder_sk: &str) -> Result<Arc<FolderStore>, StorageError> {
         let path = folder_sk.to_string();
         let db_cache = self.get_shared_db_cache().await?;
 
         let gc = Arc::new(CompactionState::new());
-        let store_slot = Arc::new(std::sync::OnceLock::<Arc<FolderStore>>::new());
+        let store_slot = Arc::new(StoreSlot::new());
 
         let supplier = Arc::new(GcFilterSupplier::new(
             path.clone(),
@@ -973,31 +988,30 @@ impl Activated {
             self.epoch,
         ));
 
-        // Shorten the compactor's scheduler tick for the one-shot
-        // `compact()` path so the first job is proposed within ~1 s
-        // instead of the 60 s default we use in steady state.
         let mut settings = make_db_settings();
-        if full_compaction && let Some(c) = settings.compactor_options.as_mut() {
-            c.poll_interval = Duration::from_secs(1);
+        if let Some(poll) = self.compactor_poll_interval
+            && let Some(c) = settings.compactor_options.as_mut()
+        {
+            c.poll_interval = poll;
         }
 
         // `l0_max_ssts` is the per-segment ceiling at which the flusher
-        // refuses to dispatch the next immutable memtable. For the `bd/`
+        // refuses to dispatch the next immutable memtable. For the `b`
         // segment under sustained sync on a slow uplink the saturation
         // math is:
         //
-        //   * a size-tiered compaction job for `bd/` triggers at
+        //   * a size-tiered compaction job for `b` triggers at
         //     `min_compaction_sources` (32) L0 SSTs and pins those 32
         //     source SSTs in `manifest.l0()` until the manifest commit;
         //   * the job rewrites ~32 × `l0_sst_size_bytes` ≈ 256 MiB; on a
         //     ~2.5 MB/s effective uplink that is ~100 s wall-clock;
         //   * during the in-flight window new memtable freezes keep
-        //     landing one L0 SST per freeze into `bd/`. With 8 MiB
+        //     landing one L0 SST per freeze into `b`. With 8 MiB
         //     freezes and ~2.5 MB/s upload the freeze cadence is also
         //     ~3 s, so ~32 new SSTs arrive before the sources are
         //     released.
         //
-        // So under sustained sync `bd/`'s effective L0 grows to roughly
+        // So under sustained sync `b`'s effective L0 grows to roughly
         // `2 * min_compaction_sources` (= 64) before the in-flight job
         // commits. If `l0_max_ssts` is tighter than that, every cycle
         // the flusher's per-segment `can_dispatch` refuses new imms;
@@ -1009,7 +1023,7 @@ impl Activated {
             );
             debug_assert!(
                 settings.l0_max_ssts >= 2 * scheduler.min_compaction_sources,
-                "l0_max_ssts ({}) must be >= 2 * min_compaction_sources ({}): a bd/ \
+                "l0_max_ssts ({}) must be >= 2 * min_compaction_sources ({}): a bd \
                  compaction pins its source SSTs until commit while new L0 SSTs \
                  continue to land",
                 settings.l0_max_ssts,
@@ -1020,14 +1034,10 @@ impl Activated {
         let mut compactor_builder = CompactorBuilder::new(path.clone(), self.object_store.clone())
             .with_runtime(self.runtime.clone())
             .with_compaction_filter_supplier(supplier)
+            .with_scheduler_supplier(Arc::new(
+                crate::compaction::BepCompactionSchedulerSupplier::new(store_slot.clone()),
+            ))
             .with_filter_policies(crate::store_keys::make_filter_policies());
-        if full_compaction {
-            compactor_builder = compactor_builder
-                .with_scheduler_supplier(Arc::new(FullCompactionSchedulerSupplier));
-        } else {
-            compactor_builder = compactor_builder
-                .with_scheduler_supplier(Arc::new(BepCompactionSchedulerSupplier::new()));
-        }
         if let Some(ref opts) = settings.compactor_options {
             compactor_builder = compactor_builder.with_options(opts.clone());
         }
@@ -1044,7 +1054,7 @@ impl Activated {
             .map_err(|e| StorageError::TransientIo(format!("open slatedb: {e}")))?;
 
         let store = Arc::new(FolderStore::new(db, gc).await?);
-        let _ = store_slot.set(store.clone());
+        store_slot.set(store.clone());
         Ok(store)
     }
 
@@ -1060,7 +1070,7 @@ impl Activated {
             return Ok(store.clone());
         }
 
-        let store = self.open_folder_store(folder, false).await?;
+        let store = self.open_folder_store(folder).await?;
         tracing::debug!(folder_id = %folder, "opened SlateDB");
         stores.insert(folder.to_string(), store.clone());
         Ok(store)
@@ -1126,52 +1136,127 @@ impl Activated {
 
     async fn compact(&self, folder_id: FolderId) -> Result<(), StorageError> {
         let (sk, _) = self.resolve_folder(folder_id)?;
-
-        // Close any cached handle so the temporary open gets exclusive access.
-        {
-            let mut stores = self.stores.write().await;
-            if let Some(store) = stores.remove(sk.as_str()) {
-                store.close().await?;
-            }
-        }
-
-        let store = self.open_folder_store(sk.as_str(), true).await?;
-
-        // Db::close() cancels background tasks. Wait for L0 to drain before
-        // closing to ensure the compaction isn't aborted mid-upload.
-        //
-        // TODO: Polling L0 emptiness is a proxy for compaction completion.
-        // Replace with a proper completion signal once SlateDB exposes one.
+        // Ensure the DB is open so the background compactor is running and
+        // will pick up the jobs we submit.
+        let store = self.store_for_folder(sk.as_str()).await?;
+        // Flush the active memtable to L0 so recent writes are part of the
+        // manifest snapshot we build specs from. Without this, anything still
+        // resident in the memtable is invisible to the compactor.
+        store
+            .db
+            .flush_with_options(FlushOptions {
+                flush_type: FlushType::MemTable,
+            })
+            .await
+            .map_err(|e| StorageError::TransientIo(format!("flush before compaction: {e}")))?;
         let admin = AdminBuilder::new(sk.to_string(), self.object_store.clone()).build();
+
+        // Submit one spec at a time and wait for its commit before building
+        // the next. Two reasons:
+        //
+        // 1. Size-tiered's validator rejects a pure-L0 spec whose destination
+        //    SR id is `< max(committed SR ids) + 1`. With multiple in-flight
+        //    pure-L0 specs the compactor may process them in any order; once
+        //    the first commits, the others' destinations become stale and
+        //    fail validation. Serializing keeps each spec's destination
+        //    correct at the time it is validated.
+        //
+        // 2. `max_concurrent_compactions = 1` already serializes execution,
+        //    so we lose nothing by serializing submission too.
         let timeout = Duration::from_secs(3600);
         let start = std::time::Instant::now();
-        tokio::time::sleep(Duration::from_secs(2)).await;
         loop {
             let view = admin
                 .read_compactor_state_view()
                 .await
                 .map_err(|e| StorageError::TransientIo(format!("read compactor state: {e}")))?;
             let manifest = view.manifest();
-            let mut l0_empty = manifest.l0().is_empty();
-            for segment in manifest.segments() {
-                if !segment.l0().is_empty() {
-                    l0_empty = false;
-                    break;
+
+            // Skip the default (unsegmented) tree: with our segment extractor
+            // every row routes into a named segment, so the default tree is
+            // empty by construction.
+            let next_segment = manifest
+                .segments()
+                .iter()
+                .find(|s| !s.l0().is_empty() || s.compacted().len() > 1);
+            let Some(segment) = next_segment else {
+                // Force the writer to pick up the manifest changes we just
+                // committed. Without this, reads via the writer's Db handle
+                // would observe stale L0 SSTs until the next periodic
+                // manifest refresh (`manifest_poll_interval`).
+                store
+                    .db
+                    .refresh_manifest()
+                    .await
+                    .map_err(|e| StorageError::TransientIo(format!("refresh manifest: {e}")))?;
+                return Ok(());
+            };
+
+            // Source order required by size-tiered's validator:
+            // L0 newest → oldest (the VecDeque's natural iteration), then
+            // SRs highest id → lowest (the Vec's natural iteration).
+            let mut pending_l0: HashSet<u128> = HashSet::new();
+            let mut pending_sr: HashSet<u32> = HashSet::new();
+            let mut sources: Vec<SourceId> = segment
+                .l0()
+                .iter()
+                .map(|sst| {
+                    pending_l0.insert(u128::from(sst.id));
+                    SourceId::SstView(sst.id)
+                })
+                .collect();
+            let min_sr = segment.compacted().iter().map(|sr| sr.id).min();
+            for run in segment.compacted() {
+                sources.push(SourceId::SortedRun(run.id));
+                if Some(run.id) != min_sr {
+                    pending_sr.insert(run.id);
                 }
             }
-            if l0_empty {
-                break;
-            }
-            if start.elapsed() > timeout {
-                return Err(StorageError::TransientIo(
-                    "compaction timed out after 1h".into(),
-                ));
-            }
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
+            // Specs that include any SR must target the lowest source SR
+            // (size-tiered's validate enforces this — the destination is
+            // overwritten in place). Pure-L0 specs allocate a fresh id one
+            // above every committed SR across all segments.
+            let destination = match min_sr {
+                Some(id) => id,
+                None => manifest
+                    .segments()
+                    .iter()
+                    .flat_map(|s| s.compacted().iter().map(|sr| sr.id))
+                    .max()
+                    .map_or(0, |id| id.saturating_add(1)),
+            };
+            let spec = CompactionSpec::for_segment(segment.prefix().clone(), sources, destination);
+            admin
+                .submit_compaction(spec)
+                .await
+                .map_err(|e| StorageError::TransientIo(format!("submit compaction: {e}")))?;
 
-        store.close().await?;
-        Ok(())
+            // Wait until this spec commits. L0 source SSTs always vanish
+            // from the manifest after commit; source SR ids other than the
+            // destination also vanish. SlateDB does not yet expose a
+            // per-job completion signal, so the poll is a stopgap.
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let view = admin
+                    .read_compactor_state_view()
+                    .await
+                    .map_err(|e| StorageError::TransientIo(format!("read compactor state: {e}")))?;
+                let still_pending = view.manifest().segments().iter().any(|seg| {
+                    seg.l0()
+                        .iter()
+                        .any(|sst| pending_l0.contains(&u128::from(sst.id)))
+                        || seg.compacted().iter().any(|sr| pending_sr.contains(&sr.id))
+                });
+                if !still_pending {
+                    break;
+                }
+                if start.elapsed() > timeout {
+                    return Err(StorageError::TransientIo(
+                        "compaction timed out after 1h".into(),
+                    ));
+                }
+            }
+        }
     }
 }
 
@@ -1622,7 +1707,7 @@ fn make_db_settings() -> Settings {
         // Serializes L0 flushes to avoid bandwidth contention and timeouts on slow links.
         l0_flush_parallelism: 1,
         // Per-segment L0 ceiling at which the flusher stops dispatching imms.
-        // Must clear the bd/ worst case of `2 * min_compaction_sources` (= 64
+        // Must clear the bd worst case of `2 * min_compaction_sources` (= 64
         // under the slow-uplink saturation math; see `open_folder_store`).
         // 512 leaves ample margin for unusual write bursts; the memory cost
         // is only the in-RAM filter+index per SST, a few MB total.
@@ -1646,20 +1731,29 @@ fn make_db_settings() -> Settings {
             // exceeds 3 min on a slow link and risks transient timeouts.
             max_sst_size: 128 * 1024 * 1024,
             // Raise size-tiered scheduler's L0 trigger from the default 4 to 32.
-            // Affects the `bd/` segment only: it routes through size-tiered
-            // (the other segments use full compaction in `BepCompactionScheduler`
-            // and ignore this knob). `bd/` rows are written in monotonically
-            // increasing seqno order, so its L0 SSTs have disjoint key ranges
-            // and reads only ever consult one SST at a time — compaction buys
-            // it nothing for read amplification, only for GC of orphaned rows
-            // and manifest size. Compacting every 4 L0 SSTs (~32 MiB) under a
-            // sustained sync starves memtable flushes (the compactor monopolises
-            // the one available L0-flush slot via `l0_flush_parallelism = 1`);
-            // 32 fires roughly 8× less often while staying well below the
-            // `l0_max_ssts = 64` per-segment backpressure ceiling.
+            // This applies to every segment (size-tiered is the only scheduler).
+            // For the `b` segment, rows are written in monotonically increasing
+            // seqno order, so its L0 SSTs have disjoint key ranges and reads only
+            // ever consult one SST at a time — compaction buys it nothing for read
+            // amplification, only for GC of orphaned rows and manifest size.
+            // Compacting every 4 L0 SSTs (~32 MiB) under a sustained sync starves
+            // memtable flushes; 32 fires roughly 8x less often while staying well
+            // below the `l0_max_ssts` per-segment backpressure ceiling.
+            // The metadata segment will also now wait for 32 L0 SSTs before
+            // compacting, which is a deliberate trade for a much lower compaction
+            // duty cycle compared to rewriting every 4 L0s.
+            // `max_compaction_sources` must be >= `min_compaction_sources`,
+            // otherwise `clamp_min` accepts the pick and `clamp_max` then
+            // truncates it back below `min`, after which the per-tree
+            // backpressure check rejects almost every proposal (estimated
+            // result size shrinks until any existing sorted run trips the
+            // "next SR's compactable run is full" guard). Default max is 8,
+            // so the lone min=32 override left the scheduler unable to make
+            // progress on the `b` segment once a few SRs had accumulated.
             scheduler_options: {
                 let mut m = std::collections::HashMap::new();
                 m.insert("min_compaction_sources".to_string(), "32".to_string());
+                m.insert("max_compaction_sources".to_string(), "64".to_string());
                 m
             },
             ..CompactorOptions::default()

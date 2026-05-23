@@ -33,16 +33,16 @@ folder lives in a single key namespace with prefixed keys.
 
 ### Key layout
 
-| Key                                   | Value                       | Purpose                                                   |
-| ------------------------------------- | --------------------------- | --------------------------------------------------------- |
-| `n/<dir>//<basename>`                 | protobuf `File`             | Primary file index, grouped by directory                  |
-| `s/<seq_be8>`                         | file name (UTF-8)           | Sequence → name mapping for delta index                   |
-| `b/<dir>/<hash_32>`                   | raw block bytes             | Block data, scoped by parent directory                    |
-| `b/<dir>/<hash_32>/ref`               | protobuf `BlockRef`         | Cross-dir dedup pointer to canonical copy                 |
-| `br/<hash_32>/<dir>//<basename>`      | empty                       | Reverse ref: which files reference a block hash           |
-| `in/<epoch_base32>/<dir>//<basename>` | protobuf `Inbox`            | Inbox: file staged during block transfer                  |
-| `ix`                                  | protobuf `FolderIndexMeta`  | Local index metadata (index_id, max_sequence, peer_floor) |
-| `dx/<devid_32>`                       | protobuf `RemoteIndexState` | Per-peer remote sequence tracking                         |
+| Key                                  | Value                       | Purpose                                                   |
+| ------------------------------------ | --------------------------- | --------------------------------------------------------- |
+| `mn<dir>//<basename>`                | protobuf `File`             | Primary file index, grouped by directory                  |
+| `ms<seq_be8>`                        | file name (UTF-8)           | Sequence → name mapping for delta index                   |
+| `bd<seq_be8>`                        | raw block bytes             | Block data (block segment)                                |
+| `mb<dir>/<hash_32>`                  | protobuf `BlockRef`         | Block pointer, scoped by parent directory                 |
+| `mr<hash_32>/<dir>//<basename>`      | empty                       | Reverse ref: which files reference a block hash           |
+| `mi<epoch_base32>/<dir>//<basename>` | protobuf `Inbox`            | Inbox: file staged during block transfer                  |
+| `mx`                                 | protobuf `FolderIndexMeta`  | Local index metadata (index_id, max_sequence, peer_floor) |
+| `md<devid_32>`                       | protobuf `RemoteIndexState` | Per-peer remote sequence tracking                         |
 
 Sequence numbers are big-endian u64 to preserve lexicographic ordering.
 
@@ -54,8 +54,8 @@ duplicating data. Reverse refs enable this lookup and support GC.
 
 ### Delta index
 
-Full index: scan the `n/` prefix. Incremental index: scan `s/` from the sequence
-number forward, resolve each entry to its `n/` file. When a file is updated, the
+Full index: scan the `mn` prefix. Incremental index: scan `ms` from the sequence
+number forward, resolve each entry to its `mn` file. When a file is updated, the
 old sequence mapping is deleted and a new one is written.
 
 ### Inbox and two-phase file intake
@@ -105,11 +105,11 @@ persistence from the wire format, ensuring stability across bepository versions.
 
 ## Invariants
 
-- **Index mutation serialization:** `name_locks` serializes `n/`, `s/`, `in/`
+- **Index mutation serialization:** `name_locks` serializes `mn`, `ms`, `mi`
   mutations per name; `seq_lock` serializes the `IX_KEY` allocation.
-  `commit_with_new_seq` must remain the sole writer of `n/` and `s/`; enforced
-  at the type level by `LockedFileName`. Compaction may drop dead `n/`, `s/`,
-  `in/` entries outside any lock (see Compaction GC); `ix` is preserved.
+  `commit_with_new_seq` must remain the sole writer of `mn` and `ms`; enforced
+  at the type level by `LockedFileName`. Compaction may drop dead `mn`, `ms`,
+  `mi` entries outside any lock (see Compaction GC); `mx` is preserved.
 - **Index commit atomicity:** All mutations for file promotion happen in a
   single atomic batch.
 - **Block reference integrity:** Canonical block data is verified to exist
@@ -159,18 +159,18 @@ connections.
 - **Parallelism:** Serialized L0 uploads (`l0_flush_parallelism = 1`) as cold
   storage does not need high flush throughput.
 - **L0 headroom (`l0_max_ssts`):** Set to `512` to clear the worst-case L0
-  occupancy of the `bd/` segment under sustained sync on a slow uplink.
+  occupancy of the `bd` segment under sustained sync on a slow uplink.
 
   The per-segment math (under sustained sync on a slow uplink):
 
-  - **Trigger:** size-tiered compaction on `bd/` fires at
+  - **Trigger:** size-tiered compaction on the `b` segment fires at
     `min_compaction_sources` = 32 L0 SSTs.
   - **Pin window:** those 32 source SSTs remain in `manifest.l0()` until the
     manifest commit — about ~100 s wall-clock to rewrite ~32 × 8 MiB ≈ 256 MiB
     at a ~2.5 MB/s effective uplink.
   - **Arrivals:** during the pin window new memtable freezes land one L0 SST per
-    freeze in `bd/` at a similar ~3 s cadence, so ~32 new SSTs accumulate before
-    the sources are released.
+    freeze in the `b` segment at a similar ~3 s cadence, so ~32 new SSTs
+    accumulate before the sources are released.
 
   Effective L0 peak ≈ `2 × min_compaction_sources` = 64.
 
@@ -193,7 +193,10 @@ connections.
 ### Compactor
 
 - **Poll interval:** Lengthened to 60 s (slatedb default is 5 s) so the
-  compactor wakes the radio less often when there is no work.
+  compactor wakes the radio less often when there is no work. Short-lived
+  callers that submit a spec and wait for it (e.g. `fsck-compact`, tests)
+  override this per-folder via `SlateStorage::set_compactor_poll_interval`,
+  snapshotted into each folder at activation time.
 - **Max SST size:** Tuned down to 128 MiB so each compaction-output upload
   completes within a single GCS retry window on the slow link.
 - **Concurrency:** Serialized (`max_concurrent_compactions = 1`) to reduce CPU
@@ -215,10 +218,10 @@ compaction filters.
 
 ### Compaction Filter Decisions
 
-- Block data (`b/`, `b/.../ref`) and reverse references (`br/`) are
-  dropped/tombstoned if not in the Bloom filter.
-- Inbox entries (`in/`) from old epochs are tombstoned.
-- Sequence mappings (`s/`) and deleted files below the global peer floor are
+- Block data (`bd`, `mb`) and reverse references (`mr`) are dropped/tombstoned
+  if not in the Bloom filter.
+- Inbox entries (`mi`) from old epochs are tombstoned.
+- Sequence mappings (`ms`) and deleted files below the global peer floor are
   dropped at the lowest sorted run, or tombstoned otherwise.
 
 ### Concurrent Compaction Safety
@@ -233,7 +236,7 @@ or skipping.
   negative not possible, but if dropped), it forces a re-request from peers,
   safely rewriting it.
 - **Crash safety:** Bloom filters are in-memory. SlateDB handles crash recovery
-  independently. s are in-memory. SlateDB handles crash recovery independently.
+  independently.
 
 ## Caveats and follow-ups
 
@@ -273,18 +276,18 @@ reduced L0 counts, so the writer doesn't depend on the periodic re-read at all.
 That would let us keep `manifest_poll_interval` high without the stall-floor
 risk. File against slatedb when revisiting.
 
-### `find_block_dir` defensive `bd/<seq>` existence check
+### `find_block_dir` defensive `bd<seq>` existence check
 
 `bepository-storage/src/store.rs` `find_block_dir` (see the `TODO(phase-7)` doc
 comment on the function) ends each candidate iteration with a defensive
-`db.get(bd/<block_ref.seqno>)` before returning a hit. It is load-bearing today
+`db.get(bd<block_ref.seqno>)` before returning a hit. It is load-bearing today
 because the dual-bloom GC builds `known_live_hashes` and `known_live_seqs` in
 separate compaction jobs with potentially-different snapshots, leaving a
 "pointer outlives data" window that the defensive `get` self-heals by falling
 through to the new-block branch.
 
 Once the dual-bloom GC shares a snapshot epoch across the two jobs (or otherwise
-proves "`b/` outlives `bd/`" is unreachable), the second `db.get` is pure
+proves "`mb` outlives `bd`" is unreachable), the second `db.get` is pure
 overhead — one extra block-segment lookup per dedup hit on the write hot path.
 Acceptance: a test that constructs the "pointer survives, data dropped"
 interleaving and shows it cannot occur, then remove the check and re-measure
@@ -295,56 +298,44 @@ dedup throughput.
 When the master sends an updated `FileInfo` for a name already tracked, the
 inbox / commit path currently treats every block on the new block list as
 something that *may* need to be fetched from the master and re-stored. For each
-block whose `(hash, offset, size)` triple appears unchanged between the old `n/`
+block whose `(hash, offset, size)` triple appears unchanged between the old `mn`
 entry and the incoming one, we should:
 
 1. skip the network fetch entirely,
 2. reuse the existing `BlockInfo` (carrying its `blockseq` for separated blocks
-   or its inline `bytes` for inline blocks) directly in the new `n/` entry, and
-3. skip emitting a fresh `br/` reverse ref since the existing one already covers
+   or its inline `bytes` for inline blocks) directly in the new `mn` entry, and
+3. skip emitting a fresh `mr` reverse ref since the existing one already covers
    this name.
 
 This is per-file dedup-by-prior-version, distinct from the cross-file cross-dir
-dedup that `reuse_block` already does via the `b/<dir>/<hash>` lookup. The
+dedup that `reuse_block` already does via the `mb<dir>/<hash>` lookup. The
 seqno-keyed layout makes it especially cheap: the prior `BlockInfo.blockseq` is
-compaction-stable and the pointed-at `bd/<seq>` row is guaranteed live by virtue
-of the old `n/` entry still referencing it.
+compaction-stable and the pointed-at `bd<seq>` row is guaranteed live by virtue
+of the old `mn` entry still referencing it.
 
 Lives in the commit path (likely `bepository-bep` / inbox machinery), not in the
 storage crate. Acceptance: a test that commits version v1 of a file, then
 commits v2 sharing N of v1's blocks, and asserts no network fetches for those N
-blocks (and no `bd/<new_seq>` rows allocated for them).
+blocks (and no `bd<new_seq>` rows allocated for them).
 
-### Reconsider whether a custom compaction scheduler is justified
+### Compaction scheduler
 
-Phase 10 produced two numbers: block-segment bottom-run rewrite bytes/cycle
-under a realistic overwrite/delete pattern, and metadata- segment tombstone
-backlog (bytes of soft-deleted `n/`, stale `in/<old-epoch>`, and `s/<seq>` below
-`peer_floor` that have not yet reached the bottom SR) under the same workload.
-Use them to decide what the production scheduler should be.
+Every segment runs stock size-tiered. The per-row GC filter (`GcFilter`) fires
+on every key that passes through any compaction, so tombstone reclamation works
+correctly under the stock scheduler. The block segment's settle-and-stay
+property comes from the segment extractor + seqno ordering (cold high-key SRs
+stop being re-selected), not from any custom policy.
 
-Phase 8 landed three custom-scheduler code paths:
-`FullCompactionSchedulerSupplier` (admin one-shot `compact()`),
-`BepCompactionSchedulerSupplier` (the production per-segment policy —
-size-tiered forwarded for `bd/`, full compaction for every other segment), and
-`BepCompactionScheduler` itself. The prior justification for all three was a
-priori, not measured. The GC filter is per-row and runs on every key that flows
-through any compaction, so stock size-tiered is *correct* for both segments; the
-block segment's settle-and-stay property comes from the segment extractor +
-seqno ordering (cold high-key SRs stop being re-selected), not from any custom
-policy. The only thing full compaction on the metadata segment buys is faster
-tombstone reclamation.
+A prior custom scheduler (`BepCompactionScheduler`) forced full compaction on
+the metadata segment for instant tombstone reclamation. Field measurement showed
+it was paying a very bad write-amp tax: ~100% compactor duty cycle and ~270×
+write-amplification per actually-pruned row under realistic ingest. On the
+target hardware profile (battery-powered roaming sidecar, slow uplink) a bounded
+tombstone backlog is cheaper than a continuously saturated compactor pushing
+rewrites through the radio, so it was removed in favor of stock size-tiered.
+Operators can still trigger a one-shot full pass via `SlateStorage::compact()` /
+the `fsck-compact` CLI subcommand, which submits per-segment full-merge specs to
+the running compactor.
 
-**Decide from the numbers:** if Phase 10's tombstone backlog stays within budget
-under stock size-tiered, delete `BepCompactionScheduler*` and
-`FullCompactionSchedulerSupplier`, drop the second DB-open in `compact()`, and
-either reimplement `compact()` as `admin.submit_compaction(spec)` against the
-running compactor (if forced GC is still wanted as an admin tool) or remove it
-entirely. If the backlog exceeds budget, keep a per-segment scheduler — but the
-design note that introduces it should cite the Phase 10 number that forced the
-choice.
-
-Acceptance: either (a) a tracked delete of `BepCompactionScheduler*` and
-`FullCompactionSchedulerSupplier`, with a one-paragraph design-doc update
-recording the Phase 10 figures that justified going stock; or (b) a per-segment
-scheduler whose design-doc justification quotes those same figures.
+*(Post-change steady-state numbers to be recorded here after manual field
+measurement.)*

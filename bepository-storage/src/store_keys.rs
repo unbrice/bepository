@@ -359,7 +359,7 @@ pub fn device_key(devid: &[u8; DEVID_LEN]) -> [u8; DEVICE_KEY_LEN] {
 /// a `/`.
 #[must_use]
 pub fn parse_block_pointer_key(key: &[u8]) -> Option<[u8; HASH_LEN]> {
-    // Minimum: b/ + / + HASH_LEN
+    // Minimum: mb + / + HASH_LEN
     if key.len() < BLOCK_PREFIX.len() + 1 + HASH_LEN || !key.starts_with(BLOCK_PREFIX) {
         return None;
     }

@@ -6,16 +6,16 @@
 //! SlateDB compaction.
 //!
 //! Before each compaction job a bloom filter is built from the block hashes
-//! referenced by committed files (`n/`) and in-progress transfers (`in/`),
-//! and a `peer_floor` is computed as `min(dx/<devid>.max_sequence)`.
+//! referenced by committed files (`mn`) and in-progress transfers (`mi`),
+//! and a `peer_floor` is computed as `min(md<devid>.max_sequence)`.
 //!
 //! During compaction the filter:
 //! - Drops/tombstones block data/ref/reverse-ref keys whose hash is NOT in the
 //!   bloom filter.
-//! - Prunes `s/<seq>` entries below `peer_floor` (no peer needs them for delta
+//! - Prunes `ms<seq>` entries below `peer_floor` (no peer needs them for delta
 //!   indexing).
-//! - Prunes deleted `n/<name>` entries whose sequence is below `peer_floor`
-//!   (all peers have already seen the deletion).
+//! - Prunes deleted `mn<dir>//<basename>` entries whose sequence is below
+//!   `peer_floor` (all peers have already seen the deletion).
 
 use std::num::NonZeroI64;
 use std::sync::Arc;
@@ -25,10 +25,11 @@ use bepository_lock::Epoch;
 use fastbloom::AtomicBloomFilter;
 use prost::Message;
 use slatedb::compactor::{
-    CompactionScheduler, CompactionSchedulerSupplier, CompactionSpec, CompactorStateView, SourceId,
+    CompactionScheduler, CompactionSchedulerSupplier, CompactorStateView,
+    SizeTieredCompactionSchedulerSupplier,
 };
+use slatedb::compactor::{CompactionSpec, SourceId};
 use slatedb::config::CompactorOptions;
-use slatedb::size_tiered_compaction::SizeTieredCompactionSchedulerSupplier;
 use slatedb::{
     CompactionFilter, CompactionFilterDecision, CompactionFilterError, CompactionFilterSupplier,
     CompactionJobContext, RowEntry, ValueDeletable,
@@ -97,14 +98,54 @@ where
     Ok(())
 }
 
-/// Factory that creates a [`GcFilter`] for each compaction job.
+/// Late-binding slot that hands the `FolderStore` to the compaction supplier.
 ///
-/// Holds a late-binding reference to the [`FolderStore`] (via `OnceLock`)
-/// because the supplier must be registered with `Db::builder` before the
-/// `FolderStore` exists.
+/// The supplier must be registered with `Db::builder` before the `FolderStore`
+/// exists (the store needs the built `Db`), and SlateDB's compactor can dispatch
+/// jobs before `build()` returns — so a non-blocking `OnceLock::get()` would race
+/// and fail. This slot lets the supplier `.await` until the store is published.
+pub(crate) struct StoreSlot {
+    cell: std::sync::OnceLock<Arc<FolderStore>>,
+    notify: tokio::sync::Notify,
+}
+
+impl StoreSlot {
+    pub fn new() -> Self {
+        Self {
+            cell: std::sync::OnceLock::new(),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub fn set(&self, store: Arc<FolderStore>) {
+        let _ = self.cell.set(store);
+        self.notify.notify_waiters();
+    }
+
+    pub async fn wait(&self) -> &Arc<FolderStore> {
+        loop {
+            // Register interest before checking, otherwise `set()` could land
+            // between the check and the await and we'd block forever.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(s) = self.cell.get() {
+                return s;
+            }
+            notified.await;
+        }
+    }
+
+    /// Non-blocking peek. Returns `Some` only after `set` has been called.
+    pub fn try_get(&self) -> Option<&Arc<FolderStore>> {
+        self.cell.get()
+    }
+}
+
+/// Factory that creates a [`GcFilter`] for each compaction job.
 pub(crate) struct GcFilterSupplier {
     folder_sk: String,
-    store_slot: Arc<std::sync::OnceLock<Arc<FolderStore>>>,
+    store_slot: Arc<StoreSlot>,
     gc: Arc<CompactionState>,
     epoch: Epoch,
 }
@@ -112,7 +153,7 @@ pub(crate) struct GcFilterSupplier {
 impl GcFilterSupplier {
     pub fn new(
         folder_sk: String,
-        store_slot: Arc<std::sync::OnceLock<Arc<FolderStore>>>,
+        store_slot: Arc<StoreSlot>,
         gc: Arc<CompactionState>,
         epoch: Epoch,
     ) -> Self {
@@ -131,13 +172,7 @@ impl CompactionFilterSupplier for GcFilterSupplier {
         &self,
         context: &CompactionJobContext,
     ) -> Result<Box<dyn CompactionFilter>, CompactionFilterError> {
-        let store = self
-            .store_slot
-            .get()
-            .ok_or_else(|| {
-                CompactionFilterError::CreationError("FolderStore not yet initialised".into())
-            })?
-            .clone();
+        let store = self.store_slot.wait().await.clone();
 
         // Build atomic bloom filters to safely capture concurrent writes during scan.
         let known_live_hashes = Arc::new(
@@ -153,10 +188,11 @@ impl CompactionFilterSupplier for GcFilterSupplier {
             .register(known_live_hashes.clone(), known_live_seqs.clone());
 
         // Single snapshot covers both scans: `complete_file` atomically moves
-        // an entry from `in/<epoch>/<name>` to `n/<name>`, so scanning the two
-        // prefixes against the same point-in-time view guarantees every live
-        // file appears in exactly one of them. Independent scans would each
-        // take their own snapshot and could miss a file mid-transition.
+        // an entry from `mi<epoch>/<dir>//<basename>` to `mn<dir>//<basename>`,
+        // so scanning the two prefixes against the same point-in-time view
+        // guarantees every live file appears in exactly one of them.
+        // Independent scans would each take their own snapshot and could miss
+        // a file mid-transition.
         let snapshot =
             store.db.snapshot().await.map_err(|e| {
                 CompactionFilterError::CreationError(crate::store::slate_err(e).into())
@@ -195,6 +231,192 @@ impl CompactionFilterSupplier for GcFilterSupplier {
             stats: FilterStats::default(),
         }))
     }
+}
+
+/// Compaction scheduler that pairs size-tiered policy on the `b` (block-data)
+/// segment with a "merge everything" policy on metadata segments.
+///
+/// For the `b` segment, size-tiered's "runs of similar size" heuristic is the
+/// right fit: block data is large, written append-only, and benefits from the
+/// merge amortisation size-tiered is designed for. Forward those proposals
+/// unchanged.
+///
+/// For metadata segments (`m` and any future ones), size-tiered is the wrong
+/// fit:
+///  * metadata is small (KB–MB) and read-amplified — every reader pays for
+///    every L0 SST that might shadow a key, so collapsing aggressively wins;
+///  * the GC payoff is dropping tombstoned entries (deleted file index, expired
+///    seq mappings), which only happens when the compactor reaches the bottom
+///    SR. Keeping multiple SRs around defers tombstone drop indefinitely.
+///
+/// So for metadata: trigger on `>= METADATA_MIN_L0` L0 SSTs OR `>1` sorted
+/// runs, and produce one spec that merges all L0 + all SRs into the lowest SR
+/// id (or a fresh one if no SR exists yet).
+pub(crate) struct BepCompactionSchedulerSupplier {
+    size_tiered_supplier: SizeTieredCompactionSchedulerSupplier,
+    store_slot: Arc<StoreSlot>,
+}
+
+impl BepCompactionSchedulerSupplier {
+    pub(crate) fn new(store_slot: Arc<StoreSlot>) -> Self {
+        Self {
+            size_tiered_supplier: SizeTieredCompactionSchedulerSupplier::new(),
+            store_slot,
+        }
+    }
+}
+
+impl CompactionSchedulerSupplier for BepCompactionSchedulerSupplier {
+    fn compaction_scheduler(
+        &self,
+        options: &CompactorOptions,
+    ) -> Box<dyn CompactionScheduler + Send + Sync> {
+        Box::new(BepCompactionScheduler {
+            size_tiered: self.size_tiered_supplier.compaction_scheduler(options),
+            store_slot: self.store_slot.clone(),
+        })
+    }
+}
+
+/// Minimum number of L0 SSTs in a metadata segment before a full-compaction
+/// pass is proposed. Each pass rewrites the entire bottom SR of that segment,
+/// so the cost is dominated by the SR size and is roughly constant in the
+/// number of L0 SSTs being merged in. Triggering on every single new L0 SST
+/// burns that fixed rewrite cost for ~no GC progress; waiting for a few L0s
+/// to accumulate amortises the rewrite over a meaningful data increment.
+///
+/// Independent from the size-tiered `min_compaction_sources` that governs the
+/// `b` segment, which is much higher because `b`-segment reads don't suffer
+/// from many L0 SSTs (rows are seqno-ordered with disjoint key ranges per SST).
+const METADATA_MIN_L0: usize = 4;
+
+struct BepCompactionScheduler {
+    size_tiered: Box<dyn CompactionScheduler + Send + Sync>,
+    store_slot: Arc<StoreSlot>,
+}
+
+impl CompactionScheduler for BepCompactionScheduler {
+    fn propose(&self, state: &CompactorStateView) -> Vec<CompactionSpec> {
+        // Skip scheduling entirely while the DB is closing or not yet open.
+        // Without this, slatedb's `Db::close()` marks the DB closed *before*
+        // shutting down the compactor task; every spec we propose in that
+        // window immediately fails in `create_compaction_filter` (snapshot on
+        // a closed DB), gets re-proposed by the next tick, and we storm the
+        // log with `error executing compaction` until the compactor shutdown
+        // signal is processed. Returning an empty Vec here lets shutdown
+        // proceed quietly.
+        //
+        // The pre-open case (store_slot not yet set) is also handled: at
+        // startup the compactor may tick before `FolderStore::new` finishes,
+        // so without this check we'd dispatch a job whose filter then awaits
+        // `store_slot.wait()` — harmless but wastes work.
+        let Some(store) = self.store_slot.try_get() else {
+            return Vec::new();
+        };
+        if store.db.status().close_reason.is_some() {
+            return Vec::new();
+        }
+
+        let size_tiered_proposals = self.size_tiered.propose(state);
+        let mut specs = retain_block_segment_specs(size_tiered_proposals);
+
+        let manifest = state.manifest();
+
+        // Segments that already have an active compaction in flight: don't
+        // re-propose. Without this guard, a metadata segment that meets our
+        // trigger criteria gets a fresh spec on every scheduler tick, and any
+        // failure (e.g. `create_compaction_filter` erroring during shutdown)
+        // turns into a hot retry loop. Mirrors `SizeTieredCompactionScheduler`'s
+        // per-tree `ConflictChecker` for the same reason.
+        let active_segments: std::collections::HashSet<&[u8]> = state
+            .compactions()
+            .into_iter()
+            .flat_map(|c| c.recent_compactions())
+            .filter(|c| c.active())
+            .map(|c| c.spec().segment().as_ref())
+            .collect();
+
+        // Destinations must be globally unique across every active spec; if the
+        // size-tiered scheduler already picked some for the `b` segment, fold
+        // them into the max so the metadata-segment specs below don't collide
+        // and get rejected by `add_compaction`.
+        let mut next_dest = next_free_sr_id(
+            manifest
+                .compacted()
+                .iter()
+                .map(|sr| sr.id)
+                .chain(
+                    manifest
+                        .segments()
+                        .iter()
+                        .flat_map(|s| s.compacted().iter().map(|sr| sr.id)),
+                )
+                .chain(specs.iter().filter_map(|s| s.destination())),
+        );
+
+        for segment in manifest.segments() {
+            if segment.prefix().as_ref() == store_keys::BLOCK_SEGMENT_PREFIX {
+                continue;
+            }
+            if active_segments.contains(segment.prefix().as_ref()) {
+                continue;
+            }
+
+            let enough_l0 = segment.l0().len() >= METADATA_MIN_L0;
+            let multi_sr = segment.compacted().len() > 1;
+            if !enough_l0 && !multi_sr {
+                continue;
+            }
+
+            let sources: Vec<SourceId> = segment
+                .l0()
+                .iter()
+                .map(|sst| SourceId::SstView(sst.id))
+                .chain(
+                    segment
+                        .compacted()
+                        .iter()
+                        .map(|sr| SourceId::SortedRun(sr.id)),
+                )
+                .collect();
+            let destination = segment
+                .compacted()
+                .iter()
+                .map(|sr| sr.id)
+                .min()
+                .unwrap_or(next_dest);
+            if segment.compacted().is_empty() {
+                next_dest = next_dest.saturating_add(1);
+            }
+            specs.push(CompactionSpec::for_segment(
+                segment.prefix().clone(),
+                sources,
+                destination,
+            ));
+        }
+
+        specs
+    }
+}
+
+/// Keep only the specs that target the `b` (block-data) segment. Used to
+/// forward the size-tiered scheduler's proposals while suppressing everything
+/// it might have proposed for other segments — metadata segments are handled
+/// by [`BepCompactionScheduler`]'s own policy below.
+fn retain_block_segment_specs(specs: Vec<CompactionSpec>) -> Vec<CompactionSpec> {
+    specs
+        .into_iter()
+        .filter(|spec| spec.segment().as_ref() == store_keys::BLOCK_SEGMENT_PREFIX)
+        .collect()
+}
+
+/// Compute the next sorted-run id to assign to a freshly created SR. Inputs
+/// must cover both already-committed SRs in the manifest and destinations
+/// already reserved by in-flight specs in the same proposal batch — SR ids
+/// are globally unique across segments (RFC-0024), and collisions are
+/// rejected by `add_compaction`.
+fn next_free_sr_id(taken: impl Iterator<Item = u32>) -> u32 {
+    taken.max().map(|id| id.saturating_add(1)).unwrap_or(0)
 }
 
 #[derive(Default)]
@@ -244,11 +466,11 @@ impl CompactionFilter for GcFilter {
     ) -> Result<CompactionFilterDecision, CompactionFilterError> {
         let key = &entry.key;
 
-        // bd/<seq> — block data
+        // bd<seq> — block data
         if key.starts_with(store_keys::BLOCK_DATA_PREFIX) {
             let seq = store_keys::parse_block_data_seq_key(key).ok_or_else(|| {
                 CompactionFilterError::FilterError(
-                    format!("corrupted bd/ key width/value: {}", hex::encode(key)).into(),
+                    format!("corrupted bd key width/value: {}", hex::encode(key)).into(),
                 )
             })?;
             if !self.job.gc.known_live_seq_contains(self.job.job_id, seq) {
@@ -260,7 +482,7 @@ impl CompactionFilter for GcFilter {
             return Ok(CompactionFilterDecision::Keep);
         }
 
-        // b/<dir>/<hash> — block pointer
+        // mb<dir>/<hash> — block pointer
         if let Some(hash) = store_keys::parse_block_pointer_key(key) {
             if !self.job.gc.known_live_hash_contains(self.job.job_id, &hash) {
                 self.stats.refs_dropped += 1;
@@ -271,7 +493,7 @@ impl CompactionFilter for GcFilter {
             return Ok(CompactionFilterDecision::Keep);
         }
 
-        // br/<hash>/<name> — reverse reference
+        // mr<hash>/<dir>//<basename> — reverse reference
         if let Some((hash, _name)) = store_keys::parse_block_reverse_key(key) {
             if !self.job.gc.known_live_hash_contains(self.job.job_id, &hash) {
                 self.stats.reverse_refs_tombstoned += 1;
@@ -282,7 +504,7 @@ impl CompactionFilter for GcFilter {
             return Ok(CompactionFilterDecision::Keep);
         }
 
-        // in/<epoch>/<name> — stale inbox entries
+        // mi<epoch>/<dir>//<basename> — stale inbox entries
         if let Some((epoch, _name)) = store_keys::parse_inbox_key(key) {
             if epoch < self.epoch {
                 self.stats.inbox_tombstoned += 1;
@@ -293,7 +515,7 @@ impl CompactionFilter for GcFilter {
             return Ok(CompactionFilterDecision::Keep);
         }
 
-        // s/<seq> — prune sequence mappings below peer_floor
+        // ms<seq> — prune sequence mappings below peer_floor
         if let Some(seq) = store_keys::parse_seq_key(key) {
             if let Some(floor) = self.peer_floor
                 && u64::try_from(floor.get()).is_ok_and(|f| seq < f)
@@ -306,7 +528,7 @@ impl CompactionFilter for GcFilter {
             return Ok(CompactionFilterDecision::Keep);
         }
 
-        // n/<name> — prune deleted-file tombstones below peer_floor
+        // mn<dir>//<basename> — prune deleted-file tombstones below peer_floor
         if let Some(name) = store_keys::parse_file_key(key) {
             if let Some(floor) = self.peer_floor
                 && let ValueDeletable::Value(val) = &entry.value
@@ -329,7 +551,7 @@ impl CompactionFilter for GcFilter {
             return Ok(CompactionFilterDecision::Keep);
         }
 
-        // Everything else (ix, dx/) — keep
+        // Everything else (mx, md) — keep
         self.stats.metadata_kept += 1;
         self.stats.kept += 1;
         Ok(CompactionFilterDecision::Keep)
@@ -337,7 +559,7 @@ impl CompactionFilter for GcFilter {
 
     async fn on_compaction_end(&mut self) -> Result<(), CompactionFilterError> {
         tracing::info!(
-            folder_sk = %self.folder_sk,
+            folder_id = %self.folder_sk,
             compaction_id = self.job.job_id,
             is_bottom = self.is_bottom,
             blocks_dropped = self.stats.blocks_dropped,
@@ -358,240 +580,6 @@ impl CompactionFilter for GcFilter {
         );
         Ok(())
     }
-}
-
-/// Scheduler supplier that forces a single full compaction.
-///
-/// When plugged into a [`CompactorBuilder`](slatedb::CompactorBuilder), the
-/// compactor will merge *all* L0 SSTs and sorted runs into one sorted run on
-/// the first poll, causing every key to pass through the registered
-/// [`CompactionFilterSupplier`] (i.e. the GC filter). Subsequent polls
-/// return no proposals because there is nothing left to compact.
-pub(crate) struct FullCompactionSchedulerSupplier;
-
-impl CompactionSchedulerSupplier for FullCompactionSchedulerSupplier {
-    fn compaction_scheduler(
-        &self,
-        _options: &CompactorOptions,
-    ) -> Box<dyn CompactionScheduler + Send + Sync> {
-        Box::new(FullCompactionScheduler)
-    }
-}
-
-struct FullCompactionScheduler;
-
-impl CompactionScheduler for FullCompactionScheduler {
-    fn propose(&self, state: &CompactorStateView) -> Vec<CompactionSpec> {
-        let manifest = state.manifest();
-        let mut specs = Vec::new();
-
-        // Default (unsegmented) tree. With a segment extractor configured this
-        // is empty by construction, but we still propose for it so the same
-        // scheduler works without segmentation.
-        //
-        // Only propose when there is L0 to merge in or more than one SR to
-        // combine; otherwise the spec is a no-op (compact SR n → SR n) and the
-        // compactor would loop on it.
-        let default_l0: Vec<SourceId> = manifest
-            .l0()
-            .iter()
-            .map(|sst| SourceId::SstView(sst.id))
-            .collect();
-        let default_srs: Vec<SourceId> = manifest
-            .compacted()
-            .iter()
-            .map(|sr| SourceId::SortedRun(sr.id))
-            .collect();
-        let default_has_work = !default_l0.is_empty() || default_srs.len() > 1;
-        if default_has_work {
-            let mut default_sources = default_l0;
-            default_sources.extend(default_srs);
-            let destination = manifest
-                .compacted()
-                .iter()
-                .map(|sr| sr.id)
-                .min()
-                .unwrap_or(0);
-            specs.push(CompactionSpec::new(default_sources, destination));
-        }
-
-        // One tiered spec per named segment whose tree has any L0 or
-        // compacted runs. Without these, segmented data never drains under
-        // `FullCompactionSchedulerSupplier`.
-        //
-        // Destination ids must be unique across all in-flight specs; we pick
-        // ids by taking max-known SR id + 1, then incrementing per segment.
-        let mut next_dest = manifest
-            .compacted()
-            .iter()
-            .map(|sr| sr.id)
-            .chain(
-                manifest
-                    .segments()
-                    .iter()
-                    .flat_map(|s| s.compacted().iter().map(|sr| sr.id)),
-            )
-            .max()
-            .map(|id| id.saturating_add(1))
-            .unwrap_or(0);
-
-        for segment in manifest.segments() {
-            // Skip segments that have nothing to merge — single SR with no
-            // L0 means the segment is already fully compacted, and
-            // proposing `compact SR n into SR n` would loop indefinitely
-            // because the spec passes validation but produces no progress.
-            let has_l0 = !segment.l0().is_empty();
-            let multi_sr = segment.compacted().len() > 1;
-            if !has_l0 && !multi_sr {
-                continue;
-            }
-
-            let mut sources: Vec<SourceId> = segment
-                .l0()
-                .iter()
-                .map(|sst| SourceId::SstView(sst.id))
-                .collect();
-            for sr in segment.compacted() {
-                sources.push(SourceId::SortedRun(sr.id));
-            }
-            let destination = segment
-                .compacted()
-                .iter()
-                .map(|sr| sr.id)
-                .min()
-                .unwrap_or(next_dest);
-            if segment.compacted().is_empty() {
-                next_dest = next_dest.saturating_add(1);
-            }
-            specs.push(CompactionSpec::for_segment(
-                segment.prefix().clone(),
-                sources,
-                destination,
-            ));
-        }
-
-        specs
-    }
-}
-
-pub(crate) struct BepCompactionSchedulerSupplier {
-    size_tiered_supplier: SizeTieredCompactionSchedulerSupplier,
-}
-
-impl BepCompactionSchedulerSupplier {
-    pub(crate) fn new() -> Self {
-        Self {
-            size_tiered_supplier: SizeTieredCompactionSchedulerSupplier::new(),
-        }
-    }
-}
-
-impl CompactionSchedulerSupplier for BepCompactionSchedulerSupplier {
-    fn compaction_scheduler(
-        &self,
-        options: &CompactorOptions,
-    ) -> Box<dyn CompactionScheduler + Send + Sync> {
-        Box::new(BepCompactionScheduler {
-            size_tiered: self.size_tiered_supplier.compaction_scheduler(options),
-        })
-    }
-}
-
-/// Minimum number of L0 SSTs in a metadata segment before a full-compaction
-/// pass is proposed. Each pass rewrites the entire bottom SR of that segment,
-/// so the cost is dominated by the SR size and is roughly constant in the
-/// number of L0 SSTs being merged in. Triggering on every single new L0 SST
-/// burns that fixed rewrite cost for ~no GC progress; waiting for a few L0s
-/// to accumulate amortises the rewrite over a meaningful data increment.
-///
-/// Independent from the size-tiered `min_compaction_sources` that governs
-/// `bd/` (much higher, since `bd/` reads don't suffer from many L0 SSTs).
-const METADATA_MIN_L0: usize = 4;
-
-struct BepCompactionScheduler {
-    size_tiered: Box<dyn CompactionScheduler + Send + Sync>,
-}
-
-impl CompactionScheduler for BepCompactionScheduler {
-    fn propose(&self, state: &CompactorStateView) -> Vec<CompactionSpec> {
-        let size_tiered_proposals = self.size_tiered.propose(state);
-        let mut specs = retain_block_segment_specs(size_tiered_proposals);
-
-        let manifest = state.manifest();
-        // Destinations must be globally unique across every active spec; if the
-        // size-tiered scheduler already picked some for the `bd/` segment, fold
-        // them into the max so the metadata-segment specs below don't collide
-        // and get rejected by `add_compaction`.
-        let mut next_dest = next_free_sr_id(
-            manifest
-                .compacted()
-                .iter()
-                .map(|sr| sr.id)
-                .chain(
-                    manifest
-                        .segments()
-                        .iter()
-                        .flat_map(|s| s.compacted().iter().map(|sr| sr.id)),
-                )
-                .chain(specs.iter().filter_map(|s| s.destination())),
-        );
-
-        for segment in manifest.segments() {
-            if segment.prefix().as_ref() == crate::store_keys::BLOCK_SEGMENT_PREFIX {
-                continue;
-            }
-
-            let enough_l0 = segment.l0().len() >= METADATA_MIN_L0;
-            let multi_sr = segment.compacted().len() > 1;
-            if !enough_l0 && !multi_sr {
-                continue;
-            }
-
-            let mut sources: Vec<SourceId> = segment
-                .l0()
-                .iter()
-                .map(|sst| SourceId::SstView(sst.id))
-                .collect();
-            for sr in segment.compacted() {
-                sources.push(SourceId::SortedRun(sr.id));
-            }
-            let destination = segment
-                .compacted()
-                .iter()
-                .map(|sr| sr.id)
-                .min()
-                .unwrap_or(next_dest);
-            if segment.compacted().is_empty() {
-                next_dest = next_dest.saturating_add(1);
-            }
-            specs.push(CompactionSpec::for_segment(
-                segment.prefix().clone(),
-                sources,
-                destination,
-            ));
-        }
-
-        specs
-    }
-}
-
-/// Keep only the specs that target the `bd/` (block-data) segment. Used to
-/// forward the size-tiered scheduler's proposals while suppressing everything
-/// it might have proposed for other segments.
-fn retain_block_segment_specs(specs: Vec<CompactionSpec>) -> Vec<CompactionSpec> {
-    specs
-        .into_iter()
-        .filter(|spec| spec.segment().as_ref() == crate::store_keys::BLOCK_SEGMENT_PREFIX)
-        .collect()
-}
-
-/// Compute the next sorted-run id to assign to a freshly created SR. Inputs
-/// must cover both already-committed SRs in the manifest and destinations
-/// already reserved by in-flight specs in the same proposal batch — SR ids
-/// are globally unique across segments (RFC-0024), and collisions are
-/// rejected by `add_compaction`.
-fn next_free_sr_id(taken: impl Iterator<Item = u32>) -> u32 {
-    taken.max().map(|id| id.saturating_add(1)).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -757,19 +745,19 @@ mod tests {
 
         let job_bottom = gc.register(bloom_hashes.clone(), bloom_seqs.clone());
 
-        // 1. Live bd/ key — keep
+        // 1. Live bd key — keep
         let mut filter = make_gc_filter_with_floor(job_bottom, epoch(1), None, true);
         let live_key = store_keys::block_data_seq_key(live_seq);
         let decision = filter.filter(&make_row(&live_key)).await.unwrap();
         assert!(matches!(decision, CompactionFilterDecision::Keep));
 
-        // 2. Orphan bd/ key (bottom run) — drop
+        // 2. Orphan bd key (bottom run) — drop
         let orphan_key = store_keys::block_data_seq_key(orphan_seq);
         let decision = filter.filter(&make_row(&orphan_key)).await.unwrap();
         assert!(matches!(decision, CompactionFilterDecision::Drop));
         assert_eq!(filter.stats.blocks_dropped, 1);
 
-        // 3. Orphan bd/ key (non-bottom run) — tombstone
+        // 3. Orphan bd key (non-bottom run) — tombstone
         let job_non_bottom = gc.register(bloom_hashes.clone(), bloom_seqs.clone());
         let mut filter_non_bottom =
             make_gc_filter_with_floor(job_non_bottom, epoch(1), None, false);
@@ -783,7 +771,7 @@ mod tests {
         ));
         assert_eq!(filter_non_bottom.stats.blocks_dropped, 1);
 
-        // 4. Corrupted bd/ key — returns error
+        // 4. Corrupted bd key — returns error
         let mut corrupted_key = store_keys::BLOCK_DATA_PREFIX.to_vec();
         corrupted_key.extend_from_slice(&[0, 0, 0]); // wrong size
         let res = filter.filter(&make_row(&corrupted_key)).await;
@@ -1044,61 +1032,6 @@ mod tests {
         assert_eq!(filter.stats.tombstones_pruned, 0);
     }
 
-    // --- BepCompactionScheduler helpers ---
-
-    #[test]
-    fn next_free_sr_id_returns_zero_when_empty() {
-        let taken: Vec<u32> = Vec::new();
-        assert_eq!(next_free_sr_id(taken.into_iter()), 0);
-    }
-
-    #[test]
-    fn next_free_sr_id_returns_max_plus_one() {
-        let taken = vec![3u32, 1, 7, 4];
-        assert_eq!(next_free_sr_id(taken.into_iter()), 8);
-    }
-
-    #[test]
-    fn next_free_sr_id_avoids_in_flight_destinations() {
-        // Without folding in-flight destinations, both schedulers would pick
-        // the same next id (= committed_max + 1) and collide in add_compaction.
-        let committed = [4u32, 2];
-        let in_flight_destinations = [5u32]; // size-tiered already reserved 5
-        let next = next_free_sr_id(committed.iter().copied().chain(in_flight_destinations));
-        assert_eq!(next, 6, "must skip past in-flight destination 5");
-    }
-
-    #[test]
-    fn retain_block_segment_specs_forwards_bd_and_drops_others() {
-        // Build one spec per segment prefix; only the block (`b`) segment
-        // should survive. There are only two valid segments at runtime —
-        // the metadata spec uses the `m` prefix.
-        let bd_spec = CompactionSpec::for_segment(
-            Bytes::copy_from_slice(crate::store_keys::BLOCK_SEGMENT_PREFIX),
-            vec![SourceId::SortedRun(0)],
-            1,
-        );
-        let m_spec = CompactionSpec::for_segment(
-            Bytes::copy_from_slice(crate::store_keys::METADATA_SEGMENT_PREFIX),
-            vec![SourceId::SortedRun(2)],
-            3,
-        );
-
-        let kept = retain_block_segment_specs(vec![bd_spec.clone(), m_spec]);
-        assert_eq!(kept.len(), 1);
-        assert_eq!(
-            kept[0].segment().as_ref(),
-            crate::store_keys::BLOCK_SEGMENT_PREFIX
-        );
-        assert_eq!(kept[0].destination(), Some(1));
-    }
-
-    #[test]
-    fn retain_block_segment_specs_empty_passthrough() {
-        // No size-tiered proposals → empty result, not a panic.
-        assert!(retain_block_segment_specs(Vec::new()).is_empty());
-    }
-
     #[tokio::test]
     async fn measure_compaction_overhead_and_bloom_cost() {
         use crate::SlateStorage;
@@ -1224,6 +1157,9 @@ mod tests {
             None,
             tokio::runtime::Handle::current(),
         );
+        // Drop the compactor's 60 s production poll so `storage.compact()`
+        // below doesn't add ~120 s of wait time to this test.
+        storage.set_compactor_poll_interval(std::time::Duration::from_millis(100));
         storage
             .activate(bepository_lock::Epoch::new(1).unwrap())
             .await
@@ -1373,11 +1309,8 @@ mod tests {
 
         // Measure bloom build cost
         let start_bloom = std::time::Instant::now();
-        let store_slot = Arc::new(std::sync::OnceLock::new());
-        store_slot
-            .set(folder.store().clone())
-            .ok()
-            .expect("store_slot set should succeed");
+        let store_slot = Arc::new(StoreSlot::new());
+        store_slot.set(folder.store().clone());
         let gc = Arc::new(CompactionState::new());
         let supplier = GcFilterSupplier::new(
             "measure".to_string(),

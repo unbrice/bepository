@@ -1199,6 +1199,13 @@ async fn cmd_fsck(
         clear_lock(&lock).await?;
     }
 
+    if compact {
+        // `fsck-compact` is a short-lived admin op: collapse the prod 60 s
+        // compactor poll so submitted jobs start within a second instead of
+        // blocking the operator for a full tick. Must be set before activate.
+        db.set_compactor_poll_interval(Duration::from_secs(1));
+    }
+
     if needs_lock {
         let action = if compact {
             "compaction"

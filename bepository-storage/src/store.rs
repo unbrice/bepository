@@ -621,7 +621,7 @@ impl FolderStore {
                 block_ref.seqno
             }
             None => {
-                // New block — write the actual data to bd/<seqno> and a pointer to b/<dir>/<hash>.
+                // New block — write the actual data to bd<seqno> and a pointer to mb<dir>/<hash>.
                 let seq = self.blockseq.allocate().await?;
                 let data_key = store_keys::block_data_seq_key(seq);
                 batch.put(data_key, data);
@@ -807,20 +807,20 @@ impl FolderStore {
     /// active, also checks that the hash is safe (recognised by all active
     /// known_live filters or written since the snapshot).
     ///
-    /// TODO: remove the `bd/<seq>` existence check at the end of the loop.
+    /// TODO: remove the `bd<seq>` existence check at the end of the loop.
     /// It is load-bearing today because the dual-bloom GC builds
     /// `known_live_hashes` and `known_live_seqs` in **separate compaction
     /// jobs with separate snapshots** — a metadata-segment job whose
-    /// snapshot still sees a file F can `Keep b/<H>` while a later
-    /// block-segment job whose snapshot has lost F can `Drop bd/<S>`,
+    /// snapshot still sees a file F can `Keep mb<H>` while a later
+    /// block-segment job whose snapshot has lost F can `Drop bd<S>`,
     /// leaving a pointer without data. The defensive get keeps that state
     /// from poisoning dedup (it falls through to the new-block branch,
     /// which self-heals by allocating a fresh seqno and re-writing the
     /// bytes). Once the two jobs share a snapshot epoch — or otherwise
-    /// prove "`b/` outlives `bd/`" is unreachable — this branch can return
+    /// prove "`mb` outlives `bd`" is unreachable — this branch can return
     /// `Some((dir, block_ref))` without the second `db.get` and save one
     /// block-segment lookup per dedup hit. See the "find_block_dir
-    /// defensive `bd/<seq>` existence check" caveat in
+    /// defensive `bd<seq>` existence check" caveat in
     /// `bepository-storage/OVERVIEW.md`.
     async fn find_block_dir(
         &self,

@@ -159,12 +159,12 @@ async fn check_sequences(
             .unwrap_or(true)
         {
             errors.push(format!(
-                "max_sequence {stored_max} in ix is less than highest s/ key {max_observed_seq}"
+                "max_sequence {stored_max} in mx is less than highest ms key {max_observed_seq}"
             ));
         }
         if level == FsckLevel::Full && max_observed_file_seq > stored_max {
             errors.push(format!(
-                "max_sequence {stored_max} in ix is less than highest file sequence {max_observed_file_seq}"
+                "max_sequence {stored_max} in mx is less than highest file sequence {max_observed_file_seq}"
             ));
         }
     }
@@ -243,7 +243,7 @@ async fn collect_expected_blocks(
             let rev_key = store_keys::block_reverse_key(&hash, &name);
             if db.get(&rev_key).await.map_err(slate_err)?.is_none() {
                 errors.push(format!(
-                    "Missing reverse reference br/ for block {} in file {name}",
+                    "Missing reverse reference mr for block {} in file {name}",
                     hex::encode(hash)
                 ));
             }
@@ -639,7 +639,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| e.contains("max_sequence 3 in ix is less than highest s/ key 5"))
+                .any(|e| e.contains("max_sequence 3 in mx is less than highest ms key 5"))
         );
 
         let meta_valid_for_s = FolderIndexMeta {
@@ -670,7 +670,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| e.contains("max_sequence 5 in ix is less than highest file sequence 6"))
+                .any(|e| e.contains("max_sequence 5 in mx is less than highest file sequence 6"))
         );
     }
 
