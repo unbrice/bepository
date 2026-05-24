@@ -35,6 +35,7 @@ use slatedb::{
     CompactionJobContext, RowEntry, ValueDeletable,
 };
 
+use crate::stats::FilterStats;
 use crate::store::{CompactionState, FolderStore};
 use crate::store_keys;
 
@@ -419,24 +420,6 @@ fn next_free_sr_id(taken: impl Iterator<Item = u32>) -> u32 {
     taken.max().map(|id| id.saturating_add(1)).unwrap_or(0)
 }
 
-#[derive(Default)]
-struct FilterStats {
-    blocks_dropped: u64,
-    blocks_kept: u64,
-    refs_dropped: u64,
-    refs_kept: u64,
-    reverse_refs_tombstoned: u64,
-    reverse_refs_kept: u64,
-    inbox_tombstoned: u64,
-    inbox_kept: u64,
-    seqs_pruned: u64,
-    seqs_kept: u64,
-    tombstones_pruned: u64,
-    files_kept: u64,
-    metadata_kept: u64,
-    kept: u64,
-}
-
 struct GcFilter {
     folder_sk: String,
     job: crate::store::CompactionJob,
@@ -465,6 +448,7 @@ impl CompactionFilter for GcFilter {
         entry: &RowEntry,
     ) -> Result<CompactionFilterDecision, CompactionFilterError> {
         let key = &entry.key;
+        self.stats.record_seen(key, entry);
 
         // bd<seq> — block data
         if key.starts_with(store_keys::BLOCK_DATA_PREFIX) {
@@ -475,6 +459,7 @@ impl CompactionFilter for GcFilter {
             })?;
             if !self.job.gc.known_live_seq_contains(self.job.job_id, seq) {
                 self.stats.blocks_dropped += 1;
+                self.stats.record_dropped(key);
                 return Ok(self.prune_decision());
             }
             self.stats.blocks_kept += 1;
@@ -486,6 +471,7 @@ impl CompactionFilter for GcFilter {
         if let Some(hash) = store_keys::parse_block_pointer_key(key) {
             if !self.job.gc.known_live_hash_contains(self.job.job_id, &hash) {
                 self.stats.refs_dropped += 1;
+                self.stats.record_dropped(key);
                 return Ok(self.prune_decision());
             }
             self.stats.refs_kept += 1;
@@ -497,6 +483,7 @@ impl CompactionFilter for GcFilter {
         if let Some((hash, _name)) = store_keys::parse_block_reverse_key(key) {
             if !self.job.gc.known_live_hash_contains(self.job.job_id, &hash) {
                 self.stats.reverse_refs_tombstoned += 1;
+                self.stats.record_dropped(key);
                 return Ok(CompactionFilterDecision::Modify(ValueDeletable::Tombstone));
             }
             self.stats.reverse_refs_kept += 1;
@@ -508,6 +495,7 @@ impl CompactionFilter for GcFilter {
         if let Some((epoch, _name)) = store_keys::parse_inbox_key(key) {
             if epoch < self.epoch {
                 self.stats.inbox_tombstoned += 1;
+                self.stats.record_dropped(key);
                 return Ok(CompactionFilterDecision::Modify(ValueDeletable::Tombstone));
             }
             self.stats.inbox_kept += 1;
@@ -521,6 +509,7 @@ impl CompactionFilter for GcFilter {
                 && u64::try_from(floor.get()).is_ok_and(|f| seq < f)
             {
                 self.stats.seqs_pruned += 1;
+                self.stats.record_dropped(key);
                 return Ok(self.prune_decision());
             }
             self.stats.seqs_kept += 1;
@@ -537,6 +526,7 @@ impl CompactionFilter for GcFilter {
                 if let Some(fi) = file_wrapper.file_info {
                     if fi.deleted && fi.sequence < floor.get() {
                         self.stats.tombstones_pruned += 1;
+                        self.stats.record_dropped(key);
                         return Ok(self.prune_decision());
                     }
                 } else {
@@ -558,26 +548,8 @@ impl CompactionFilter for GcFilter {
     }
 
     async fn on_compaction_end(&mut self) -> Result<(), CompactionFilterError> {
-        tracing::info!(
-            folder_id = %self.folder_sk,
-            compaction_id = self.job.job_id,
-            is_bottom = self.is_bottom,
-            blocks_dropped = self.stats.blocks_dropped,
-            blocks_kept = self.stats.blocks_kept,
-            refs_dropped = self.stats.refs_dropped,
-            refs_kept = self.stats.refs_kept,
-            reverse_refs_tombstoned = self.stats.reverse_refs_tombstoned,
-            reverse_refs_kept = self.stats.reverse_refs_kept,
-            inbox_tombstoned = self.stats.inbox_tombstoned,
-            inbox_kept = self.stats.inbox_kept,
-            seqs_pruned = self.stats.seqs_pruned,
-            seqs_kept = self.stats.seqs_kept,
-            tombstones_pruned = self.stats.tombstones_pruned,
-            files_kept = self.stats.files_kept,
-            metadata_kept = self.stats.metadata_kept,
-            kept = self.stats.kept,
-            "compaction GC complete"
-        );
+        self.stats
+            .log_completion(&self.folder_sk, self.job.job_id, self.is_bottom);
         Ok(())
     }
 }

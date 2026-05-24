@@ -11,6 +11,7 @@ pub mod meta;
 pub mod proto;
 pub mod snapshot;
 mod snapshot_fs;
+mod stats;
 mod store;
 pub mod store_keys;
 
