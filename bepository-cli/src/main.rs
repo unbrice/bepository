@@ -961,7 +961,7 @@ fn init_tracing(trace_level: Option<String>) -> Result<()> {
 
     let registry = tracing_subscriber::registry();
 
-    #[cfg(feature = "tokio-console")]
+    #[cfg(all(feature = "tokio-console", tokio_unstable))]
     let registry = registry.with(
         console_subscriber::ConsoleLayer::builder()
             .with_default_env()
