@@ -413,14 +413,14 @@ impl<Fs: SnapshotFs> DavFile for DavSnapshotFile<Fs> {
             SeekFrom::Start(n) => Some(n),
             SeekFrom::End(n) => {
                 if n >= 0 {
-                    self.size.checked_add(n.try_into().unwrap())
+                    self.size.checked_add(n as u64)
                 } else {
                     self.size.checked_sub(n.unsigned_abs())
                 }
             }
             SeekFrom::Current(n) => {
                 if n >= 0 {
-                    self.pos.checked_add(n.try_into().unwrap())
+                    self.pos.checked_add(n as u64)
                 } else {
                     self.pos.checked_sub(n.unsigned_abs())
                 }
