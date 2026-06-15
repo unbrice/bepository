@@ -16,6 +16,7 @@
 //! Call [`serve`] to start the server.
 
 use std::collections::HashSet;
+use std::convert::Infallible;
 use std::io::SeekFrom;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -93,7 +94,7 @@ pub async fn serve<Fs: SnapshotFs>(
                         let handler = handler.clone();
                         let password = password.clone();
                         async move {
-                            handle_request(req, &handler, &password).await
+                            Ok::<_, Infallible>(handle_request(req, &handler, &password).await)
                         }
                     });
                     if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
@@ -119,15 +120,15 @@ async fn handle_request(
     req: Request<Incoming>,
     handler: &DavHandler,
     password: &SecretString,
-) -> Result<Response<Body>, http::Error> {
+) -> Response<Body> {
     tracing::debug!(method = %req.method(), path = %req.uri().path(), "dav request");
     if check_basic_auth(req.headers(), password).is_ok() {
-        return Ok(handler.handle(req).await);
+        return handler.handle(req).await;
     }
-    Response::builder()
-        .status(StatusCode::UNAUTHORIZED)
-        .header("WWW-Authenticate", r#"Basic realm="bepository""#)
-        .body(Body::from("Unauthorized\n"))
+    let mut res = Response::new(Body::from("Unauthorized\n"));
+    *res.status_mut() = StatusCode::UNAUTHORIZED;
+    res.headers_mut().insert("WWW-Authenticate", http::HeaderValue::from_static(r#"Basic realm="bepository""#));
+    res
 }
 
 #[tracing::instrument(level = "debug", skip_all, err(level = "warn"))]
