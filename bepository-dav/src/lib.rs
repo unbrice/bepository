@@ -16,7 +16,6 @@
 //! Call [`serve`] to start the server.
 
 use std::collections::HashSet;
-use std::convert::Infallible;
 use std::io::SeekFrom;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -94,7 +93,7 @@ pub async fn serve<Fs: SnapshotFs>(
                         let handler = handler.clone();
                         let password = password.clone();
                         async move {
-                            Ok::<_, Infallible>(handle_request(req, &handler, &password).await)
+                            handle_request(req, &handler, &password).await
                         }
                     });
                     if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
@@ -120,16 +119,15 @@ async fn handle_request(
     req: Request<Incoming>,
     handler: &DavHandler,
     password: &SecretString,
-) -> Response<Body> {
+) -> Result<Response<Body>, http::Error> {
     tracing::debug!(method = %req.method(), path = %req.uri().path(), "dav request");
     if check_basic_auth(req.headers(), password).is_ok() {
-        return handler.handle(req).await;
+        return Ok(handler.handle(req).await);
     }
     Response::builder()
         .status(StatusCode::UNAUTHORIZED)
         .header("WWW-Authenticate", r#"Basic realm="bepository""#)
         .body(Body::from("Unauthorized\n"))
-        .expect("static 401 response is valid")
 }
 
 #[tracing::instrument(level = "debug", skip_all, err(level = "warn"))]
