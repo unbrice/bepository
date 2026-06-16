@@ -413,6 +413,7 @@ impl<Fs: SnapshotFs> DavFile for DavSnapshotFile<Fs> {
             SeekFrom::Start(n) => Some(n),
             SeekFrom::End(n) => {
                 if n >= 0 {
+                    // SAFE: n >= 0 ensures this will not panic
                     self.size.checked_add(n.try_into().unwrap())
                 } else {
                     self.size.checked_sub(n.unsigned_abs())
@@ -420,6 +421,7 @@ impl<Fs: SnapshotFs> DavFile for DavSnapshotFile<Fs> {
             }
             SeekFrom::Current(n) => {
                 if n >= 0 {
+                    // SAFE: n >= 0 ensures this will not panic
                     self.pos.checked_add(n.try_into().unwrap())
                 } else {
                     self.pos.checked_sub(n.unsigned_abs())
