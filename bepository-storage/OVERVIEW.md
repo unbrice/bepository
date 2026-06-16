@@ -10,8 +10,9 @@ local filesystem, in-memory for tests).
 index support via sequence tracking, remote peer state, conflict resolution,
 point-in-time checkpointing.
 
-**Out:** GC sweep (block/tombstone pruning), sequence pruning below peer floor,
-global config store, multi-device remote index storage, filesystem watching.
+**Out:** standalone GC sweep task (block/tombstone pruning happens only inside
+compaction via filters — see Compaction GC), global config store, multi-device
+remote index storage, filesystem watching.
 
 ## Data model
 
@@ -278,8 +279,8 @@ risk. File against slatedb when revisiting.
 
 ### `find_block_dir` defensive `bd<seq>` existence check
 
-`bepository-storage/src/store.rs` `find_block_dir` (see the `TODO(phase-7)` doc
-comment on the function) ends each candidate iteration with a defensive
+`bepository-storage/src/store.rs` `find_block_dir` (see the `TODO` doc comment
+on the function) ends each candidate iteration with a defensive
 `db.get(bd<block_ref.seqno>)` before returning a hit. It is load-bearing today
 because the dual-bloom GC builds `known_live_hashes` and `known_live_seqs` in
 separate compaction jobs with potentially-different snapshots, leaving a
@@ -320,22 +321,28 @@ blocks (and no `bd<new_seq>` rows allocated for them).
 
 ### Compaction scheduler
 
-Every segment runs stock size-tiered. The per-row GC filter (`GcFilter`) fires
-on every key that passes through any compaction, so tombstone reclamation works
-correctly under the stock scheduler. The block segment's settle-and-stay
-property comes from the segment extractor + seqno ordering (cold high-key SRs
-stop being re-selected), not from any custom policy.
+`BepCompactionScheduler` wraps the stock size-tiered scheduler and splits policy
+by segment:
 
-A prior custom scheduler (`BepCompactionScheduler`) forced full compaction on
-the metadata segment for instant tombstone reclamation. Field measurement showed
-it was paying a very bad write-amp tax: ~100% compactor duty cycle and ~270×
-write-amplification per actually-pruned row under realistic ingest. On the
-target hardware profile (battery-powered roaming sidecar, slow uplink) a bounded
-tombstone backlog is cheaper than a continuously saturated compactor pushing
-rewrites through the radio, so it was removed in favor of stock size-tiered.
-Operators can still trigger a one-shot full pass via `SlateStorage::compact()` /
-the `fsck-compact` CLI subcommand, which submits per-segment full-merge specs to
-the running compactor.
+- **Block (`b`) segment:** size-tiered proposals are forwarded unchanged
+  (`min_compaction_sources = 32`, `max_compaction_sources = 64` — both must be
+  overridden together; leaving max at the slatedb default of 8 below an
+  overridden min wedges the scheduler). The segment's settle-and-stay property
+  comes from the segment extractor + seqno ordering (cold high-key SRs stop
+  being re-selected), not from custom policy.
+- **Metadata segments:** size-tiered proposals are suppressed; the scheduler
+  instead proposes a full merge of the segment (all L0 SSTs + all SRs) once at
+  least `METADATA_MIN_L0` (4) L0 SSTs accumulate or more than one SR exists.
+  Waiting for a few L0s amortises the fixed bottom-SR rewrite cost: an earlier
+  variant that recompacted on every new L0 measured ~100% compactor duty cycle
+  and ~270× write-amplification per actually-pruned row under realistic ingest —
+  unacceptable on a battery-powered roaming sidecar with a slow uplink.
 
-*(Post-change steady-state numbers to be recorded here after manual field
-measurement.)*
+The per-row GC filter (`GcFilter`) fires on every key passing through any
+compaction, so tombstone reclamation happens on both paths. The scheduler also
+proposes nothing while the DB is closing or not yet open, and never re-proposes
+a segment that already has a compaction in flight.
+
+Operators can trigger a one-shot full pass via `SlateStorage::compact()` / the
+`fsck-compact` CLI subcommand, which submits per-segment full-merge specs to the
+running compactor.

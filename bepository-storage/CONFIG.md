@@ -11,7 +11,7 @@ which lists files and reads the last one without requiring the lock.
 
 ## Fields
 
-### `next_folder_id`
+### `next_folder_key`
 
 **Type:** integer **Default:** `0`
 
@@ -50,13 +50,14 @@ as the SlateDB checkpoint name (e.g. `"1h"`, `"1d"`).
 | ------ | ------ | --------------------------------------------------- |
 | `ttl`  | string | How long to keep each checkpoint (humantime format) |
 
-Minimum interval and TTL enforced at write time: 10 minutes. SlateDB expires
+Minimum interval and TTL: 10 minutes, enforced by the CLI (`checkpoint every`)
+before writing — the storage crate itself does not validate. SlateDB expires
 checkpoints automatically via background GC when their TTL elapses.
 
 ## Example
 
 ```toml
-next_folder_id = 2
+next_folder_key = 2
 
 [identity]
 cert_der = "MIIBkTCB+wIJAL..."
