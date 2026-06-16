@@ -57,7 +57,7 @@ prost-build = "0.14"
 prost-types = { version = "0.14", default-features = false, features = ["std"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
-slatedb = { version = "0.13", features = ["compaction_filters", "foyer"] }
+slatedb = { version = "0.13.1", features = ["compaction_filters", "foyer"] }
 tempfile = "3.27"
 thiserror = "2"
 tokio = { version = "1", features = ["full", "parking_lot", "tracing"] }
