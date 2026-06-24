@@ -646,14 +646,7 @@ impl SlateStorage {
 
         // Remove the entry from the metadata registry.
         self.modify_meta(|m| {
-            let key = m
-                .folders
-                .iter()
-                .find(|(_, entry)| entry.id == id)
-                .map(|(k, _)| k.clone());
-            if let Some(k) = key {
-                m.folders.remove(&k);
-            }
+            m.folders.retain(|_, entry| entry.id != id);
             Ok(())
         })
         .await?;
