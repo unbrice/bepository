@@ -21,9 +21,13 @@ Download the sample environment file and save it as `bepository.env`:
 curl -o bepository.env https://raw.githubusercontent.com/unbrice/bepository/master/deploy/env.example
 ```
 
+You will install this file in Step 2: it becomes `/etc/bepository/env` (Quadlet)
+or `.env` next to the Compose file.
+
 Open `bepository.env` in your editor and configure `BEPOSITORY_STORAGE_URI`,
 `BEPOSITORY_MASTER_DEVICE_ID` (the Device ID of your local Syncthing), and your
-storage credentials if applicable.
+storage credentials if applicable. Keep `BEPOSITORY_PORT` set — the Quadlet unit
+fails to start without it.
 
 ### Storage URI
 
@@ -36,6 +40,7 @@ The `BEPOSITORY_STORAGE_URI` defines where to store data. Non-secret config
 | S3-compatible (MinIO, B2, R2…) | `s3://my-bucket/syncthing?region=auto&endpoint=https://minio.example.com` |
 | Google Cloud Storage           | `gs://my-bucket/syncthing?project=my-gcp-project`                         |
 | SFTP                           | `sftp://user@host:22/remote/path`                                         |
+| Local path (NAS, testing)      | `file:///data` (container path; the units map it to a host volume)        |
 
 ### Credentials
 
@@ -49,6 +54,7 @@ mounts `/etc/bepository/` read-only, so file-based credentials work).
 | AWS     | `AWS_SESSION_TOKEN`              | Optional: AWS session token                                                                          |
 | GCS     | `GOOGLE_APPLICATION_CREDENTIALS` | Path to a service-account JSON key (recommended; place it at `/etc/bepository/sa-key.json` and 0600) |
 | GCS     | `CLOUDSDK_AUTH_ACCESS_TOKEN`     | Short-lived bearer token (`gcloud auth print-access-token`)                                          |
+| SFTP    | *(URI only)*                     | Key auth: append `?key=/etc/bepository/id_ed25519` to the URI (path as seen inside the container)    |
 
 ### Optional: Configure Cache
 
@@ -66,8 +72,11 @@ Choose the installation method that best fits your environment.
 > [!WARNING]
 > **Pre-1.0 warning:** The on-disk format is not yet stable. If you enable
 > auto-updates (Quadlet's `AutoUpdate=registry`, or pulling `:latest` on a
-> schedule), you may pull breaking changes. Consider pinning to a specific image
-> digest, or disabling auto-update, until 1.0.
+> schedule), you may pull breaking changes. To pin, replace `Image=…:latest` in
+> the `.container` file with the digest printed by
+> `podman image inspect --format '{{index .RepoDigests 0}}' ghcr.io/unbrice/bepository:latest`.
+> (The `deploy/` files fetched below track `master` and can briefly be ahead of
+> the released image.)
 
 ### Decision Table
 
@@ -110,8 +119,8 @@ systemctl status bepository
 It should report
 `Loaded: loaded (/etc/containers/systemd/bepository.container; generated)`. It
 is normal for the service to be `inactive (dead)` at this point — it hasn't been
-started yet. If it says `not-found`, check your podman installation or file
-syntax.
+started yet. If it says `not-found`, run `/usr/libexec/podman/quadlet -dryrun`
+(path varies by distro) to see the generator's error.
 
 **Start and enable auto-update:**
 
@@ -161,7 +170,7 @@ outputs = { nixpkgs, bepository, ... }: {
           port           = 22001; # host port to publish (default: 22001)
           priority       = 100;   # distributed-lock priority
           lease          = 180;   # lock lease in seconds (minimum 180)
-          enableCache    = true;  # set false to pass --no-cache (default: true)
+          enableCache    = true;  # set false to disable the disk cache
 
           # Reference credentials by path (the file itself is dropped into
           # /etc/bepository/ out-of-band, e.g. via sops-nix, so the secret
@@ -196,7 +205,8 @@ curl -O https://raw.githubusercontent.com/unbrice/bepository/master/deploy/compo
 curl -o .env https://raw.githubusercontent.com/unbrice/bepository/master/deploy/env.example
 ```
 
-Then edit `.env` with your settings and run:
+Then edit `.env` with your settings, `chmod 600 .env` (it holds credentials),
+and run:
 
 ```sh
 podman compose up -d
@@ -229,9 +239,14 @@ ID, and connect it to your master Syncthing node.
 > ```sh
 > alias bepository='sudo podman run --rm \
 >   --env-file=/etc/bepository/env \
+>   -p 8080:8080 \
 >   -v "/etc/bepository:/etc/bepository:ro,idmap=uids=0-65532-1;gids=0-65532-1" \
+>   -v "/var/lib/bepository:/data:z,idmap=uids=0-65532-1;gids=0-65532-1" \
 >   ghcr.io/unbrice/bepository:latest'
 > ```
+>
+> The `/data` mount matches the service's state directory (needed for
+> `file:///data` storage); port 8080 serves the WebDAV browser (see README).
 >
 > **Compose:** `alias bepository='podman compose run --rm bepository'`
 >
@@ -266,8 +281,33 @@ bepository get-id
 1. Copy the printed Device ID.
 2. In your master Syncthing web UI, go to **Add Remote Device** and paste the
    ID.
-3. Set the address to `tcp://127.0.0.1:22001` (or whatever port you configured
-   if running remotely).
+3. Set the address to `tcp://127.0.0.1:22001` (match `BEPOSITORY_PORT`, and the
+   host if running remotely).
 4. Share folders with the new device. Syncthing will connect, exchange indexes,
-   and start syncing with cold storage. If multiple bepository share cold
-   storage, only one will be active at a time.
+   and start syncing with cold storage. If multiple bepository instances share
+   cold storage, only one will be active at a time.
+
+## Verify & Troubleshoot
+
+Watch the logs while Syncthing connects:
+
+```sh
+sudo journalctl -u bepository -f
+```
+
+Syncthing can take several minutes to discover the new device; pausing and
+resuming it in the Syncthing UI forces a reconnect. Once connected, the UI shows
+the device as **Connected** and syncing.
+
+- **Connection rejected in the logs** — the connecting device is not
+  `BEPOSITORY_MASTER_DEVICE_ID`; each instance accepts exactly one master.
+- **Storage errors at startup** — check the URI and credentials;
+  `bepository get-id` tests them without starting the daemon.
+- **Lock/standby messages** — another instance holds the lock; expected when
+  several machines share a store. `bepository fsck --clear-lock` forces it free,
+  but only when no other instance is running.
+
+**Uninstall:** `sudo systemctl disable --now bepository`, then remove
+`/etc/containers/systemd/bepository.container`, `/etc/bepository/`,
+`/var/lib/bepository`, and `/var/cache/bepository`. Synced data lives in the
+object store and is not touched.

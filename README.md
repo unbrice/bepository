@@ -48,7 +48,8 @@ all the benefits of Peer-to-Peer synchronisation.
 First and foremost, reliability:
 
 - Not much field testing.
-- Installation instructions only test on NixOS (report success or failure).
+- Installation instructions are only tested on NixOS (report success or
+  failure).
 - On-disk format not stable yet (that will be 1.0).
 - Partially implemented using LLMs. I've been careful to not trust it blindly
   and to be driving the session, please report slop if you see it.
@@ -66,6 +67,8 @@ On the feature front:
     folder level and keeps webdav working but requires custom crypto.
   - Relying on Syncthing's built-in encryption (more secure?).
 
+Planned work is tracked in [ROADMAP.md](ROADMAP.md).
+
 ## Contributing
 
 If you have insight into how to solve these problems, please do reach out.
@@ -79,8 +82,6 @@ Fellow nix users, a flake lives in `nix/dev`, use it with
 ---
 
 ## How it works
-
-(Illustration shows two laptops, it works for any number of machines.)
 
 ```
 ╭──────────────────────────────────────╮       ╭────────────────────────────────────╮
@@ -98,8 +99,13 @@ Fellow nix users, a flake lives in `nix/dev`, use it with
                                 ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 ```
 
+*(Two laptops shown; any number of machines works.)*
+
 - `bepository` runs on the same device as a regular Syncthing instance
   ([see FAQ](#running-on-different-device)).
+- All durable state — identity, index, checkpoints — lives in the object store;
+  hosts keep only a disposable cache. If a machine dies, install on a new one
+  and point it at the same bucket.
 - Multiple `bepository` instances can share the same object store. An
   epoch-based distributed lock ensures only the highest-priority instance writes
   at any time; the rest stay on standby and take over automatically if the
@@ -124,37 +130,21 @@ See [INSTALL.md](INSTALL.md) for the full guide:
 ## Point-in-time recovery
 
 > [!TIP]
-> **Alias tip:** Depending on your install method, define a shortcut first.
->
-> **Quadlet:**
->
-> ```sh
-> alias bepository='sudo podman run --rm \
->   --volumes-from systemd-bepository \
->   --env-file=/etc/bepository/env \
->   ghcr.io/unbrice/bepository:latest'
-> ```
->
-> **Compose:** `alias bepository='podman compose run --rm bepository'`
->
-> **Source:** `alias bepository='./target/release/bepository'` (export
-> `BEPOSITORY_*` yourself, or pass flags)
-
-The Quadlet alias inherits volumes (including `/etc/bepository`) from the
-running daemon via `--volumes-from`, so it requires the service to be active.
-For pre-install commands like `init` / `get-id`, use the standalone form in
-[INSTALL.md](INSTALL.md). The Compose alias works the same way.
+> Container installs: reuse the `bepository` alias from
+> [INSTALL.md](INSTALL.md#step-3-syncthing-integration). From source:
+> `alias bepository='./target/release/bepository'`.
 
 Checkpoints are taken automatically. To browse or download files from
-checkpoints, set `BEPOSITORY_DAV_PASSWORD` in `/etc/bepository/env` and start
-the WebDAV server:
+checkpoints, set `BEPOSITORY_DAV_PASSWORD` in `/etc/bepository/env` (Compose:
+`.env`) and start the WebDAV server:
 
 ```sh
 bepository checkpoint serve 0.0.0.0:8080
+# Compose alternative: podman compose --profile dav up dav
 ```
 
 Open `http://localhost:8080` in a WebDAV client (or a browser) and log in with
-the password you set. Files are organised as:
+any username and the password you set. Files are organised as:
 
 ```
 /<folder-label>/<timestamp>/path/to/file
@@ -199,7 +189,7 @@ bepository fsck --regenerate-id
 # Force a full compaction
 bepository fsck --compact
 
-# Clear a stuck distributed lock
+# Clear a stuck distributed lock (only when no instance is running)
 bepository fsck --clear-lock
 ```
 

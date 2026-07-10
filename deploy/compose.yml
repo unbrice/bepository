@@ -54,6 +54,15 @@ services:
     command: get-id
     profiles: [setup]
 
+  # --- WebDAV checkpoint browser (podman compose --profile dav up dav) ---
+  # Requires BEPOSITORY_DAV_PASSWORD in .env.
+  dav:
+    <<: *base
+    command: checkpoint serve 0.0.0.0:8080
+    ports:
+      - "8080:8080"
+    profiles: [dav]
+
 volumes:
   data:
   cache:
