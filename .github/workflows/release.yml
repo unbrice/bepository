@@ -48,7 +48,7 @@ jobs:
 
       # cachix/install-nix-action@v27, pinned by SHA (same pin as ci.yml)
       - name: Install nix
-        uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b
+        uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c
         with:
           extra_nix_config: "experimental-features = nix-command flakes"
 

@@ -24,7 +24,7 @@ jobs:
         with:
           persist-credentials: false
       # cachix/install-nix-action@v27, pinned by SHA
-      - uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b
+      - uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c
         with:
           extra_nix_config: "experimental-features = nix-command flakes"
       # Smoke-check the user-facing flake (module + release-binary fetch, fast to eval).
