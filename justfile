@@ -72,7 +72,9 @@ setup-hooks:
 credit-ai:
     git commit --amend --no-edit \
         --trailer "Co-authored-by: Gemini <noreply@google.com>" \
-        --trailer "Co-authored-by: Claude <noreply@anthropic.com>"
+        --trailer "Co-authored-by: Claude <noreply@anthropic.com>" \
+        --trailer "Co-authored-by: GLM <noreply@z.ai>"
+
 
 # Bump version and commit, then echo the commands to tag and push (accepts numerical VERSION)
 push-tag version:
