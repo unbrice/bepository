@@ -122,25 +122,18 @@ See [INSTALL.md](INSTALL.md) for the full guide:
 
 1. Pick a storage backend (S3, GCS, SFTP …) and configure credentials.
 2. On each device:
-   1. Install the daemon (Systemd Quadlet, NixOS flake, Podman Compose, or from
-      source).
+   1. Install the daemon (native binary, NixOS, or from source).
    2. Pair it with your local Syncthing instance (see
       [FAQ for running on a different device](#running-on-different-device)).
 
 ## Point-in-time recovery
 
-> [!TIP]
-> Container installs: reuse the `bepository` alias from
-> [INSTALL.md](INSTALL.md#step-3-syncthing-integration). From source:
-> `alias bepository='./target/release/bepository'`.
-
 Checkpoints are taken automatically. To browse or download files from
-checkpoints, set `BEPOSITORY_DAV_PASSWORD` in `/etc/bepository/env` (Compose:
-`.env`) and start the WebDAV server:
+checkpoints, set `BEPOSITORY_DAV_PASSWORD` in `/etc/bepository/env` and start
+the WebDAV server:
 
 ```sh
 bepository checkpoint serve 0.0.0.0:8080
-# Compose alternative: podman compose --profile dav up dav
 ```
 
 Open `http://localhost:8080` in a WebDAV client (or a browser) and log in with

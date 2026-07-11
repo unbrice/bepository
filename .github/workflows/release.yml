@@ -1,8 +1,8 @@
 name: Release
 
-# Publishes static musl binaries (instead of an OCI image) on every `v*.*.*`
-# tag push. A final job pins the per-triple sha256s into nix/release-hashes.json
-# so the NixOS module can fetchurl the matching binary.
+# Publishes static musl binaries on every `v*.*.*` tag push, and pins the
+# per-triple sha256s into nix/release-hashes.json so the NixOS module can
+# fetchurl the matching binary.
 #
 # Native-dependency survey (see commit body): the release binary links ring
 # (rustls), aws-lc-sys (via object_store's aws feature → reqwest
