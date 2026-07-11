@@ -30,8 +30,13 @@ machine-uid = "0.5"
 object_store.workspace = true
 object_store_opendal = "0.55"
 opendal = { version = "0.55", features = ["services-sftp"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 secrecy.workspace = true
+self-replace = { version = "1", optional = true }
+semver = { version = "1", optional = true }
+serde = { workspace = true, optional = true }
+sha2 = { version = "0.10", optional = true }
 single-instance = "0.3"
 tokio.workspace = true
 tokio-util.workspace = true
@@ -46,11 +51,15 @@ default = ["self-manage"]
 # Service-management and self-upgrade subcommands (`install-service`,
 # `print-service`, `uninstall-service`, `upgrade`). Distros that ship their own
 # service files and update mechanism build with `--no-default-features`.
-self-manage = []
+self-manage = ["dep:reqwest", "dep:serde", "dep:sha2", "dep:semver", "dep:self-replace"]
 tokio-console = ["dep:console-subscriber"]
 
 [dev-dependencies]
 assert_cmd = "2.2"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 predicates = "3.1"
 tempfile.workspace = true
 
