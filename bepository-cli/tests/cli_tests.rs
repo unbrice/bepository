@@ -106,7 +106,7 @@ fn test_print_service() {
             "EnvironmentFile=/etc/bepository/env",
         ))
         .stdout(predicate::str::contains(
-            "ExecStart=/usr/local/bin/bepository serve",
+            "ExecStart=/usr/bin/env bepository serve",
         ))
         .stdout(predicate::str::contains("ProtectSystem=strict"));
 }

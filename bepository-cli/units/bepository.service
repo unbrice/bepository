@@ -1,0 +1,21 @@
+[Unit]
+Description=bepository cold-storage bridge for Syncthing
+After=network-online.target
+Wants=network-online.target
+Conflicts=sleep.target
+Before=sleep.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env bepository serve
+EnvironmentFile=/etc/bepository/env
+StateDirectory=bepository
+CacheDirectory=bepository
+DynamicUser=yes
+ProtectSystem=strict
+PrivateTmp=yes
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target

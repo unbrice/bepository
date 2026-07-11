@@ -30,55 +30,19 @@ const ENV_PATH: &str = "/etc/bepository/env";
 /// Port/listen address comes from the env file (`BEPOSITORY_LISTEN`), not the
 /// unit. `DynamicUser=yes` means there is no stable UID, so the binary itself
 /// must auto-init on serve (no root one-shot `init` first).
-const BEPOSITORY_SERVICE: &str = "\
-[Unit]
-Description=bepository cold-storage bridge for Syncthing
-After=network-online.target
-Wants=network-online.target
-Conflicts=sleep.target
-Before=sleep.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/bepository serve
-EnvironmentFile=/etc/bepository/env
-StateDirectory=bepository
-CacheDirectory=bepository
-DynamicUser=yes
-ProtectSystem=strict
-PrivateTmp=yes
-Restart=on-failure
-RestartSec=10s
-
-[Install]
-WantedBy=multi-user.target
-";
+///
+/// Canonical source: `bepository-cli/units/bepository.service`. The NixOS
+/// module installs the same file from the package, so the two installs cannot
+/// drift — see `nix/module.nix`'s `systemd.packages`.
+const BEPOSITORY_SERVICE: &str = include_str!("../units/bepository.service");
 
 /// Oneshot service that runs `bepository upgrade` and restarts the daemon.
-const BEPOSITORY_UPGRADE_SERVICE: &str = "\
-[Unit]
-Description=bepository self-upgrade
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/bepository upgrade --restart-unit bepository.service
-";
+/// Canonical source: `bepository-cli/units/bepository-upgrade.service`.
+const BEPOSITORY_UPGRADE_SERVICE: &str = include_str!("../units/bepository-upgrade.service");
 
 /// Daily upgrade timer, randomized to spread load.
-const BEPOSITORY_UPGRADE_TIMER: &str = "\
-[Unit]
-Description=Daily bepository self-upgrade
-
-[Timer]
-OnCalendar=daily
-RandomizedDelaySec=1h
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-";
+/// Canonical source: `bepository-cli/units/bepository-upgrade.timer`.
+const BEPOSITORY_UPGRADE_TIMER: &str = include_str!("../units/bepository-upgrade.timer");
 
 /// Print the `bepository.service` unit to stdout.
 pub(crate) fn print_service() -> Result<()> {
@@ -251,7 +215,7 @@ mod tests {
                 "service unit missing {needle:?}"
             );
         }
-        assert!(BEPOSITORY_SERVICE.contains("ExecStart=/usr/local/bin/bepository serve"));
+        assert!(BEPOSITORY_SERVICE.contains("ExecStart=/usr/bin/env bepository serve"));
     }
 
     #[test]
@@ -264,6 +228,23 @@ mod tests {
     #[test]
     fn upgrade_service_restarts_unit() {
         assert!(BEPOSITORY_UPGRADE_SERVICE.contains("upgrade --restart-unit bepository.service"));
+    }
+
+    /// The canonical unit files must not contain unresolved template tokens —
+    /// both installers consume them verbatim. Catches a future edit that leaves
+    /// a `@placeholder@` behind.
+    #[test]
+    fn unit_files_have_no_unresolved_tokens() {
+        for (name, text) in [
+            ("bepository.service", BEPOSITORY_SERVICE),
+            ("bepository-upgrade.service", BEPOSITORY_UPGRADE_SERVICE),
+            ("bepository-upgrade.timer", BEPOSITORY_UPGRADE_TIMER),
+        ] {
+            assert!(
+                !text.contains('@'),
+                "{name} contains an '@' — likely an unresolved template token:\n{text}"
+            );
+        }
     }
 
     /// If `systemd-analyze` is on PATH, validate the emitted unit parses.

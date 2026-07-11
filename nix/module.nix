@@ -130,24 +130,21 @@ in
         (lib.mapAttrsToList (k: v: "${k}=${v}") cfg.extraEnv)
       + "\n";
 
-    systemd.services.bepository = {
-      description = "bepository cold-storage bridge for Syncthing";
-      wantedBy = [ "multi-user.target" ];
-      after = [ "network-online.target" ];
-      wants = [ "network-online.target" ];
+    # Install the unit shipped in cfg.package ($out/lib/systemd/system/).
+    # The unit itself is the canonical source (bepository-cli/units/), consumed
+    # byte-identical by install-service and here — so the two installs cannot
+    # drift on hardening keys, sleep.target coupling, etc.
+    systemd.packages = [ cfg.package ];
 
-      serviceConfig = {
-        Type = "simple";
-        ExecStart = "${cfg.package}/bin/bepository serve";
-        EnvironmentFile = [ "/etc/bepository/env" ];
-        StateDirectory = "bepository";
-        CacheDirectory = "bepository";
-        DynamicUser = true;
-        ProtectSystem = "strict";
-        PrivateTmp = true;
-        Restart = "on-failure";
-        RestartSec = "10s";
-      };
+    systemd.services.bepository = {
+      # Packaged units are not auto-enabled; wire the default target.
+      wantedBy = [ "multi-user.target" ];
+      # ExecStart is `/usr/bin/env bepository serve` — put the wrapped binary
+      # on the service's PATH so `env` resolves it.
+      path = [ cfg.package ];
+      # Restart whenever the generated env file changes (editing storageUri,
+      # listen, extraEnv, etc.), since the unit file itself is stable.
+      restartTriggers = [ config.environment.etc."bepository/env".text ];
     };
 
     # The service must not run an upgrade timer — nix owns updates

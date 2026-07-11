@@ -1,0 +1,8 @@
+[Unit]
+Description=bepository self-upgrade
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env bepository upgrade --restart-unit bepository.service

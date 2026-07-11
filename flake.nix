@@ -42,13 +42,18 @@
             meta.mainProgram = "bepository";
           }
           ''
-            mkdir -p "$out/bin"
+            mkdir -p "$out/bin" "$out/lib/systemd/system"
             # makeWrapper needs the interpreter to resolve; the static musl
             # binary has none, so we can copy it directly and wrap by exec.
             cp "${raw}" "$out/bin/bepository"
             chmod 0755 "$out/bin/bepository"
             wrapProgram "$out/bin/bepository" \
               --set BEPOSITORY_PACKAGE_MANAGED "update via 'nix flake update'"
+            # Install the canonical unit so the NixOS module can consume it via
+            # systemd.packages — same file install-service emits, byte-identical.
+            cp "${./bepository-cli/units/bepository.service}" \
+               "$out/lib/systemd/system/bepository.service"
+            chmod 0644 "$out/lib/systemd/system/bepository.service"
           '';
     in
     {
