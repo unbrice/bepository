@@ -7,12 +7,17 @@
 
   inputs = {
     nixpkgs.url = "nixpkgs";
-    rust-overlay.url = "github:oxalica/rust-overlay";
+    # `follows` makes rust-overlay track the root nixpkgs instead of carrying
+    # its own separate (older) pin — one fewer lockfile node, one fewer nixpkgs
+    # eval. rust-overlay is designed to support this.
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     crane.url = "github:ipetkov/crane";
-    llm-agents.url = "github:numtide/llm-agents.nix";
   };
 
-  outputs = { self, nixpkgs, rust-overlay, crane, llm-agents }:
+  outputs = { self, nixpkgs, rust-overlay, crane }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forAll = nixpkgs.lib.genAttrs systems;
@@ -132,7 +137,7 @@
               socat
               dprint
               reuse
-              llm-agents.packages.${system}.rtk
+              rtk
             ];
 
             shellHook = ''
