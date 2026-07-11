@@ -41,14 +41,14 @@ jobs:
           - aarch64-unknown-linux-musl
     steps:
       - name: Checkout
-        # actions/checkout@v5, pinned by SHA
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        # actions/checkout@v7, pinned by SHA
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           persist-credentials: false
 
-      # cachix/install-nix-action@v27, pinned by SHA (same pin as ci.yml)
+      # cachix/install-nix-action@v31, pinned by SHA
       - name: Install nix
-        uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b
+        uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c
         with:
           extra_nix_config: "experimental-features = nix-command flakes"
 
@@ -63,8 +63,8 @@ jobs:
              "bepository-${{ matrix.target }}"
 
       - name: Upload artifact
-        # actions/upload-artifact@v4, pinned by SHA
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        # actions/upload-artifact@v7, pinned by SHA
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: bepository-${{ matrix.target }}
           path: bepository-${{ matrix.target }}
@@ -78,13 +78,13 @@ jobs:
     permissions: { contents: write }
     steps:
       - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           persist-credentials: false
 
       - name: Download built binaries
-        # actions/download-artifact@v4, pinned by SHA
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        # actions/download-artifact@v8, pinned by SHA
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           path: assets
           merge-multiple: true
@@ -121,7 +121,7 @@ jobs:
     permissions: { contents: write, pull-requests: write }
     steps:
       - name: Checkout master
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           ref: master
 
