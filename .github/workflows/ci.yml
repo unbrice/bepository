@@ -23,10 +23,24 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
           persist-credentials: false
-      # cachix/install-nix-action@v27, pinned by SHA
-      - uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b
+      # nixbuild/nix-quick-install-action@v35, pinned by SHA. Paired with
+      # cache-nix-action below, which expects this installer's store layout.
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c
         with:
-          extra_nix_config: "experimental-features = nix-command flakes"
+          nix_conf: |
+            experimental-features = nix-command flakes
+
+      # nix-community/cache-nix-action@v7, pinned by SHA. Caches crane's
+      # cargoArtifacts (the expensive part of `nix flake check ./nix/dev`) in
+      # GitHub's native Actions cache — no external account, no secret. Keyed
+      # on both lockfiles so a hit means the build is reproducible; the prefix
+      # restore-key reuses the last-known store when only one lockfile moved.
+      - name: Restore nix store cache
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'nix/dev/flake.lock', 'Cargo.lock') }}
+          restore-keys: |
+            nix-${{ runner.os }}-
       # Smoke-check the user-facing flake (module + release-binary fetch, fast to eval).
       - run: nix flake check
         env:
