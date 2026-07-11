@@ -5,6 +5,9 @@ on:
     branches: [master]
   pull_request:
 
+permissions:
+  contents: read
+
 # Cancel in-flight runs for the same ref when a new commit lands.
 concurrency:
   group: ci-${{ github.ref }}
@@ -14,9 +17,12 @@ jobs:
   ci:
     name: nix flake check + e2e + packager
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      # actions/checkout@v4, pinned by SHA
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      # actions/checkout@v5, pinned by SHA
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
       # cachix/install-nix-action@v27, pinned by SHA
       - uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b
         with:
@@ -31,9 +37,13 @@ jobs:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       # Distro packager tier: the CLI must build with --no-default-features
       # (no self-manage networking/service code).
-      - run: nix develop ./nix/dev --command just check-packager
+      - run: nix develop ./nix/dev#ci --command just check-packager
         env:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-      - run: nix develop ./nix/dev --command just test-e2e
+      - run: nix develop ./nix/dev#ci --command just test-e2e
         env:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      # Cross-compile check: a `nix flake update` or dependency change that
+      # breaks musl cross-compilation fails here on push, not on tag day.
+      # Debug build, one target — cheaper than the release matrix.
+      - run: nix develop ./nix/dev#ci --command cargo zigbuild --target x86_64-unknown-linux-musl -p bepository-cli

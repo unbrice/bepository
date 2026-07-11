@@ -36,6 +36,11 @@
               src = craneLib.path ./../..;
               filter = path: type:
                 (pkgs.lib.hasSuffix ".proto" path) ||
+                # Non-Rust files embedded via include_str! in bepository-cli
+                # (systemd units, deploy/env.example).
+                (pkgs.lib.hasSuffix ".service" path) ||
+                (pkgs.lib.hasSuffix ".timer" path) ||
+                (pkgs.lib.hasSuffix "/deploy/env.example" path) ||
                 (craneLib.filterCargoSources path type);
             };
             strictDeps = true;
@@ -79,7 +84,44 @@
       });
 
       devShells = forAll (system:
-        let p = mkPkg system; in {
+        let
+          p = mkPkg system;
+          # Rust with the musl targets for the static release binaries. Same
+          # rustc as mkPkg's toolchain (same flake.lock pin); defined separately
+          # so crane's cargoArtifacts derivation is unaffected.
+          crossToolchain = p.pkgs.rust-bin.stable.latest.default.override {
+            targets = [ "x86_64-unknown-linux-musl" "aarch64-unknown-linux-musl" ];
+          };
+        in
+        {
+          # Shell for the GitHub workflows (ci.yml and release.yml): test
+          # tooling plus the release cross-build tooling, so a `nix flake
+          # update` that breaks the release toolchain fails CI on the next
+          # push instead of on tag day. cmake is for aws-lc-sys; zig is the
+          # cross C/asm toolchain cargo-zigbuild drives (ring, aws-lc, zstd,
+          # lz4). Deliberately NOT inputsFrom = [ p.bepository ]: that would
+          # put crane's musl-less rust toolchain on PATH alongside
+          # crossToolchain with unspecified ordering.
+          ci = p.pkgs.mkShell {
+            buildInputs = with p.pkgs; [
+              crossToolchain
+              cargo-zigbuild
+              zig
+              cmake
+              pkg-config
+              protobuf
+              # openssl serves the *native* test builds (same as commonArgs);
+              # the release binary itself links no OpenSSL.
+              openssl
+              syncthing
+              just
+              bubblewrap
+              socat
+            ];
+            PROTOC = "${p.pkgs.protobuf}/bin/protoc";
+          };
+
+          # Contributor shell: day-to-day human tooling, no cross-build weight.
           default = p.pkgs.mkShell {
             inputsFrom = [ p.bepository ];
 
