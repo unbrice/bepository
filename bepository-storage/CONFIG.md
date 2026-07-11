@@ -11,6 +11,16 @@ which lists files and reads the last one without requiring the lock.
 
 ## Fields
 
+### `format_version`
+
+**Type:** integer **Default:** `1` (current supported version)
+
+On-disk format version. An instance refuses to activate a store whose version is
+higher than it supports, preventing an older binary from silently clobbering a
+store written by a newer release. Old meta files lacking the field are treated
+as version `1`. Lock-free readers (`get-id`, `checkpoint list`) warn instead of
+failing.
+
 ### `next_folder_key`
 
 **Type:** integer **Default:** `0`
@@ -57,6 +67,7 @@ checkpoints automatically via background GC when their TTL elapses.
 ## Example
 
 ```toml
+format_version = 1
 next_folder_key = 2
 
 [identity]

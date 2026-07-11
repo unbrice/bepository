@@ -15,8 +15,15 @@ use serde::{Deserialize, Serialize};
 ///
 /// The epoch in the filename corresponds to the distributed lock epoch that
 /// last wrote the file. `clean_meta` deletes files from prior epochs.
-#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Meta {
+    /// On-disk format version of this meta file. Used as a forward fence: an
+    /// instance refuses to activate a store written by a newer format it does
+    /// not understand (see [`SUPPORTED_FORMAT_VERSION`]). Old files lacking the
+    /// field deserialize to the current version via [`default_format_version`].
+    #[serde(default = "default_format_version")]
+    pub format_version: u32,
+
     /// Next folder ID to allocate. Monotonically increasing to prevent reuse.
     #[serde(default)]
     pub next_folder_key: u64,
@@ -83,6 +90,36 @@ pub struct FolderEntry {
 pub struct CheckpointSchedule {
     #[serde(with = "humantime_serde")]
     pub ttl: Duration,
+}
+
+/// The format version this instance reads and writes. An instance refuses to
+/// activate a store whose meta reports a strictly greater version — auto-update
+/// makes version skew routine, and writing back with an old binary would lose
+/// information the newer format encoded.
+pub const SUPPORTED_FORMAT_VERSION: u32 = 1;
+
+/// Serde default for [`Meta::format_version`]: old meta files written before
+/// the field existed are, by definition, format version 1. This is pinned to a
+/// literal rather than [`SUPPORTED_FORMAT_VERSION`] on purpose — if the
+/// constant ever bumps to 2, legacy files must still read as 1, not silently
+/// become "current" (a version-2 reader would then misread genuinely-old data).
+/// [`Meta::default`] (fresh stores) uses the constant; this default is for
+/// deserialization of old files only.
+#[must_use]
+pub fn default_format_version() -> u32 {
+    1
+}
+
+impl Default for Meta {
+    fn default() -> Self {
+        Self {
+            format_version: SUPPORTED_FORMAT_VERSION,
+            next_folder_key: 0,
+            identity: None,
+            folders: BTreeMap::new(),
+            checkpoint: BTreeMap::new(),
+        }
+    }
 }
 
 impl Meta {

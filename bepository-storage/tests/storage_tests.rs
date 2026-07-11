@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use object_store::ObjectStore;
 use object_store::memory::InMemory;
 
 use bepository_bep::proto::bep::{BlockInfo, Counter, FileInfo, Vector};
@@ -1277,4 +1278,117 @@ async fn inline_blocks_excluded_from_gc_liveness() {
     // Verify they are dropped.
     assert!(folder.get_raw(&b_key).await.is_none());
     assert!(folder.get_raw(&br_key).await.is_none());
+}
+
+// --- format version fence (PLAN-0.8 Phase 1) ---
+
+#[test]
+fn meta_without_format_version_deserializes_to_one() {
+    // An old meta file written before `format_version` existed.
+    let old = "
+next_folder_key = 1
+";
+    let parsed: bepository_storage::meta::Meta = toml::from_str(old).unwrap();
+    // Old files are, by definition, format version 1 — pinned to a literal so a
+    // future SUPPORTED_FORMAT_VERSION bump doesn't silently reclassify legacy
+    // stores as "current" and misread them.
+    assert_eq!(parsed.format_version, 1);
+    // Sanity: today the constant is also 1.
+    assert_eq!(
+        parsed.format_version,
+        bepository_storage::meta::SUPPORTED_FORMAT_VERSION
+    );
+}
+
+#[tokio::test]
+async fn activate_refuses_store_written_by_newer_format_version() {
+    // Plant a meta file with a future format version directly into the object
+    // store. We can't go through SlateStorage's own writers because
+    // write_meta_to_disk forces SUPPORTED_FORMAT_VERSION.
+    let object_store = Arc::new(InMemory::new());
+    let future_version = bepository_storage::meta::SUPPORTED_FORMAT_VERSION + 98; // 99
+    let planted = format!("format_version = {future_version}\nnext_folder_key = 0\n");
+    let path = object_store::path::Path::from("bepository-00000001.toml");
+    object_store.put(&path, planted.into()).await.unwrap();
+
+    let s = SlateStorage::new(
+        object_store.clone(),
+        None,
+        tokio::runtime::Handle::current(),
+    );
+    let err = s
+        .activate(bepository_lock::Epoch::new(2).unwrap())
+        .await
+        .expect_err("activating a newer-format store must fail");
+    let StorageError::Corruption(msg) = err else {
+        panic!("expected Corruption, got {err:?}");
+    };
+    assert!(
+        msg.contains(&future_version.to_string()),
+        "message should name the found version: {msg}"
+    );
+    assert!(
+        msg.contains(&bepository_storage::meta::SUPPORTED_FORMAT_VERSION.to_string()),
+        "message should name the supported version: {msg}"
+    );
+    assert!(
+        msg.contains("upgrade this instance"),
+        "message should direct: {msg}"
+    );
+
+    // The too-new meta file must be untouched — activation did not rewrite it.
+    let reread: bepository_storage::meta::Meta = toml::from_str(
+        std::str::from_utf8(
+            &object_store
+                .get(&path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(reread.format_version, future_version);
+}
+
+#[tokio::test]
+async fn freshly_written_meta_contains_supported_format_version() {
+    let object_store = Arc::new(InMemory::new());
+    let epoch = bepository_lock::Epoch::new(1).unwrap();
+    {
+        let s = SlateStorage::new(
+            object_store.clone(),
+            None,
+            tokio::runtime::Handle::current(),
+        );
+        s.activate(epoch).await.unwrap();
+        s.close().await.unwrap();
+    }
+
+    // Read back whatever meta file activation wrote.
+    let listing = object_store.list_with_delimiter(None).await.unwrap();
+    let meta_obj = listing
+        .objects
+        .iter()
+        .find(|o| {
+            o.location
+                .filename()
+                .is_some_and(|n| n.starts_with(bepository_storage::meta::META_PREFIX))
+        })
+        .expect("a meta file should have been written");
+    let bytes = object_store
+        .get(&meta_obj.location)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let parsed: bepository_storage::meta::Meta =
+        toml::from_str(std::str::from_utf8(&bytes).unwrap()).unwrap();
+    assert_eq!(
+        parsed.format_version,
+        bepository_storage::meta::SUPPORTED_FORMAT_VERSION
+    );
 }

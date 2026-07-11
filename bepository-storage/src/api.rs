@@ -235,6 +235,19 @@ impl SlateStorage {
         // under the new epoch name, delete the old ones.
         let m = self.read_meta_unlocked().await?;
 
+        // Forward format fence: refuse to activate (and thus to rewrite) a store
+        // written by a newer format version. Must run before the unconditional
+        // write_meta_to_disk / clean_meta below so an old binary never clobbers
+        // information it does not understand. See meta::SUPPORTED_FORMAT_VERSION.
+        if m.format_version > meta::SUPPORTED_FORMAT_VERSION {
+            return Err(StorageError::Corruption(format!(
+                "this store was written by bepository format version {}, but this \
+                 instance only supports version {} — upgrade this instance",
+                m.format_version,
+                meta::SUPPORTED_FORMAT_VERSION
+            )));
+        }
+
         let activated = Arc::new(Activated {
             epoch,
             stores: tokio::sync::RwLock::new(HashMap::new()),
@@ -372,10 +385,21 @@ impl SlateStorage {
                 });
             }
         }
-        match last {
-            Some(obj) => Self::read_meta_at(&self.inner.object_store, &obj.location).await,
-            None => Ok(Meta::default()),
+        let meta = match last {
+            Some(obj) => Self::read_meta_at(&self.inner.object_store, &obj.location).await?,
+            None => Meta::default(),
+        };
+        // Lock-free readers (get-id, checkpoint list) only warn on a newer
+        // format version rather than failing — activation is the hard fence.
+        if meta.format_version > meta::SUPPORTED_FORMAT_VERSION {
+            tracing::warn!(
+                found = meta.format_version,
+                supported = meta::SUPPORTED_FORMAT_VERSION,
+                "store was written by a newer bepository format version; \
+                 upgrade this instance before writing to it"
+            );
         }
+        Ok(meta)
     }
 
     /// Atomically read-modify-write the meta TOML file.
@@ -897,7 +921,11 @@ impl Activated {
 
     async fn write_meta_to_disk(&self, m: &Meta) -> Result<(), StorageError> {
         let path = self.meta_path();
-        let content = toml::to_string_pretty(m)
+        // Enforce the supported format version centrally so no caller can
+        // forget to set it. The clone is cheap (meta is small).
+        let mut m = m.clone();
+        m.format_version = meta::SUPPORTED_FORMAT_VERSION;
+        let content = toml::to_string_pretty(&m)
             .map_err(|e| StorageError::Internal(format!("serialize meta: {e}")))?;
         self.object_store
             .put(&path, content.into())
