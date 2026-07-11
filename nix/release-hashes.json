@@ -1,6 +1,6 @@
 {
   "version": "0.8.0",
-  "comment": "sha256 hashes of the GitHub release binaries. Filled automatically by the release workflow (release.yml pin-nix-hashes job) on each tag push; the placeholders below are only valid until v0.8.0 is released.",
-  "x86_64-linux": "0000000000000000000000000000000000000000000000000000000000000000",
-  "aarch64-linux": "0000000000000000000000000000000000000000000000000000000000000000"
+  "comment": "filled by release CI on tag push",
+  "x86_64-linux": "c057b80244101f0caf9ee89e545076f273a21c2863b11ce65b7a6d88fd02ca89",
+  "aarch64-linux": "fe05221693ea4ad2f9acac14d88bfe5923034f3c1db6dda181437a77f6633b9e"
 }
