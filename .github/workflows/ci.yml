@@ -2,23 +2,36 @@ name: CI
 
 on:
   push:
+    branches: [master]
   pull_request:
+
+# Cancel in-flight runs for the same ref when a new commit lands.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   ci:
-    name: nix flake check + e2e
+    name: nix flake check + e2e + packager
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v27
+      # actions/checkout@v4, pinned by SHA
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      # cachix/install-nix-action@v27, pinned by SHA
+      - uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b
         with:
           extra_nix_config: "experimental-features = nix-command flakes"
-      # Smoke-check the user-facing flake (module-only, near-instant).
+      # Smoke-check the user-facing flake (module + release-binary fetch, fast to eval).
       - run: nix flake check
         env:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       # Run cargo tests, fmt, and clippy via the contributor flake.
       - run: nix flake check ./nix/dev
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      # Distro packager tier: the CLI must build with --no-default-features
+      # (no self-manage networking/service code).
+      - run: nix develop ./nix/dev --command just check-packager
         env:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       - run: nix develop ./nix/dev --command just test-e2e
