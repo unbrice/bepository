@@ -93,3 +93,50 @@ fn test_cli_fsck() {
         .success()
         .stdout(predicate::str::contains("Compaction complete."));
 }
+
+#[cfg(feature = "self-manage")]
+#[test]
+fn test_print_service() {
+    let mut cmd = Command::cargo_bin("bepository").unwrap();
+    cmd.arg("print-service")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("DynamicUser=yes"))
+        .stdout(predicate::str::contains(
+            "EnvironmentFile=/etc/bepository/env",
+        ))
+        .stdout(predicate::str::contains(
+            "ExecStart=/usr/local/bin/bepository serve",
+        ))
+        .stdout(predicate::str::contains("ProtectSystem=strict"));
+}
+
+#[cfg(feature = "self-manage")]
+#[test]
+fn test_package_managed_hides_subcommands_and_refuses() {
+    // When BEPOSITORY_PACKAGE_MANAGED is set, --help omits the self-manage
+    // subcommands...
+    let mut cmd = Command::cargo_bin("bepository").unwrap();
+    cmd.env(
+        "BEPOSITORY_PACKAGE_MANAGED",
+        "update via 'nix flake update'",
+    )
+    .arg("--help")
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("install-service").not())
+    .stdout(predicate::str::contains("print-service").not())
+    .stdout(predicate::str::contains("upgrade").not());
+
+    // ...and invoking one refuses with the hint.
+    let mut cmd = Command::cargo_bin("bepository").unwrap();
+    cmd.env(
+        "BEPOSITORY_PACKAGE_MANAGED",
+        "update via 'nix flake update'",
+    )
+    .arg("print-service")
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("package-managed"))
+    .stderr(predicate::str::contains("update via 'nix flake update'"));
+}

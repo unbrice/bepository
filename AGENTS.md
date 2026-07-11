@@ -48,8 +48,10 @@ documents its TOML metadata file in `CONFIG.md`.
 - BEP engine/state machine: `bepository-bep/src/engine.rs`; wire framing:
   `framing.rs`; retry policy: `retry.rs`
 - Lock algorithm: `bepository-lock/src/epoch.rs`; renewal/guard: `guard.rs`
-- CLI (subcommands, storage-URI parsing, serve loop): single file,
-  `bepository-cli/src/main.rs`
+- CLI (subcommands, storage-URI parsing, serve loop):
+  `bepository-cli/src/main.rs` — no longer a single file: service-management is
+  in `service.rs`, self-upgrade in `upgrade.rs`, both behind the default
+  `self-manage` feature.
 
 ## Vocabulary
 

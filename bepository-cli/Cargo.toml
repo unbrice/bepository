@@ -42,6 +42,11 @@ url = "2.5"
 uuid.workspace = true
 
 [features]
+default = ["self-manage"]
+# Service-management and self-upgrade subcommands (`install-service`,
+# `print-service`, `uninstall-service`, `upgrade`). Distros that ship their own
+# service files and update mechanism build with `--no-default-features`.
+self-manage = []
 tokio-console = ["dep:console-subscriber"]
 
 [dev-dependencies]

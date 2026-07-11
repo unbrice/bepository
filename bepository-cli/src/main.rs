@@ -14,6 +14,7 @@ use futures::StreamExt;
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use std::collections::HashMap;
+use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,6 +32,11 @@ use uuid::Uuid;
 /// Conflict resolver that always accepts the remote (non-bepository) version.
 /// The local version is noted but not backed up — the remote host retains it.
 struct TheirsResolver;
+
+#[cfg(feature = "self-manage")]
+mod service;
+#[cfg(feature = "self-manage")]
+mod upgrade;
 
 impl ConflictResolver for TheirsResolver {
     fn resolve<'a>(
@@ -192,6 +198,32 @@ enum Commands {
         #[arg(long)]
         compact: bool,
     },
+    /// Print the systemd service unit to stdout.
+    #[cfg(feature = "self-manage")]
+    PrintService,
+    /// Install the systemd service unit (and upgrade timer, unless
+    /// `--no-auto-upgrade`), enable it, and seed `/etc/bepository/env`.
+    ///
+    /// Requires root. Idempotent.
+    #[cfg(feature = "self-manage")]
+    InstallService {
+        /// Do not install the daily self-upgrade timer.
+        #[arg(long)]
+        no_auto_upgrade: bool,
+    },
+    /// Disable and remove the systemd service units. Leaves config in place.
+    #[cfg(feature = "self-manage")]
+    UninstallService,
+    /// Self-upgrade this binary from the latest GitHub release.
+    #[cfg(feature = "self-manage")]
+    Upgrade {
+        /// Restart this systemd unit after a successful upgrade.
+        #[arg(long, value_name = "UNIT")]
+        restart_unit: Option<String>,
+        /// Print what would happen, but make no changes.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -258,6 +290,13 @@ impl Commands {
             | Commands::Serve { storage, .. }
             | Commands::Fsck { storage, .. }
             | Commands::Checkpoint { storage, .. } => &storage.storage_uri,
+            // The self-manage subcommands do not open the store; give them a
+            // distinct lock scope so they don't collide with a running daemon.
+            #[cfg(feature = "self-manage")]
+            Commands::PrintService
+            | Commands::InstallService { .. }
+            | Commands::UninstallService
+            | Commands::Upgrade { .. } => "self-manage",
         }
     }
 }
@@ -802,6 +841,24 @@ async fn serve_locked(
         return ServeOutcome::Fatal(e.into());
     }
 
+    // Auto-init: under DynamicUser there is no stable UID for a root-run
+    // one-shot `init`, so serve performs the idempotent init itself when the
+    // store has no identity yet. Safe to call on every serve — run_init is a
+    // no-op once an identity exists.
+    let needs_init = match storage.get_identity() {
+        Ok(None) => true,
+        Ok(Some(_)) => false,
+        Err(e) => {
+            return ServeOutcome::Fatal(anyhow::Error::from(e).context("failed to read identity"));
+        }
+    };
+    if needs_init {
+        tracing::info!("uninitialized store — running init");
+        if let Err(e) = run_init(storage).await {
+            return ServeOutcome::Fatal(e);
+        }
+    }
+
     // Load identity under lock with epoch fencing — ensures we see a
     // consistent version even if fsck --regenerate-id ran concurrently.
     let identity = match require_identity(storage, true).await {
@@ -994,10 +1051,100 @@ fn init_tracing(trace_level: Option<String>) -> Result<()> {
     Ok(())
 }
 
+/// Lowest-precedence configuration layer: read `/etc/bepository/env` (or the
+/// `BEPOSITORY_ENV_FILE` override, used by tests) and set any KEY=VALUE pairs
+/// that are not already present in the process environment. Mirrors systemd's
+/// `EnvironmentFile` semantics: `KEY=VALUE` lines, `#` comments, blanks, and
+/// one surrounding pair of double-quotes stripped from the value. **No** shell
+/// expansion is performed — values are literal.
+///
+/// # Safety
+///
+/// Must be called single-threaded (before the tokio runtime is built). Env var
+/// mutation is otherwise `unsafe` under the 2024 edition.
+unsafe fn load_env_file() {
+    let path =
+        std::env::var("BEPOSITORY_ENV_FILE").unwrap_or_else(|_| "/etc/bepository/env".into());
+    // read_to_string fails for both "missing" and "exists but unreadable".
+    // Missing is the normal case for ad-hoc runs outside the service; unreadable
+    // (e.g. root-owned /etc/bepository/env run as a non-root user) is the one
+    // case where silence misleads — the user gets a confusing "storage URI not
+    // set" downstream. Distinguish them with a visible stderr hint. We use
+    // eprintln! (not tracing!) because this runs before init_tracing installs a
+    // subscriber.
+    let contents = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            eprintln!(
+                "bepository: env file {path} exists but could not be read ({e}); \
+                 ad-hoc commands may miss config — try running with sudo, \
+                 or set BEPOSITORY_* variables explicitly."
+            );
+            return;
+        }
+    };
+    for raw in contents.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            eprintln!("bepository: ignoring malformed env line in {path}: {raw}");
+            continue;
+        };
+        // Existing process env wins — never override. systemd EnvironmentFile is
+        // similarly the lowest layer.
+        if std::env::var_os(key).is_some() {
+            continue;
+        }
+        // Strip one surrounding pair of double-quotes, matching systemd semantics.
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .unwrap_or(value);
+        // Safety: single-threaded per the function's contract.
+        unsafe { std::env::set_var(key, value) };
+    }
+}
+
+/// Parse the CLI. When `BEPOSITORY_PACKAGE_MANAGED` is set, the self-manage
+/// subcommands are hidden from `--help` (their handlers still refuse execution,
+/// independently — clap's `hide` only affects help text).
+#[cfg(feature = "self-manage")]
+fn parse_cli() -> Cli {
+    use clap::{CommandFactory, FromArgMatches};
+    let mut cmd = Cli::command();
+    if std::env::var_os("BEPOSITORY_PACKAGE_MANAGED").is_some_and(|v| !v.is_empty()) {
+        for name in [
+            "install-service",
+            "print-service",
+            "uninstall-service",
+            "upgrade",
+        ] {
+            cmd = cmd.mut_subcommand(name, |c| c.hide(true));
+        }
+    }
+    let matches = cmd.get_matches();
+    Cli::from_arg_matches(&matches).expect("Cli derives Parser; from_arg_matches cannot fail here")
+}
+
+#[cfg(not(feature = "self-manage"))]
+fn parse_cli() -> Cli {
+    Cli::parse()
+}
+
 fn main() -> Result<()> {
+    // Load /etc/bepository/env before anything else — before rustls init, before
+    // tokio, and crucially before Cli::parse() (clap binds env vars at parse
+    // time). This gives ad-hoc commands the same config the systemd unit reads
+    // via EnvironmentFile. Existing process env always wins (lowest precedence).
+    // Safety: this runs single-threaded, before any runtime or spawned thread.
+    unsafe { load_env_file() };
+
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let cli = Cli::parse();
+    let cli = parse_cli();
     // Scrub the env var so child processes can't inherit it.
     // Safety: single-threaded at this point; no concurrent env reads.
     unsafe { std::env::remove_var("BEPOSITORY_DAV_PASSWORD") };
@@ -1139,6 +1286,37 @@ async fn async_main(cli: Cli, storage_runtime_handle: tokio::runtime::Handle) ->
         }
         Commands::Checkpoint { storage, action } => {
             cmd_checkpoint(storage, action, &holder, storage_runtime_handle).await?;
+        }
+        #[cfg(feature = "self-manage")]
+        Commands::PrintService => {
+            if let Some(hint) = service::package_managed_hint() {
+                return Err(service::package_managed_error(&hint));
+            }
+            service::print_service()?;
+        }
+        #[cfg(feature = "self-manage")]
+        Commands::InstallService { no_auto_upgrade } => {
+            if let Some(hint) = service::package_managed_hint() {
+                return Err(service::package_managed_error(&hint));
+            }
+            service::install_service(no_auto_upgrade)?;
+        }
+        #[cfg(feature = "self-manage")]
+        Commands::UninstallService => {
+            if let Some(hint) = service::package_managed_hint() {
+                return Err(service::package_managed_error(&hint));
+            }
+            service::uninstall_service()?;
+        }
+        #[cfg(feature = "self-manage")]
+        Commands::Upgrade {
+            restart_unit,
+            dry_run,
+        } => {
+            if let Some(hint) = service::package_managed_hint() {
+                return Err(service::package_managed_error(&hint));
+            }
+            upgrade::run(restart_unit, dry_run).await?;
         }
     }
     Ok(())
@@ -1475,5 +1653,88 @@ mod tests {
         assert_eq!(registered.len(), 1);
         assert_eq!(registered[0].0, FolderId::from("test-folder"));
         assert_eq!(registered[0].1, FolderLabel::from("LabelFor-test-folder"));
+    }
+
+    // --- env-file load (PLAN-0.8 Phase 2) ---
+
+    /// The serve auto-init predicate: a fresh store has no identity, and
+    /// `run_init` (which `serve_locked` calls in that case) produces one.
+    /// `serve_locked` itself is exercised end-to-end by the e2e suite
+    /// (files_survive_bepository_restarts); this unit test pins the auto-init
+    /// branch's precondition + effect directly.
+    #[tokio::test]
+    async fn serve_auto_init_predicate() {
+        let store = Arc::new(InMemory::new());
+        let storage = SlateStorage::new(store, None, tokio::runtime::Handle::current());
+        storage
+            .activate(bepository_lock::Epoch::new(1).unwrap())
+            .await
+            .unwrap();
+        // Fresh store: no identity yet — this is the precondition serve_locked checks.
+        assert!(storage.get_identity().unwrap().is_none());
+        // run_init is the idempotent path serve_locked calls; it must produce an identity.
+        let id = run_init(&storage).await.unwrap();
+        assert!(!id.is_empty());
+        // After init, the identity is present — serve would not re-init.
+        assert!(storage.get_identity().unwrap().is_some());
+        // Idempotent: running again returns the same identity.
+        assert_eq!(run_init(&storage).await.unwrap(), id);
+    }
+
+    /// Serializes env-file tests: both load_env_file and the env-file-missing
+    /// check mutate the global `BEPOSITORY_ENV_FILE` var, and cargo runs tests
+    /// on parallel threads. Holding a sync mutex across the synchronous
+    /// load_env_file (no awaits) is fine.
+    static ENV_FILE_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `load_env_file` sets unset vars, leaves already-set vars untouched, and
+    /// treats a missing file as a no-op. Merged into one test so the two
+    /// `BEPOSITORY_ENV_FILE` mutations can't race under cargo's parallel runner.
+    #[test]
+    fn env_file_load_and_missing_file_are_handled() {
+        let _guard = ENV_FILE_TEST_GUARD.lock().unwrap();
+        const NEW: &str = "BEPOSITORY_TEST_ENV_FILE_NEW";
+        const EXISTING: &str = "BEPOSITORY_TEST_ENV_FILE_EXISTING";
+        // Safety: serialized by ENV_FILE_TEST_GUARD; clean up so the test is
+        // order-independent and leaves no residue.
+        unsafe {
+            std::env::remove_var(NEW);
+            std::env::set_var(EXISTING, "from-process");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("env");
+        std::fs::write(
+            &path,
+            "# a comment\n\
+             BEPOSITORY_TEST_ENV_FILE_NEW=from-file\n\
+             BEPOSITORY_TEST_ENV_FILE_EXISTING=from-file\n\
+             BEPOSITORY_TEST_ENV_FILE_QUOTED=\"quoted value\"\n",
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("BEPOSITORY_ENV_FILE", &path);
+            load_env_file();
+        }
+        assert_eq!(std::env::var(NEW).unwrap(), "from-file");
+        // Process env wins over the file.
+        assert_eq!(std::env::var(EXISTING).unwrap(), "from-process");
+        assert_eq!(
+            std::env::var("BEPOSITORY_TEST_ENV_FILE_QUOTED").unwrap(),
+            "quoted value"
+        );
+
+        // A missing env file is a no-op (normal for ad-hoc runs).
+        unsafe {
+            std::env::set_var("BEPOSITORY_ENV_FILE", "/nonexistent/bepository-env-test");
+            load_env_file();
+        }
+
+        // Cleanup.
+        unsafe {
+            std::env::remove_var(NEW);
+            std::env::remove_var(EXISTING);
+            std::env::remove_var("BEPOSITORY_TEST_ENV_FILE_QUOTED");
+            std::env::remove_var("BEPOSITORY_ENV_FILE");
+        }
     }
 }
