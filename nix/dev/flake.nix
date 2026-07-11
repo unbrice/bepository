@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
 {
-  description = "bepository dev shell and OCI image (contributor flake)";
+  description = "bepository dev shell and source-built package (contributor flake)";
 
   inputs = {
     nixpkgs.url = "nixpkgs";
@@ -60,47 +60,15 @@
             cargoExtraArgs = "-p bepository-cli";
             meta.mainProgram = "bepository";
           });
-
-          oci = pkgs.dockerTools.buildLayeredImage {
-            name = "bepository";
-            tag = "latest";
-
-            fromImage = pkgs.dockerTools.pullImage {
-              imageName = "cgr.dev/chainguard/glibc-dynamic";
-              # Pin with: nix run nixpkgs#nix-prefetch-docker -- \
-              #   --image-name cgr.dev/chainguard/glibc-dynamic --image-tag latest
-              imageDigest = "sha256:c97b5efe4aeb84e438afa743e69ccf2fc4a23ec847f6c3c68efc3edd9fad683c";
-              hash = "sha256-X625EiiRGK02cKB17hN+9mSPAM0sVIOVv9cGu03+8XY=";
-              finalImageName = "cgr.dev/chainguard/glibc-dynamic";
-              finalImageTag = "latest";
-            };
-
-            # Pure Rustls + Ring — no OpenSSL runtime dep, glibc base is sufficient.
-            contents = [ bepository ];
-
-            config = {
-              Entrypoint = [ "${bepository}/bin/bepository" ];
-              WorkingDir = "/data";
-              Volumes = { "/data" = { }; };
-              User = "65532:65532"; # chainguard nonroot
-              Labels = {
-                "org.opencontainers.image.source" = "https://github.com/unbrice/bepository";
-                "org.opencontainers.image.description" = "bepository: Syncthing cold-storage bridge";
-                "org.opencontainers.image.version" = (pkgs.lib.importTOML ./../../Cargo.toml).workspace.package.version;
-                "org.opencontainers.image.licenses" = "MIT OR Apache-2.0";
-              };
-            };
-          };
         in
         {
-          inherit pkgs craneLib commonArgs cargoArtifacts bepository oci;
+          inherit pkgs craneLib commonArgs cargoArtifacts bepository;
         };
     in
     {
       packages = forAll (system:
         let p = mkPkg system; in {
           default = p.bepository;
-          oci = p.oci;
         });
 
       apps = forAll (system: {
