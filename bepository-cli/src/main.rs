@@ -5,7 +5,9 @@
 use anyhow::{Context, Result, anyhow};
 use bepository_bep::ids::FolderId;
 use bepository_bep::proto::bep::FileInfo;
-use bepository_bep::{BepEngine, ConflictResolution, ConflictResolver, DeviceId, EngineEvent};
+use bepository_bep::{
+    BepEngine, ConflictResolution, ConflictResolver, DeviceId, EngineEvent, StorageError,
+};
 use bepository_lock::{LockGuard, LockLost};
 use bepository_storage::{CacheProvider, CheckpointSchedule, SlateStorage};
 use bepository_tls::Identity;
@@ -464,7 +466,10 @@ where
     // Once the lock is acquired, every fallible operation must be captured
     // so we always reach release() — even on activate/close/f failure.
     let result = async {
-        storage.activate(epoch).await?;
+        storage
+            .activate(epoch)
+            .await
+            .map_err(into_activation_error)?;
         let r = f().await;
         storage.close().await?;
         r
@@ -827,6 +832,31 @@ async fn spawn_checkpoint_tasks(
     checkpoint_handles
 }
 
+/// Map an activation error into an `anyhow::Error`, adding a concrete remedy
+/// when the store was written by a newer format version. Only suggests the
+/// `upgrade` subcommand in builds that have it (the `self-manage` feature);
+/// both activation paths (`serve_locked`, `with_admin_lock`) route through this
+/// so the hint cannot drift between them. Non-`UnsupportedVersion` errors pass
+/// through unchanged.
+fn into_activation_error(e: StorageError) -> anyhow::Error {
+    let hint = match e {
+        StorageError::UnsupportedVersion { found, supported } => {
+            let base = format!(
+                "this store was written by format version {found}, but this \
+                 instance only supports version {supported}."
+            );
+            #[cfg(feature = "self-manage")]
+            let tail = " Run `bepository upgrade`, then restart.";
+            #[cfg(not(feature = "self-manage"))]
+            let tail = " Upgrade this instance and restart.";
+            format!("{base}{tail}")
+        }
+        // Any other error: no actionable hint to add.
+        other => return anyhow::Error::from(other),
+    };
+    anyhow::Error::from(e).context(hint)
+}
+
 #[tracing::instrument(level = "info", skip(s, storage, cancel, guard), fields(epoch = %guard.epoch().as_base32()))]
 async fn serve_locked(
     s: &ServeConfig,
@@ -835,7 +865,7 @@ async fn serve_locked(
     guard: &mut LockGuard,
 ) -> ServeOutcome {
     if let Err(e) = storage.activate(guard.epoch()).await {
-        return ServeOutcome::Fatal(e.into());
+        return ServeOutcome::Fatal(into_activation_error(e));
     }
     if let Err(e) = storage.gc_inbox().await {
         return ServeOutcome::Fatal(e.into());

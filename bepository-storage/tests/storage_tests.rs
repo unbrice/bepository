@@ -1320,17 +1320,15 @@ async fn activate_refuses_store_written_by_newer_format_version() {
         .activate(bepository_lock::Epoch::new(2).unwrap())
         .await
         .expect_err("activating a newer-format store must fail");
-    let StorageError::Corruption(msg) = err else {
-        panic!("expected Corruption, got {err:?}");
+    let StorageError::UnsupportedVersion { found, supported } = err else {
+        panic!("expected UnsupportedVersion, got {err:?}");
     };
-    assert!(
-        msg.contains(&future_version.to_string()),
-        "message should name the found version: {msg}"
+    assert_eq!(found, future_version);
+    assert_eq!(
+        supported,
+        bepository_storage::meta::SUPPORTED_FORMAT_VERSION
     );
-    assert!(
-        msg.contains(&bepository_storage::meta::SUPPORTED_FORMAT_VERSION.to_string()),
-        "message should name the supported version: {msg}"
-    );
+    let msg = err.to_string();
     assert!(
         msg.contains("upgrade this instance"),
         "message should direct: {msg}"

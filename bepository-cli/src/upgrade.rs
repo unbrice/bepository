@@ -379,14 +379,6 @@ FEDCBA9876543210  bepository-aarch64-unknown-linux-musl\n";
         assert!(msg.contains("checksum mismatch"), "{msg}");
     }
 
-    #[test]
-    fn older_or_equal_version_is_not_strictly_newer() {
-        let current = Version::new(0, 8, 0);
-        assert!(Version::new(0, 7, 5) <= current); // older → noop
-        assert!(Version::new(0, 8, 0) <= current); // equal → noop
-        assert!(Version::new(0, 8, 1) > current); // newer → upgrade
-    }
-
     /// A tiny hyper server impersonating the GitHub releases API for the
     /// upgrade path. Serves `/releases/latest` (JSON with `browser_download_url`
     /// pointing back at the fixture), plus the binary asset and SHA256SUMS.

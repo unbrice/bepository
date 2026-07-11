@@ -263,14 +263,16 @@ enum IndexTaskMessage {
 
 /// Wraps a BepError with a priority used by the connection supervisor to
 /// pick the most informative error when multiple worker tasks fail. Ranking:
-/// storage/corruption > protocol > peer-level > network/IO > writer-closed-proxy
-/// > peer-clean-close.
+/// version-mismatch > storage/corruption > protocol > peer-level > network/IO
+/// then writer-closed-proxy, then peer-clean-close. UnsupportedVersion ranks
+/// above Corruption: its root cause is deterministic and self-explanatory.
 #[derive(Debug)]
 struct WorkerError(BepError);
 
 impl WorkerError {
     fn priority(&self) -> u8 {
         match &self.0 {
+            BepError::UnsupportedVersion { .. } => 110,
             BepError::Corruption(_) => 100,
             BepError::Internal(_) => 90,
             BepError::PeerBadHello(_) | BepError::PeerBadMessage(_) => 70,

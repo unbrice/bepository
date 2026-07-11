@@ -25,6 +25,15 @@ pub enum StorageError {
     #[error("data corruption: {0}")]
     Corruption(String),
 
+    /// On-disk store was written by a newer format version than this instance
+    /// understands. Not corruption — the data is well-formed, the binary is
+    /// just too old to honor it. The caller should surface a clear "upgrade
+    /// this instance" message rather than treating it as decode failure.
+    #[error(
+        "store written by format version {found}, but this instance only supports version {supported} — upgrade this instance"
+    )]
+    UnsupportedVersion { found: u32, supported: u32 },
+
     /// Requested resource does not exist.
     ///
     /// Includes missing blocks, unregistered folders, and absent index entries.
@@ -64,7 +73,10 @@ impl StorageError {
     /// Returns true if the error indicates unrecoverable state requiring process shutdown.
     #[must_use]
     pub fn is_fatal(&self) -> bool {
-        matches!(self, Self::Corruption(_) | Self::Internal(_))
+        matches!(
+            self,
+            Self::Corruption(_) | Self::Internal(_) | Self::UnsupportedVersion { .. }
+        )
     }
 }
 
@@ -87,6 +99,12 @@ pub enum BepError {
     /// Data corruption or decode failures
     #[error("data corruption: {0}")]
     Corruption(String),
+
+    /// On-disk store written by a newer format version than this binary supports.
+    #[error(
+        "store written by format version {found}, but this instance only supports version {supported} — upgrade this instance"
+    )]
+    UnsupportedVersion { found: u32, supported: u32 },
 
     /// Internal logic error not caused by storage corruption
     #[error("internal error: {0}")]
@@ -126,7 +144,10 @@ impl BepError {
     /// Returns true if the error indicates unrecoverable state requiring process shutdown.
     #[must_use]
     pub fn is_fatal(&self) -> bool {
-        matches!(self, Self::Corruption(_) | Self::Internal(_))
+        matches!(
+            self,
+            Self::Corruption(_) | Self::Internal(_) | Self::UnsupportedVersion { .. }
+        )
     }
 
     /// Returns true if the error was caused by the remote peer's protocol violation.

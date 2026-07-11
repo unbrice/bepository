@@ -239,13 +239,13 @@ impl SlateStorage {
         // written by a newer format version. Must run before the unconditional
         // write_meta_to_disk / clean_meta below so an old binary never clobbers
         // information it does not understand. See meta::SUPPORTED_FORMAT_VERSION.
+        // UnsupportedVersion is distinct from Corruption: the data is well-formed,
+        // this binary is simply too old to honor it.
         if m.format_version > meta::SUPPORTED_FORMAT_VERSION {
-            return Err(StorageError::Corruption(format!(
-                "this store was written by bepository format version {}, but this \
-                 instance only supports version {} — upgrade this instance",
-                m.format_version,
-                meta::SUPPORTED_FORMAT_VERSION
-            )));
+            return Err(StorageError::UnsupportedVersion {
+                found: m.format_version,
+                supported: meta::SUPPORTED_FORMAT_VERSION,
+            });
         }
 
         let activated = Arc::new(Activated {

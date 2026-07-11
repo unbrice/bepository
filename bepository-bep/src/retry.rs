@@ -32,6 +32,9 @@ fn standard_map_error(error: StorageError) -> BepError {
     match error {
         StorageError::TransientIo(msg) => BepError::TransientIo(msg),
         StorageError::Corruption(msg) => BepError::Corruption(msg),
+        StorageError::UnsupportedVersion { found, supported } => {
+            BepError::UnsupportedVersion { found, supported }
+        }
         StorageError::Standby(msg) => BepError::Standby(msg),
         StorageError::NotFound(msg) => BepError::Corruption(format!("not found: {msg}")),
         StorageError::InvalidInput(msg) => {
@@ -233,6 +236,10 @@ mod tests {
         let policy = ExponentialBackoff::default();
         for err in [
             StorageError::Corruption("c".into()),
+            StorageError::UnsupportedVersion {
+                found: 2,
+                supported: 1,
+            },
             StorageError::Standby("nm".into()),
             StorageError::NotFound("nf".into()),
             StorageError::InvalidInput("ii".into()),
@@ -260,6 +267,20 @@ mod tests {
         assert!(matches!(
             NoRetry.map_error(StorageError::Corruption("x".into())),
             BepError::Corruption(_)
+        ));
+    }
+
+    #[test]
+    fn error_mapping_unsupported_version() {
+        assert!(matches!(
+            NoRetry.map_error(StorageError::UnsupportedVersion {
+                found: 2,
+                supported: 1
+            }),
+            BepError::UnsupportedVersion {
+                found: 2,
+                supported: 1
+            }
         ));
     }
 
