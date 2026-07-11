@@ -18,4 +18,5 @@ target
 # Optimize LLM usage.
 .rtk/
 .aider*
+.antigravitycli/
 .claude/
