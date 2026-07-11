@@ -1,39 +1,169 @@
-name: Release OCI Image
+name: Release
+
+# Publishes static musl binaries (instead of an OCI image) on every `v*.*.*`
+# tag push. A final job pins the per-triple sha256s into nix/release-hashes.json
+# so the NixOS module can fetchurl the matching binary.
+#
+# Native-dependency survey (see commit body): the release binary links ring
+# (rustls), aws-lc-sys (via object_store's aws feature → reqwest
+# rustls-tls-native-roots), zstd-sys/lz4-sys (foyer), all statically via the
+# `cc` crate. aws-lc-sys shells out to cmake, so cmake must be present alongside
+# zig. protoc is build-time only (prost). No OpenSSL is linked.
 
 on:
   push:
+    # Note: this glob also matches pre-release tags like `v0.8.0-rc1`. The repo
+    # has never tagged rcs; if it ever does, the pin job would commit rc hashes
+    # to master and `gh release create` below would not mark the release as a
+    # prerelease. Tighten the glob (e.g. `v[0-9]*.[0-9]*.[0-9]*`) before tagging rcs.
     tags: ["v*.*.*"]
 
 permissions:
-  contents: read
-  packages: write
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  publish:
-    name: Build and push OCI image
+  build:
+    name: Build static binary (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - name: Checkout
+        # actions/checkout@v5, pinned by SHA
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Install build deps (protoc, cmake, zig)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler cmake
+          # zig is the cross C/asm toolchain cargo-zigbuild drives (ring, aws-lc, zstd, lz4).
+          # Pinned version for reproducibility.
+          ZIG_VERSION="0.13.0"
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" \
+            | sudo tar -xJ -C /usr/local
+          sudo ln -sf "/usr/local/zig-linux-x86_64-${ZIG_VERSION}/zig" /usr/local/bin/zig
+          zig version
+
+      - name: Install Rust toolchain
+        run: |
+          rustup target add ${{ matrix.target }}
+          # Pinned: a cargo-zigbuild release could change cross-build behavior
+          # between two tags. This is the version validated by the local
+          # feasibility spike (nix-shell -p … cargo-zigbuild).
+          cargo install --locked --version 0.22.3 cargo-zigbuild
+
+      - name: Build
+        run: cargo zigbuild --release --target ${{ matrix.target }} -p bepository-cli
+
+      - name: Stage release asset
+        run: |
+          mv "target/${{ matrix.target }}/release/bepository" \
+             "bepository-${{ matrix.target }}"
+
+      - name: Upload artifact
+        # actions/upload-artifact@v4, pinned by SHA
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: bepository-${{ matrix.target }}
+          path: bepository-${{ matrix.target }}
+          if-no-files-found: error
+
+  upload:
+    name: Upload release assets + SHA256SUMS
+    needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
 
-      - uses: cachix/install-nix-action@v27
+      - name: Download built binaries
+        # actions/download-artifact@v4, pinned by SHA
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          extra_nix_config: "experimental-features = nix-command flakes"
+          path: assets
+          merge-multiple: true
 
-      - name: Build OCI image
-        run: nix build ./nix/dev#oci --out-link result-oci
-
-      - name: Log in to ghcr.io
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Push OCI image
+      - name: Generate SHA256SUMS
         run: |
-          docker load < result-oci
-          IMAGE="ghcr.io/${{ github.repository }}"
-          docker tag bepository:latest "${IMAGE}:latest"
-          docker tag bepository:latest "${IMAGE}:${{ github.ref_name }}"
-          docker push "${IMAGE}:latest"
-          docker push "${IMAGE}:${{ github.ref_name }}"
+          cd assets
+          sha256sum bepository-x86_64-unknown-linux-musl \
+                    bepository-aarch64-unknown-linux-musl > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create / update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" --clobber \
+              assets/bepository-x86_64-unknown-linux-musl \
+              assets/bepository-aarch64-unknown-linux-musl \
+              assets/SHA256SUMS
+          else
+            gh release create "$TAG" --verify-tag --generate-notes \
+              assets/bepository-x86_64-unknown-linux-musl \
+              assets/bepository-aarch64-unknown-linux-musl \
+              assets/SHA256SUMS
+          fi
+
+  pin-nix-hashes:
+    name: Pin nix/release-hashes.json
+    needs: upload
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout master
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Rewrite release-hashes.json from the release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+          # Fetch the SHA256SUMS uploaded in the previous job.
+          gh release download "$TAG" --pattern SHA256SUMS --dir .
+          X86=$(awk '/x86_64-unknown-linux-musl/ {print $1}' SHA256SUMS)
+          ARM=$(awk '/aarch64-unknown-linux-musl/ {print $1}' SHA256SUMS)
+          test -n "$X86" -a -n "$ARM"
+          # jq rejects hyphens in unquoted object keys — quote them. The key
+          # names must match nix/module.nix's hashes.${system} reads exactly.
+          jq --null-input \
+            --arg version "$VERSION" \
+            --arg x86 "$X86" \
+            --arg arm "$ARM" \
+            '{version: $version, comment: "filled by release CI on tag push", "x86_64-linux": $x86, "aarch64-linux": $arm}' \
+            > nix/release-hashes.json
+          cat nix/release-hashes.json
+
+      - name: Commit hash pin
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add nix/release-hashes.json
+          git commit -m "chore(nix): pin ${{ github.ref_name }} release binaries" || exit 0
+          if git push origin master; then
+            echo "Pushed hash pin to master."
+          else
+            echo "::warning::Push rejected (branch protection?). Opening a PR."
+            BRANCH="pin-release-hashes-$(date +%s)"
+            git switch -c "$BRANCH"
+            git push origin "$BRANCH"
+            gh pr create --title "chore(nix): pin ${{ github.ref_name }} release binaries" \
+                         --body "Bot commit from the release workflow (push to master was rejected)." \
+                         --head "$BRANCH" --base master
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
