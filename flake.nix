@@ -21,6 +21,10 @@
       }.${system};
 
       # The pinned release version + sha256s, maintained by release CI.
+      # Values are SRI base64 NAR hashes (executable mode), matching
+      # `pkgs.fetchurl { executable = true; }` below — see release.yml's
+      # pin-nix-hashes job, which computes them with `nix store prefetch-file
+      # --executable`. A plain sha256sum (flat hash) would never match.
       hashes = builtins.fromJSON (builtins.readFile ./nix/release-hashes.json);
 
       # Prebuilt static musl binary fetched from GitHub releases, wrapped to set

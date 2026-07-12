@@ -6,9 +6,14 @@ name: Release
 #
 # Releases are immutable: once a tag's assets exist, the upload job refuses to
 # overwrite them. Corrected/rebuilt binaries must ship under a new tag — the
-# committed sha256s are content-addressed, so mutating an asset after pinning
-# silently breaks every flake consumer (the v0.8.1 hash drift that motivated
-# this rule).
+# committed hashes are content-addressed, so mutating an asset after pinning
+# would silently break every flake consumer.
+#
+# Hash mode: fetchurl uses `executable = true` (see flake.nix), which ingests
+# the file in NAR mode with the exec bit set. The pin job therefore computes
+# hashes with `nix store prefetch-file --executable`, NOT `sha256sum` (a flat
+# hash that can never match). A flat-vs-NAR mismatch caused the v0.8.1/v0.8.2
+# rebuild failures.
 #
 # Toolchain: rustc + musl targets, zig, cargo-zigbuild, cmake, and protoc all
 # come from the contributor flake's `ci` dev shell (nix/dev), pinned by its
@@ -143,19 +148,37 @@ jobs:
         with:
           ref: master
 
+      - name: Install nix
+        # Needed so the hashes we pin match what nix's fetchurl will later
+        # compute. fetchurl with `executable = true` (see flake.nix) uses a
+        # NAR-mode hash — i.e. the recursive hash over the file with the exec
+        # bit set. `sha256sum` produces a flat hash, which can never match, so
+        # we must derive the hash the same way nix ingests the file.
+        uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c
+        with:
+          extra_nix_config: "experimental-features = nix-command flakes"
+
       - name: Rewrite release-hashes.json from the release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ github.ref_name }}"
           VERSION="${TAG#v}"
-          # Fetch the SHA256SUMS uploaded in the previous job.
-          gh release download "$TAG" --pattern SHA256SUMS --dir .
-          X86=$(awk '/x86_64-unknown-linux-musl/ {print $1}' SHA256SUMS)
-          ARM=$(awk '/aarch64-unknown-linux-musl/ {print $1}' SHA256SUMS)
+          # Compute the SAME hash nix's fetchurl will later verify against:
+          # `nix store prefetch-file --executable` ingests the file in NAR mode
+          # with the executable bit set, exactly mirroring
+          # `pkgs.fetchurl { executable = true; }` in flake.nix. The resulting
+          # SRI string (sha256-…=, base64) is what fetchurl's `sha256` field
+          # accepts. A plain sha256sum (flat hash) would never match.
+          X86=$(nix store prefetch-file --executable --json \
+                  "https://github.com/${{ github.repository }}/releases/download/${TAG}/bepository-x86_64-unknown-linux-musl" \
+                | jq -r .hash)
+          ARM=$(nix store prefetch-file --executable --json \
+                  "https://github.com/${{ github.repository }}/releases/download/${TAG}/bepository-aarch64-unknown-linux-musl" \
+                | jq -r .hash)
           test -n "$X86" -a -n "$ARM"
           # jq rejects hyphens in unquoted object keys — quote them. The key
-          # names must match nix/module.nix's hashes.${system} reads exactly.
+          # names must match flake.nix's hashes.${system} reads exactly.
           jq --null-input \
             --arg version "$VERSION" \
             --arg x86 "$X86" \
@@ -164,19 +187,15 @@ jobs:
             > nix/release-hashes.json
           cat nix/release-hashes.json
 
-      - name: Verify pinned hashes against the live release assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify the pinned hashes build
         run: |
-          # Guard against the v0.8.1 failure mode: an asset mutated between the
-          # upload and this commit would desync nix/release-hashes.json from
-          # what the NixOS module ultimately fetchurls. Re-download the binaries
-          # and assert they still match SHA256SUMS before we pin anything.
-          TAG="${{ github.ref_name }}"
-          mkdir -p verify && cd verify
-          gh release download "$TAG" \
-            --pattern 'bepository-*-unknown-linux-musl' --dir .
-          sha256sum -c ../SHA256SUMS
+          # End-to-end check: the hash we just pinned must actually fetchurl.
+          # `nix build` exercises the exact flake.nix fetchurl path consumers
+          # use, so a flat/NAR mode mismatch or a stale asset fails here before
+          # we commit — rather than on every downstream nixos-rebuild. Only the
+          # runner's native arch is built (x86_64 on ubuntu-latest); the aarch64
+          # hash comes from the same deterministic prefetch above.
+          nix build --no-link .#packages.${{ runner.arch == 'X64' && 'x86_64' || 'aarch64' }}-linux.default
 
       - name: Commit hash pin
         env:

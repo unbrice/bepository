@@ -1,6 +1,6 @@
 {
   "version": "0.8.2",
   "comment": "filled by release CI on tag push",
-  "x86_64-linux": "5ab92ad0ca0cff705667c33e62bb2471c9b7440595b1a2dc89ea98434449ed25",
-  "aarch64-linux": "e17ad7288bbd45d0656fa0c92259f728663b1063cfe6cafe161c17290fb8e30b"
+  "x86_64-linux": "sha256-Y/us+i3gPtmegxDDmFBCvSSOffb+F2WX+Qbw7TaDAxQ=",
+  "aarch64-linux": "sha256-rzLkiNlEylIWKrchpu9DrQidMrMZaa/yijY3/zBrodY="
 }
