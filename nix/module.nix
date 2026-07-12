@@ -132,6 +132,10 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    # Put `bepository` on the system PATH so ad-hoc commands (get-id, fsck, …)
+    # resolve from a shell — the unit's own PATH is wired separately below.
+    environment.systemPackages = [ cfg.package ];
+
     # The EnvironmentFile the service reads. Generated from the options above.
     environment.etc."bepository/env".text =
       ''
@@ -144,6 +148,11 @@ in
       ''
       + lib.concatStringsSep "\n"
         (lib.mapAttrsToList (k: v: "${k}=${v}") cfg.extraEnv)
+      + lib.optionalString (cfg.extraEnv ? GOOGLE_APPLICATION_CREDENTIALS) ''
+
+        # tip: if the service is stopped, /run/credentials doesn't work — pipe the key via stdin:
+        #   sudo cat /etc/bepository/sa-key.json | GOOGLE_APPLICATION_CREDENTIALS=/dev/stdin bepository fsck
+      ''
       + "\n";
 
     # Install the unit shipped in cfg.package ($out/lib/systemd/system/).

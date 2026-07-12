@@ -311,6 +311,28 @@ the device as **Connected** and syncing.
   several machines share a store. `sudo bepository fsck --clear-lock` forces it
   free, but only when no other instance is running.
 
+### Running ad-hoc commands without the service
+
+`get-id`, `fsck`, and friends read the same `/etc/bepository/env` the daemon
+does (your process environment always wins over the file, matching systemd's
+`EnvironmentFile` semantics). With GCS configured via `LoadCredential`, the env
+file points `GOOGLE_APPLICATION_CREDENTIALS` at
+`/run/credentials/bepository.service/…`, which only exists while the service is
+running — so ad-hoc commands fail when the daemon is stopped.
+
+Pipe the key in and override the path to `/dev/stdin` (Linux symlinks it to your
+input; bepository reads it once at startup, then holds the parsed credentials in
+memory). Run as a normal user — no `sudo` on `bepository` itself:
+
+```sh
+sudo cat /etc/bepository/sa-key.json | \
+  GOOGLE_APPLICATION_CREDENTIALS=/dev/stdin bepository fsck
+```
+
+The `sudo cat` is the only privileged step: it reads the `root:root 0600` key
+that the dynamic-user daemon also can't open by path. The same pattern works for
+`get-id`. (GCS only — SFTP's `?key=…` lives in the URI, not an env var.)
+
 **Uninstall:** `sudo bepository uninstall-service`, then remove
 `/etc/bepository/`, `/var/lib/bepository`, and `/var/cache/bepository`. Synced
 data lives in the object store and is not touched.
