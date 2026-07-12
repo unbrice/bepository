@@ -43,6 +43,15 @@ in
         <filename>/etc/bepository/sa-key.json</filename>, or by extending
         <option>environment.etc."bepository/env".text</option>). The service
         reads that directory but cannot write to it.
+        <emphasis role="strong">Credential files opened by path</emphasis>
+        (a GCS service-account key, an SFTP key) are
+        <emphasis role="strong">not</emphasis> readable by the process as-is:
+        the unit runs under <literal>DynamicUser=yes</literal>, so a root-owned
+        <literal>0600</literal> file is denied. Hand them to systemd via
+        <option>systemd.services.bepository.serviceConfig.LoadCredential</option>
+        and point the env var at the resulting
+        <filename>/run/credentials/bepository.service/</filename> path — see
+        INSTALL.md's Credentials section.
       '';
     };
 
@@ -102,15 +111,22 @@ in
       '';
       description = ''
         Extra <literal>KEY=value</literal> pairs to append to
-        <filename>/etc/bepository/env</filename>. Use for paths to credential
-        files dropped under <filename>/etc/bepository/</filename> (e.g. via
-        sops-nix).
+        <filename>/etc/bepository/env</filename>. Use for non-secret config and
+        for pointers to credentials (e.g.
+        <literal>GOOGLE_APPLICATION_CREDENTIALS</literal>).
 
         <emphasis role="strong">Warning:</emphasis> the generated env file is a
         world-readable symlink into the Nix store, so anything put here is
-        readable by every user on the host. Reference credential files by path
-        (dropped under <filename>/etc/bepository/</filename> out-of-band with a
-        restricted mode, e.g. via sops-nix) rather than inlining secret values.
+        readable by every user on the host — never inline secret values, only
+        point at files. And because the unit runs under
+        <literal>DynamicUser=yes</literal>, a path under
+        <filename>/etc/bepository/</filename> is
+        <emphasis role="strong">not</emphasis> readable by the process unless
+        the file is handed to systemd via
+        <option>systemd.services.bepository.serviceConfig.LoadCredential</option>;
+        in that case point the env var at the resulting
+        <filename>/run/credentials/bepository.service/</filename> path. See
+        INSTALL.md's Credentials section.
       '';
     };
   };

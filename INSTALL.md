@@ -49,6 +49,38 @@ sudo install -m 600 /path/to/sa-key.json /etc/bepository/sa-key.json
 #   GOOGLE_APPLICATION_CREDENTIALS=/etc/bepository/sa-key.json
 ```
 
+> [!WARNING]
+> **Credential files opened by path need `LoadCredential`.** The service runs
+> under `DynamicUser=yes` (a fresh, unprivileged UID per boot), so even a `0600`
+> key owned by `root` is **not readable** by the process. (`EnvironmentFile`
+> works because systemd reads *it* as root; but a file the process opens itself
+> — like `GOOGLE_APPLICATION_CREDENTIALS` or an SFTP `?key=…` — is opened as the
+> dynamic user and gets `Permission denied`.) Inline env values (`AWS_*`,
+> `CLOUDSDK_AUTH_ACCESS_TOKEN`) are unaffected.
+>
+> Hand the key to systemd instead, which reads it as root at start and
+> re-exposes it owned by the dynamic user. Add a drop-in:
+>
+> ```sh
+> sudo systemctl edit bepository
+> # In the editor, add:
+> #   [Service]
+> #   LoadCredential=sa-key.json:/etc/bepository/sa-key.json
+> ```
+>
+> then point the env file at the credential path:
+>
+> ```sh
+> # in /etc/bepository/env:
+> GOOGLE_APPLICATION_CREDENTIALS=/run/credentials/bepository.service/sa-key.json
+> ```
+>
+> The same applies to an SFTP key:
+> `LoadCredential=id_ed25519:/etc/bepository/id_ed25519` and
+> `?key=/run/credentials/bepository.service/id_ed25519` in the storage URI.
+> NixOS users, see the [NixOS section](#nixos) below — the module wires
+> `LoadCredential` via `systemd.services.bepository.serviceConfig`.
+
 ### Optional: Configure Cache
 
 By default, `bepository` uses a local cache to avoid unnecessary reads. It
@@ -183,11 +215,20 @@ outputs = { nixpkgs, bepository, ... }: {
           lease          = 180;   # lock lease in seconds (minimum 180)
           enableCache    = true;  # set false to disable the disk cache
 
-          # Reference credentials by path (the file itself is dropped into
-          # /etc/bepository/ out-of-band, e.g. via sops-nix, so the secret
-          # never lands in the Nix store).
-          extraEnv.GOOGLE_APPLICATION_CREDENTIALS = "/etc/bepository/sa-key.json";
+          # Credential files opened by path (GCS service-account key, SFTP key)
+          # must be handed to systemd via LoadCredential, not read directly:
+          # the service runs under DynamicUser=yes, so a root-owned 0600 key
+          # under /etc/bepository/ is unreadable by the process. systemd reads
+          # it as root at start and re-exposes it owned by the dynamic user.
+          extraEnv.GOOGLE_APPLICATION_CREDENTIALS =
+            "/run/credentials/bepository.service/sa-key.json";
         };
+
+        # Hand the key file to systemd (reads it as root, re-exposes it owned by
+        # the dynamic user under /run/credentials/bepository.service/).
+        systemd.services.bepository.serviceConfig.LoadCredential = [
+          "sa-key.json:/etc/bepository/sa-key.json"
+        ];
 
         # Example secret placement with sops-nix:
         # sops.secrets."bepository-sa-key" = {
