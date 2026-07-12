@@ -1,6 +1,6 @@
 {
-  "version": "0.8.1",
+  "version": "0.8.2",
   "comment": "filled by release CI on tag push",
-  "x86_64-linux": "007067dc1e36a8d61d424139a6850a4800f2a06bc6d9db6787370ada6bb96d96",
-  "aarch64-linux": "25a18966703fb7bc83c1cbc3e3f02d59354d39ff12ed8b8ca1f486f3517613fa"
+  "x86_64-linux": "5ab92ad0ca0cff705667c33e62bb2471c9b7440595b1a2dc89ea98434449ed25",
+  "aarch64-linux": "e17ad7288bbd45d0656fa0c92259f728663b1063cfe6cafe161c17290fb8e30b"
 }
