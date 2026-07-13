@@ -484,6 +484,26 @@ where
 pub static LOCK_PATH: LazyLock<object_store::path::Path> =
     LazyLock::new(|| object_store::path::Path::from("_lock"));
 
+/// Acquire the local single-instance lock for this machine + storage URI.
+///
+/// Read-only commands that never open SlateDB skip this and may run
+/// alongside an active daemon.
+fn acquire_single_instance(holder: &str) -> Result<single_instance::SingleInstance> {
+    // Hash into a compact name to avoid platform/socket limits on lock identifier length.
+    let lock_name = format!(
+        "https://github.com/unbrice/bepository/#lock-{}",
+        Uuid::new_v5(&Uuid::NAMESPACE_URL, holder.as_bytes()).simple()
+    );
+    let instance = single_instance::SingleInstance::new(&lock_name)
+        .map_err(|e| anyhow!("failed to initialize single instance lock: {e}"))?;
+    if !instance.is_single() {
+        return Err(anyhow!(
+            "Another instance of bepository is already running for this storage URI with this machine ID."
+        ));
+    }
+    Ok(instance)
+}
+
 async fn require_identity(storage: &SlateStorage, locked: bool) -> Result<Identity> {
     let res = if locked {
         storage.get_identity()
@@ -640,6 +660,7 @@ async fn cmd_serve(
     holder: &str,
     runtime: tokio::runtime::Handle,
 ) -> Result<()> {
+    let _instance = acquire_single_instance(holder)?;
     let allowed_device =
         DeviceId::parse(&master_device_id).ok_or_else(|| anyhow!("Invalid peer device ID"))?;
     let storage_uri = storage.storage_uri.clone();
@@ -1202,6 +1223,7 @@ async fn cmd_init(
     holder: &str,
     runtime: tokio::runtime::Handle,
 ) -> Result<()> {
+    let _instance = acquire_single_instance(holder)?;
     let (store, _, db) = storage.open(true, runtime)?;
     let dev_id = with_admin_lock(store, &db, holder, 60, || run_init(&db)).await?;
     println!("Initialized. Device ID: {dev_id}");
@@ -1214,6 +1236,7 @@ async fn cmd_remove_folder(
     folder: String,
     runtime: tokio::runtime::Handle,
 ) -> Result<()> {
+    let _instance = acquire_single_instance(holder)?;
     let (store, _, db) = storage.open(false, runtime)?;
     let folder_id = FolderId::new(&folder);
     with_admin_lock(store, &db, holder, 60, || async {
@@ -1252,21 +1275,6 @@ async fn async_main(cli: Cli, storage_runtime_handle: tokio::runtime::Handle) ->
 
     let storage_uri = cli.command.storage_uri();
     let holder = format!("{machine_id}/{storage_uri}");
-
-    // Ensure only one instance of the program runs for a given storage URI on this machine.
-    // Hash into a compact name to avoid platform/socket limits on lock identifier length.
-    let lock_name = format!(
-        "https://github.com/unbrice/bepository/#lock-{}",
-        Uuid::new_v5(&Uuid::NAMESPACE_URL, holder.as_bytes()).simple()
-    );
-    let instance = single_instance::SingleInstance::new(&lock_name)
-        .map_err(|e| anyhow!("failed to initialize single instance lock: {e}"))?;
-
-    if !instance.is_single() {
-        return Err(anyhow!(
-            "Another instance of bepository is already running for this storage URI with this machine ID."
-        ));
-    }
 
     match cli.command {
         Commands::Init { storage } => {
@@ -1397,6 +1405,7 @@ async fn cmd_fsck(
     holder: &str,
     runtime: tokio::runtime::Handle,
 ) -> Result<()> {
+    let _instance = acquire_single_instance(holder)?;
     let (store, _, db) = storage.open(false, runtime)?;
     let needs_lock = compact || regenerate_id || check.is_some();
     let lock = bepository_lock::Lock::new(&*store, LOCK_PATH.clone(), holder.to_string(), 0, 300);
@@ -1467,6 +1476,7 @@ async fn checkpoint_set_ttl(
 ) -> Result<()> {
     let interval_dur = validate_checkpoint_duration(interval)?;
     let ttl = validate_checkpoint_duration(value)?;
+    let _instance = acquire_single_instance(holder)?;
     let (store, _, db) = storage.open(false, runtime)?;
     let schedule = CheckpointSchedule { ttl };
     with_admin_lock(store, &db, holder, 60, || async {
@@ -1493,6 +1503,7 @@ async fn checkpoint_remove(
     runtime: tokio::runtime::Handle,
 ) -> Result<()> {
     let interval_dur = validate_checkpoint_duration(interval)?;
+    let _instance = acquire_single_instance(holder)?;
     let (store, _, db) = storage.open(false, runtime)?;
     with_admin_lock(store, &db, holder, 60, || async {
         db.update_checkpoint_schedule(interval_dur, None)

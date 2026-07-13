@@ -130,6 +130,9 @@ adding/removing dependencies, `.github/` changes, destructive ops.
 - **Conflict resolution:** Injected, never hardcoded.
 - **Docs:** When changing behavior documented in an `OVERVIEW.md` or
   `CONFIG.md`, update that doc in the same commit.
+- **Doc comments:** terse. Don't narrate the change, enumerate callers, or
+  restate what the type system already guarantees. For APIs: one-line summary,
+  then only the non-obvious invariant.
 - **Commits:** `<type>: <summary>` (imperative). Types:
   `feat fix refactor docs test chore style perf`. Body: explain *why*, use
   bullet points.
