@@ -48,6 +48,7 @@ futures = "0.3"
 humantime = "2"
 linear-map = "1.2.0"
 lockable = "0.2"
+machine-uid = "0.6"
 object_store = { version = "0.12", features = ["aws", "gcp", "http"] }
 once_cell = { version = "1", features = ["parking_lot"] }
 opendal = { version = "0.55" }
@@ -55,8 +56,10 @@ parking_lot = { version = "0.12", features = ["deadlock_detection"] }
 prost = { version = "0.14", default-features = false, features = ["std"] }
 prost-build = "0.14"
 prost-types = { version = "0.14", default-features = false, features = ["std"] }
+reqwest = { version = "0.13", default-features = false }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
+sha2 = "0.11"
 slatedb = { version = "0.13.1", features = ["compaction_filters", "foyer"] }
 tempfile = "3.27"
 thiserror = "2"

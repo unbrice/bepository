@@ -26,17 +26,17 @@ console-subscriber = { version = "0.5", optional = true, features = ["parking_lo
 directories = "6"
 futures.workspace = true
 humantime.workspace = true
-machine-uid = "0.5"
+machine-uid.workspace = true
 object_store.workspace = true
 object_store_opendal = "0.55"
 opendal = { version = "0.55", features = ["services-sftp"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
+reqwest = { workspace = true, features = ["rustls", "json"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 secrecy.workspace = true
 self-replace = { version = "1", optional = true }
 semver = { version = "1", optional = true }
 serde = { workspace = true, optional = true }
-sha2 = { version = "0.10", optional = true }
+sha2 = { workspace = true, optional = true }
 single-instance = "0.3"
 tokio.workspace = true
 tokio-util.workspace = true
