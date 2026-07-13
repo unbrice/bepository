@@ -1,8 +1,14 @@
 name: Release
 
-# Publishes static musl binaries on every `v*.*.*` tag push, and pins the
-# per-triple sha256s into nix/release-hashes.json so the NixOS module can
-# fetchurl the matching binary.
+# Publishes static musl binaries whenever a version bump lands on master (the
+# `detect` job compares Cargo.toml's version against existing tags and creates
+# the `v*` tag itself), and pins the per-triple sha256s into
+# nix/release-hashes.json so the NixOS module can fetchurl the matching binary.
+# A manual `v*.*.*` tag push still works as an escape hatch.
+#
+# The tag is only created at `gh release create` time (upload job), after the
+# binaries built — a failed build leaves no tag, so re-running the workflow
+# retries the same version.
 #
 # Releases are immutable: once a tag's assets exist, the upload job refuses to
 # overwrite them. Corrected/rebuilt binaries must ship under a new tag — the
@@ -28,10 +34,13 @@ name: Release
 
 on:
   push:
-    # Note: this glob also matches pre-release tags like `v0.8.0-rc1`. The repo
-    # has never tagged rcs; if it ever does, the pin job would commit rc hashes
-    # to master and `gh release create` below would not mark the release as a
-    # prerelease. Tighten the glob (e.g. `v[0-9]*.[0-9]*.[0-9]*`) before tagging rcs.
+    branches: [master]
+    # Manual escape hatch. Note: this glob also matches pre-release tags like
+    # `v0.8.0-rc1` (and the master path would tag an rc version from Cargo.toml
+    # just the same). The repo has never tagged rcs; if it ever does, the pin
+    # job would commit rc hashes to master and `gh release create` below would
+    # not mark the release as a prerelease. Tighten the glob (e.g.
+    # `v[0-9]*.[0-9]*.[0-9]*`) before tagging rcs.
     tags: ["v*.*.*"]
 
 concurrency:
@@ -39,8 +48,48 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  detect:
+    name: Decide whether to release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: { contents: read }
+    outputs:
+      release: ${{ steps.decide.outputs.release }}
+      tag: ${{ steps.decide.outputs.tag }}
+    steps:
+      - name: Checkout
+        # actions/checkout@v7, pinned by SHA
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Compare Cargo.toml version against existing tags
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "Tag pushed by hand: releasing $GITHUB_REF_NAME."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          test -n "$VERSION"
+          TAG="v${VERSION}"
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists; version unchanged — nothing to release."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Version $VERSION is untagged: releasing $TAG from $GITHUB_SHA."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: Build static binary (${{ matrix.target }})
+    needs: detect
+    if: needs.detect.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions: { contents: read }
@@ -83,12 +132,13 @@ jobs:
 
   upload:
     name: Upload release assets + SHA256SUMS
-    needs: build
+    needs: [detect, build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions: { contents: write }
     steps:
       - name: Checkout
+        # actions/checkout@v7, pinned by SHA
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           persist-credentials: false
@@ -111,7 +161,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${{ github.ref_name }}"
+          TAG="${{ needs.detect.outputs.tag }}"
           if gh release view "$TAG" >/dev/null 2>&1; then
             # Releases are immutable (see top of file): an existing release for
             # this tag means a prior upload already published these assets.
@@ -130,7 +180,12 @@ jobs:
               assets/bepository-aarch64-unknown-linux-musl \
               assets/SHA256SUMS
           else
-            gh release create "$TAG" --verify-tag --generate-notes \
+            # --target creates the tag at the released commit when it doesn't
+            # exist yet (master-push path); it is ignored when the tag already
+            # exists (manual tag-push path). Tags created with GITHUB_TOKEN do
+            # not trigger workflows, which is exactly right here — this run IS
+            # the release.
+            gh release create "$TAG" --target "${{ github.sha }}" --generate-notes \
               assets/bepository-x86_64-unknown-linux-musl \
               assets/bepository-aarch64-unknown-linux-musl \
               assets/SHA256SUMS
@@ -138,12 +193,13 @@ jobs:
 
   pin-nix-hashes:
     name: Pin nix/release-hashes.json
-    needs: upload
+    needs: [detect, upload]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions: { contents: write, pull-requests: write }
     steps:
       - name: Checkout master
+        # actions/checkout@v7, pinned by SHA
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           ref: master
@@ -162,7 +218,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${{ github.ref_name }}"
+          TAG="${{ needs.detect.outputs.tag }}"
           VERSION="${TAG#v}"
           # Compute the SAME hash nix's fetchurl will later verify against:
           # `nix store prefetch-file --executable` ingests the file in NAR mode
@@ -204,20 +260,25 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add nix/release-hashes.json
-          git commit -m "chore(nix): pin ${{ github.ref_name }} release binaries" || exit 0
+          git commit -m "chore(nix): pin ${{ needs.detect.outputs.tag }} release binaries" || exit 0
           if git push origin master; then
             echo "Pushed hash pin to master."
             exit 0
           fi
+          # Expected path under the master ruleset: GITHUB_TOKEN cannot bypass
+          # it on a user-owned repo, so the pin lands as a PR instead. The
+          # assignee makes GitHub email the owner a participating-level
+          # notification: merge it with your admin bypass (`gh pr merge
+          # --rebase`), or close/reopen it first if you want CI to run (PRs
+          # created with GITHUB_TOKEN do not trigger pull_request workflows).
           echo "::warning::Push rejected (branch protection). Opening a PR."
           BRANCH="pin-release-hashes-$(date +%s)"
           git switch -c "$BRANCH"
           git push origin "$BRANCH"
-          # Note: PRs created with GITHUB_TOKEN do not trigger pull_request CI;
-          # required status checks will need a manual close/reopen or push.
           if ! gh pr create \
-                 --title "chore(nix): pin ${{ github.ref_name }} release binaries" \
+                 --title "chore(nix): pin ${{ needs.detect.outputs.tag }} release binaries" \
                  --body "Bot commit from the release workflow (push to master was rejected by branch protection)." \
+                 --assignee "${{ github.repository_owner }}" \
                  --head "$BRANCH" --base master; then
             echo "::error::Could not open the PR automatically — likely 'Allow GitHub Actions to create and approve pull requests' is disabled (Settings → Actions → General). The pin commit is on branch '$BRANCH'; open it manually: https://github.com/${{ github.repository }}/compare/master...$BRANCH"
             exit 1

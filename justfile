@@ -76,15 +76,36 @@ credit-ai:
         --trailer "Co-authored-by: GLM <noreply@z.ai>"
 
 
-# Bump version and commit, then echo the commands to tag and push (accepts numerical VERSION)
-push-tag version:
+# Push REV (default @-) as a PR on a <hostname>/<changeid> branch; auto-merges when CI passes
+ship rev="@-":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cid=$(jj log -r '{{rev}}' --no-graph -T 'change_id.short()')
+    bookmark="$(hostname)/${cid}"
+    jj bookmark set "$bookmark" -r '{{rev}}' --allow-backwards
+    jj git push --bookmark "$bookmark" --allow-new
+    gh pr view "$bookmark" --json number >/dev/null 2>&1 \
+        || gh pr create --head "$bookmark" --fill
+    gh pr merge "$bookmark" --rebase --auto
+
+# Fetch master and rebase the stack; merged changes and their bookmarks evaporate
+sync:
+    jj git fetch
+    jj rebase -d 'trunk()' --skip-emptied
+
+# On merge, release CI detects the new Cargo.toml version, tags v{{version}},
+# builds and uploads static binaries, then opens a PR pinning
+# nix/release-hashes.json (assigned to you — merge it to finish the release).
+#
+# Bump the version on a fresh change atop trunk and ship it as a PR
+cut-release version: sync
+    #!/usr/bin/env bash
+    set -euo pipefail
+    jj new 'trunk()' -m "chore: bump version to {{version}}"
     sed -i 's/^version = ".*"/version = "{{version}}"/' Cargo.toml
     {{cargo}} check
-    git commit -am "chore: bump version to {{version}}"
-    @echo "Version bumped to {{version}}. Verify the commit and then run:"
-    @echo "  git tag v{{version}} && git push origin HEAD v{{version}}"
-    @echo "Pushing the tag triggers release CI: it builds and uploads static binaries,"
-    @echo "then auto-pins nix/release-hashes.json as a bot commit — verify that lands."
+    just ship @
+    jj new
 
 clean:
     {{cargo}} clean

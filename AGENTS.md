@@ -111,12 +111,30 @@ just test                      # unit + e2e (builds CLI first)
 just lint / just fmt
 ```
 
+## Version control
+
+Colocated **jj (Jujutsu) + git** repo — `.jj/` is the source of truth. Never run
+mutating git commands (`git commit/rebase/checkout/branch/reset/switch`); use
+jj. Read-only git (`log`, `diff`, `status`, `show`) and `gh` are fine. Tags are
+the exception: jj cannot create them; release CI does.
+
+Workflow — one change = one PR, CI is the reviewer:
+
+- `jj new 'trunk()'`, hack, `jj describe -m "<type>: <summary>"`.
+- `just ship [rev]` — pushes the change (default `@-`) as bookmark
+  `<hostname>/<changeid>`, opens a PR, enables rebase auto-merge.
+- `just sync` — after merges: fetch + rebase; merged changes and their bookmarks
+  evaporate.
+- `just cut-release <version>` — version bump shipped like any PR; release CI
+  tags `v<version>` and publishes when it lands on master.
+
 ## Permissions
 
 **Allowed:** read files, `rtk cargo check/clippy/fmt`, `just test-unit`,
 `just test-e2e`, `just lint`, `just fmt`.
 
-**Require approval:** `just test` (full suite), `git commit/push`,
+**Require approval:** `just test` (full suite), anything that pushes or opens
+PRs (`jj git push`, `just ship`, `just cut-release`, `git push`),
 adding/removing dependencies, `.github/` changes, destructive ops.
 
 ## Conventions
