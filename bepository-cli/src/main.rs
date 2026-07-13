@@ -138,6 +138,14 @@ enum Commands {
         /// The folder ID to remove (as shown in Syncthing).
         folder: String,
     },
+    /// List registered folders.
+    ///
+    /// Reads storage directly; does not acquire the distributed lock and can
+    /// run alongside an active daemon.
+    ListFolders {
+        #[command(flatten)]
+        storage: StorageCli,
+    },
     /// Retrieves the Device ID of this bepository instance.
     ///
     /// This ID must be added to your local Syncthing "Remote Devices" list.
@@ -288,6 +296,7 @@ impl Commands {
         match self {
             Commands::Init { storage }
             | Commands::RemoveFolder { storage, .. }
+            | Commands::ListFolders { storage }
             | Commands::GetId { storage }
             | Commands::Serve { storage, .. }
             | Commands::Fsck { storage, .. }
@@ -1255,6 +1264,31 @@ async fn cmd_remove_folder(
     Ok(())
 }
 
+async fn cmd_list_folders(storage: StorageCli, runtime: tokio::runtime::Handle) -> Result<()> {
+    let (_, _, db) = storage.open(false, runtime)?;
+    let folders = db
+        .list_folders_unlocked()
+        .await
+        .context("failed to list folders")?;
+    if folders.is_empty() {
+        println!("No folders registered.");
+    } else {
+        // Only the first two columns need padding; the storage key is last.
+        let (h0, h1, h2) = ("ID", "LABEL", "OBJECT_STORE");
+        let (w0, w1) = folders
+            .iter()
+            .fold((h0.len(), h1.len()), |(m0, m1), (id, label, _)| {
+                (m0.max(id.as_str().len()), m1.max(label.as_str().len()))
+            });
+        println!("  {h0:<w0$}  {h1:<w1$}  {h2}");
+        for (id, label, sk) in &folders {
+            println!("  {id:<w0$}  {label:<w1$}  {sk}");
+        }
+    }
+    db.close().await?;
+    Ok(())
+}
+
 async fn cmd_get_id(storage: StorageCli, runtime: tokio::runtime::Handle) -> Result<()> {
     let (_, _, db) = storage.open(false, runtime)?;
     let dev_id = run_get_id(&db).await?;
@@ -1282,6 +1316,9 @@ async fn async_main(cli: Cli, storage_runtime_handle: tokio::runtime::Handle) ->
         }
         Commands::RemoveFolder { storage, folder } => {
             cmd_remove_folder(storage, &holder, folder, storage_runtime_handle).await?;
+        }
+        Commands::ListFolders { storage } => {
+            cmd_list_folders(storage, storage_runtime_handle).await?;
         }
         Commands::GetId { storage } => {
             cmd_get_id(storage, storage_runtime_handle).await?;

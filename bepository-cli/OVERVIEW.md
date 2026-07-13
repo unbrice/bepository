@@ -18,6 +18,8 @@ and `upgrade.rs` respectively, behind the default `self-manage` feature.
   idempotent init path when the store has no identity, and logs the device ID at
   `info!` on every startup.
 - **`remove-folder`** — delete a folder's object-store keys. Takes the lock.
+- **`list-folders`** — list registered folders and their storage keys. Lock-free
+  (`list_folders_unlocked`); runs alongside an active daemon.
 - **`checkpoint`** — `every <interval> (ttl <ttl> | remove)` manages schedules;
   `list` shows schedules and existing checkpoints; `serve <addr>` exposes them
   over read-only WebDAV (`bepository-dav`).

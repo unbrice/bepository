@@ -52,6 +52,37 @@ fn test_cli_init_and_get_id() {
 }
 
 #[test]
+fn test_cli_list_folders() {
+    let dir = tempdir().unwrap();
+    let storage_uri = format!("file://{}", dir.path().to_str().unwrap());
+
+    // Before init, list-folders reports no folders (it does not require identity).
+    let mut cmd = Command::cargo_bin("bepository").unwrap();
+    cmd.arg("list-folders")
+        .arg("--storage-uri")
+        .arg(&storage_uri)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No folders registered."));
+
+    // After init it still reports none — folders are only registered by serve.
+    let mut cmd = Command::cargo_bin("bepository").unwrap();
+    cmd.arg("init")
+        .arg("--storage-uri")
+        .arg(&storage_uri)
+        .assert()
+        .success();
+
+    let mut cmd = Command::cargo_bin("bepository").unwrap();
+    cmd.arg("list-folders")
+        .arg("--storage-uri")
+        .arg(&storage_uri)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No folders registered."));
+}
+
+#[test]
 fn test_cli_fsck() {
     let dir = tempdir().unwrap();
     let storage_uri = format!("file://{}", dir.path().to_str().unwrap());
