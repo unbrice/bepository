@@ -59,6 +59,9 @@ impl ConflictResolver for TheirsResolver {
 #[derive(Parser)]
 #[command(name = "bepository")]
 #[command(about = "Cold storage bridge daemon for Syncthing", long_about = None)]
+#[command(
+    after_help = "CONFIGURATION:\n    Settings are layered: command-line flags override environment variables,\n    which override /etc/bepository/env (created at install time).\n    Most commands need no flags on an installed machine."
+)]
 struct Cli {
     /// Override the machine ID (for tests or cross-machine identity).
     #[arg(long, global = true, env = "BEPOSITORY_MACHINE_ID")]
@@ -66,6 +69,12 @@ struct Cli {
     /// Set the tracing level (e.g., info, debug, trace)
     #[arg(long, global = true, env = "BEPOSITORY_LOG")]
     trace: Option<String>,
+    /// The path or URI to the SlateDB storage (e.g., s3://bucket/path, file:///tmp/sync).
+    /// Usually set via BEPOSITORY_STORAGE_URI in /etc/bepository/env.
+    #[arg(long, short = 's', global = true, env = "BEPOSITORY_STORAGE_URI")]
+    storage_uri: Option<String>,
+    #[command(flatten)]
+    cache: CacheArgs,
     #[command(subcommand)]
     command: Commands,
 }
@@ -74,10 +83,15 @@ struct Cli {
 struct CacheArgs {
     /// Override the Foyer block-cache directory.
     /// Defaults to $BEPOSITORY_CACHE_DIRECTORY, $CACHE_DIRECTORY (systemd) or the XDG cache dir.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, global = true, value_name = "PATH")]
     cache_dir: Option<PathBuf>,
     /// Disable the Foyer block cache entirely.
-    #[arg(long, env = "BEPOSITORY_NO_CACHE", conflicts_with = "cache_dir")]
+    #[arg(
+        long,
+        global = true,
+        env = "BEPOSITORY_NO_CACHE",
+        conflicts_with = "cache_dir"
+    )]
     no_cache: bool,
 }
 
@@ -91,28 +105,23 @@ impl CacheProvider for CacheArgs {
     }
 }
 
-#[derive(clap::Args)]
-struct StorageCli {
-    /// The path or URI to the SlateDB storage (e.g., s3://bucket/path, file:///tmp/sync).
-    #[arg(long, short = 's', env = "BEPOSITORY_STORAGE_URI")]
-    storage_uri: String,
-    #[command(flatten)]
-    cache: CacheArgs,
-}
-
 type StorageStack = (
     Arc<dyn ObjectStore>,
     Arc<dyn CacheProvider + Send + Sync>,
     SlateStorage,
 );
 
-impl StorageCli {
-    fn open(&self, create: bool, runtime: tokio::runtime::Handle) -> Result<StorageStack> {
-        let store = parse_storage_uri(&self.storage_uri, create)?;
-        let cache = Arc::new(self.cache.clone());
-        let db = SlateStorage::new(store.clone(), Some(cache.clone()), runtime);
-        Ok((store, cache, db))
-    }
+/// Open the object store, block cache, and SlateStorage from a resolved URI.
+fn open_storage(
+    storage_uri: &str,
+    cache: &CacheArgs,
+    create: bool,
+    runtime: tokio::runtime::Handle,
+) -> Result<StorageStack> {
+    let store = parse_storage_uri(storage_uri, create)?;
+    let cache = Arc::new(cache.clone());
+    let db = SlateStorage::new(store.clone(), Some(cache.clone()), runtime);
+    Ok((store, cache, db))
 }
 
 #[derive(Subcommand)]
@@ -123,18 +132,13 @@ enum Commands {
     /// on an already-initialized store is a no-op.
     /// Acquires the distributed lock to prevent races with serve.
     ///
-    /// Example: bepository init -s s3://my-bucket/backup
-    Init {
-        #[command(flatten)]
-        storage: StorageCli,
-    },
+    /// Example: bepository init   (or: bepository init -s s3://my-bucket/backup)
+    Init,
     /// Permanently remove a folder and its data from storage.
     ///
     /// Acquires the distributed lock and recursively deletes all object store
     /// keys associated with the folder.
     RemoveFolder {
-        #[command(flatten)]
-        storage: StorageCli,
         /// The folder ID to remove (as shown in Syncthing).
         folder: String,
     },
@@ -142,28 +146,20 @@ enum Commands {
     ///
     /// Reads storage directly; does not acquire the distributed lock and can
     /// run alongside an active daemon.
-    ListFolders {
-        #[command(flatten)]
-        storage: StorageCli,
-    },
+    ListFolders,
     /// Retrieves the Device ID of this bepository instance.
     ///
     /// This ID must be added to your local Syncthing "Remote Devices" list.
-    GetId {
-        #[command(flatten)]
-        storage: StorageCli,
-    },
+    GetId,
     /// Runs the bepository daemon.
     ///
     /// Automatically accepts and registers all folders proposed by the peer.
     ///
-    /// Example: bepository serve -s s3://my-bucket/backup L773...
+    /// Example: bepository serve L773...   (or: bepository serve -s s3://my-bucket/backup L773...)
     Serve {
-        #[command(flatten)]
-        storage: StorageCli,
         /// The Device ID of the master of this instance.
         #[arg(env = "BEPOSITORY_MASTER_DEVICE_ID", value_name = "MASTER_DEVICE_ID")]
-        master_device_id: String,
+        master_device_id: Option<String>,
         /// The address to listen on for BEP connections.
         #[arg(long, env = "BEPOSITORY_LISTEN", default_value = "127.0.0.1:0")]
         listen: String,
@@ -181,19 +177,15 @@ enum Commands {
     /// in-memory storage does not persist checkpoints across restarts.
     ///
     /// Examples:
-    ///   bepository checkpoint -s s3://bucket/path every 1h ttl 7d
-    ///   bepository checkpoint -s s3://bucket/path every 1h remove
-    ///   bepository checkpoint -s s3://bucket/path list
+    ///   bepository checkpoint every 1h ttl 7d
+    ///   bepository checkpoint every 1h remove
+    ///   bepository checkpoint list
     Checkpoint {
-        #[command(flatten)]
-        storage: StorageCli,
         #[command(subcommand)]
         action: CheckpointAction,
     },
     /// Integrity check and manual maintenance tool.
     Fsck {
-        #[command(flatten)]
-        storage: StorageCli,
         /// Run filesystem consistency checks at the specified level.
         #[arg(long, value_enum)]
         check: Option<FsckLevel>,
@@ -250,7 +242,7 @@ enum CheckpointAction {
     /// Duration formats: 10m, 1h, 6h, 1d, 7d, etc.
     /// Minimum interval is 10 minutes.
     ///
-    /// Example: bepository checkpoint s3://bucket/path every 1h ttl 7d
+    /// Example: bepository checkpoint every 1h ttl 7d
     Every {
         /// Checkpoint interval (e.g. "1h", "1d"). Minimum 10 minutes.
         #[arg(value_parser = humantime::parse_duration)]
@@ -265,17 +257,18 @@ enum CheckpointAction {
     /// The server is read-only and requires no distributed lock. Snapshots are
     /// loaded once at startup; restart to pick up new checkpoints.
     ///
-    /// Requires BEPOSITORY_DAV_PASSWORD to be set (non-empty). The env var is
-    /// cleared from the process environment immediately after reading.
+    /// Requires a WebDAV password (via BEPOSITORY_DAV_PASSWORD env var or
+    /// --webdav-password). The env var is cleared from the process environment
+    /// immediately after reading.
     ///
-    /// Example: BEPOSITORY_DAV_PASSWORD=secret bepository checkpoint -s s3://bucket/path serve 127.0.0.1:8080
+    /// Example: BEPOSITORY_DAV_PASSWORD=secret bepository checkpoint serve 127.0.0.1:8080
     Serve {
         /// Listen address, e.g. 127.0.0.1:8080 or 0.0.0.0:8080
         addr: String,
 
         /// WebDAV password. Can be set via BEPOSITORY_DAV_PASSWORD environment variable.
         #[arg(long, env = "BEPOSITORY_DAV_PASSWORD", hide_env_values = true)]
-        webdav_password: secrecy::SecretString,
+        webdav_password: Option<secrecy::SecretString>,
     },
 }
 
@@ -291,24 +284,33 @@ enum EveryOp {
     Remove,
 }
 
+impl Cli {
+    /// Resolve the storage URI, failing late with a friendly message when it is
+    /// absent and the subcommand needs storage.
+    fn require_storage_uri(&self) -> Result<&str> {
+        self.storage_uri
+            .as_deref()
+            .ok_or_else(|| anyhow!("no storage configured\nset BEPOSITORY_STORAGE_URI in /etc/bepository/env or pass -s/--storage-uri"))
+    }
+}
+
 impl Commands {
-    fn storage_uri(&self) -> &str {
-        match self {
-            Commands::Init { storage }
-            | Commands::RemoveFolder { storage, .. }
-            | Commands::ListFolders { storage }
-            | Commands::GetId { storage }
-            | Commands::Serve { storage, .. }
-            | Commands::Fsck { storage, .. }
-            | Commands::Checkpoint { storage, .. } => &storage.storage_uri,
-            // The self-manage subcommands do not open the store; give them a
-            // distinct lock scope so they don't collide with a running daemon.
-            #[cfg(feature = "self-manage")]
+    /// The self-manage subcommands do not open the store; give them a distinct
+    /// lock scope so they don't collide with a running daemon.
+    #[cfg(feature = "self-manage")]
+    fn is_self_manage(&self) -> bool {
+        matches!(
+            self,
             Commands::PrintService
-            | Commands::InstallService { .. }
-            | Commands::UninstallService
-            | Commands::Upgrade { .. } => "self-manage",
-        }
+                | Commands::InstallService { .. }
+                | Commands::UninstallService
+                | Commands::Upgrade { .. }
+        )
+    }
+
+    #[cfg(not(feature = "self-manage"))]
+    fn is_self_manage(&self) -> bool {
+        false
     }
 }
 
@@ -660,8 +662,10 @@ struct ServeConfig {
     storage_runtime: tokio::runtime::Handle,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_serve(
-    storage: StorageCli,
+    storage_uri: &str,
+    cache: &CacheArgs,
     master_device_id: String,
     listen: String,
     priority: u32,
@@ -672,8 +676,8 @@ async fn cmd_serve(
     let _instance = acquire_single_instance(holder)?;
     let allowed_device =
         DeviceId::parse(&master_device_id).ok_or_else(|| anyhow!("Invalid peer device ID"))?;
-    let storage_uri = storage.storage_uri.clone();
-    let (store, cache, _) = storage.open(false, runtime.clone())?;
+    let storage_uri = storage_uri.to_string();
+    let (store, cache, _) = open_storage(storage_uri.as_str(), cache, false, runtime.clone())?;
 
     run_serve(&ServeConfig {
         store,
@@ -1228,25 +1232,27 @@ fn main() -> Result<()> {
 }
 
 async fn cmd_init(
-    storage: StorageCli,
+    storage_uri: &str,
+    cache: &CacheArgs,
     holder: &str,
     runtime: tokio::runtime::Handle,
 ) -> Result<()> {
     let _instance = acquire_single_instance(holder)?;
-    let (store, _, db) = storage.open(true, runtime)?;
+    let (store, _, db) = open_storage(storage_uri, cache, true, runtime)?;
     let dev_id = with_admin_lock(store, &db, holder, 60, || run_init(&db)).await?;
     println!("Initialized. Device ID: {dev_id}");
     Ok(())
 }
 
 async fn cmd_remove_folder(
-    storage: StorageCli,
+    storage_uri: &str,
+    cache: &CacheArgs,
     holder: &str,
     folder: String,
     runtime: tokio::runtime::Handle,
 ) -> Result<()> {
     let _instance = acquire_single_instance(holder)?;
-    let (store, _, db) = storage.open(false, runtime)?;
+    let (store, _, db) = open_storage(storage_uri, cache, false, runtime)?;
     let folder_id = FolderId::new(&folder);
     with_admin_lock(store, &db, holder, 60, || async {
         // Verify the folder exists before claiming success.
@@ -1264,8 +1270,12 @@ async fn cmd_remove_folder(
     Ok(())
 }
 
-async fn cmd_list_folders(storage: StorageCli, runtime: tokio::runtime::Handle) -> Result<()> {
-    let (_, _, db) = storage.open(false, runtime)?;
+async fn cmd_list_folders(
+    storage_uri: &str,
+    cache: &CacheArgs,
+    runtime: tokio::runtime::Handle,
+) -> Result<()> {
+    let (_, _, db) = open_storage(storage_uri, cache, false, runtime)?;
     let folders = db
         .list_folders_unlocked()
         .await
@@ -1289,8 +1299,12 @@ async fn cmd_list_folders(storage: StorageCli, runtime: tokio::runtime::Handle) 
     Ok(())
 }
 
-async fn cmd_get_id(storage: StorageCli, runtime: tokio::runtime::Handle) -> Result<()> {
-    let (_, _, db) = storage.open(false, runtime)?;
+async fn cmd_get_id(
+    storage_uri: &str,
+    cache: &CacheArgs,
+    runtime: tokio::runtime::Handle,
+) -> Result<()> {
+    let (_, _, db) = open_storage(storage_uri, cache, false, runtime)?;
     let dev_id = run_get_id(&db).await?;
     println!("{dev_id}");
     db.close().await?;
@@ -1307,31 +1321,54 @@ async fn async_main(cli: Cli, storage_runtime_handle: tokio::runtime::Handle) ->
         })
     });
 
-    let storage_uri = cli.command.storage_uri();
-    let holder = format!("{machine_id}/{storage_uri}");
+    // The self-manage subcommands do not open the store and must work with no
+    // storage configured. Give them a distinct lock scope (so they don't collide
+    // with a running daemon) and skip the storage-URI check entirely.
+    let is_self_manage = cli.command.is_self_manage();
+    let storage_uri: String = if is_self_manage {
+        String::new()
+    } else {
+        cli.require_storage_uri()?.to_owned()
+    };
+    let holder = if is_self_manage {
+        format!("{machine_id}/self-manage")
+    } else {
+        format!("{machine_id}/{storage_uri}")
+    };
+    let cache = cli.cache.clone();
 
     match cli.command {
-        Commands::Init { storage } => {
-            cmd_init(storage, &holder, storage_runtime_handle).await?;
+        Commands::Init => {
+            cmd_init(&storage_uri, &cache, &holder, storage_runtime_handle).await?;
         }
-        Commands::RemoveFolder { storage, folder } => {
-            cmd_remove_folder(storage, &holder, folder, storage_runtime_handle).await?;
+        Commands::RemoveFolder { folder } => {
+            cmd_remove_folder(
+                &storage_uri,
+                &cache,
+                &holder,
+                folder,
+                storage_runtime_handle,
+            )
+            .await?;
         }
-        Commands::ListFolders { storage } => {
-            cmd_list_folders(storage, storage_runtime_handle).await?;
+        Commands::ListFolders => {
+            cmd_list_folders(&storage_uri, &cache, storage_runtime_handle).await?;
         }
-        Commands::GetId { storage } => {
-            cmd_get_id(storage, storage_runtime_handle).await?;
+        Commands::GetId => {
+            cmd_get_id(&storage_uri, &cache, storage_runtime_handle).await?;
         }
         Commands::Serve {
-            storage,
             master_device_id,
             listen,
             priority,
             lease,
         } => {
+            let master_device_id = master_device_id.ok_or_else(|| {
+                anyhow!("no master device ID configured\nset BEPOSITORY_MASTER_DEVICE_ID in /etc/bepository/env or pass it as an argument: bepository serve <MASTER_DEVICE_ID>")
+            })?;
             cmd_serve(
-                storage,
+                &storage_uri,
+                &cache,
                 master_device_id,
                 listen,
                 priority,
@@ -1342,14 +1379,14 @@ async fn async_main(cli: Cli, storage_runtime_handle: tokio::runtime::Handle) ->
             .await?;
         }
         Commands::Fsck {
-            storage,
             check,
             regenerate_id,
             clear_lock,
             compact,
         } => {
             cmd_fsck(
-                storage,
+                &storage_uri,
+                &cache,
                 check,
                 regenerate_id,
                 clear_lock,
@@ -1359,8 +1396,15 @@ async fn async_main(cli: Cli, storage_runtime_handle: tokio::runtime::Handle) ->
             )
             .await?;
         }
-        Commands::Checkpoint { storage, action } => {
-            cmd_checkpoint(storage, action, &holder, storage_runtime_handle).await?;
+        Commands::Checkpoint { action } => {
+            cmd_checkpoint(
+                &storage_uri,
+                &cache,
+                action,
+                &holder,
+                storage_runtime_handle,
+            )
+            .await?;
         }
         #[cfg(feature = "self-manage")]
         Commands::PrintService => {
@@ -1433,8 +1477,10 @@ async fn clear_lock(lock: &bepository_lock::Lock<'_, dyn ObjectStore>) -> Result
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_fsck(
-    storage: StorageCli,
+    storage_uri: &str,
+    cache: &CacheArgs,
     check: Option<FsckLevel>,
     regenerate_id: bool,
     clear_lock_flag: bool,
@@ -1443,7 +1489,7 @@ async fn cmd_fsck(
     runtime: tokio::runtime::Handle,
 ) -> Result<()> {
     let _instance = acquire_single_instance(holder)?;
-    let (store, _, db) = storage.open(false, runtime)?;
+    let (store, _, db) = open_storage(storage_uri, cache, false, runtime)?;
     let needs_lock = compact || regenerate_id || check.is_some();
     let lock = bepository_lock::Lock::new(&*store, LOCK_PATH.clone(), holder.to_string(), 0, 300);
 
@@ -1505,7 +1551,8 @@ async fn cmd_fsck(
 }
 
 async fn checkpoint_set_ttl(
-    storage: StorageCli,
+    storage_uri: &str,
+    cache: &CacheArgs,
     interval: Duration,
     value: Duration,
     holder: &str,
@@ -1514,7 +1561,7 @@ async fn checkpoint_set_ttl(
     let interval_dur = validate_checkpoint_duration(interval)?;
     let ttl = validate_checkpoint_duration(value)?;
     let _instance = acquire_single_instance(holder)?;
-    let (store, _, db) = storage.open(false, runtime)?;
+    let (store, _, db) = open_storage(storage_uri, cache, false, runtime)?;
     let schedule = CheckpointSchedule { ttl };
     with_admin_lock(store, &db, holder, 60, || async {
         db.update_checkpoint_schedule(interval_dur, Some(schedule))
@@ -1534,14 +1581,15 @@ async fn checkpoint_set_ttl(
 }
 
 async fn checkpoint_remove(
-    storage: StorageCli,
+    storage_uri: &str,
+    cache: &CacheArgs,
     interval: Duration,
     holder: &str,
     runtime: tokio::runtime::Handle,
 ) -> Result<()> {
     let interval_dur = validate_checkpoint_duration(interval)?;
     let _instance = acquire_single_instance(holder)?;
-    let (store, _, db) = storage.open(false, runtime)?;
+    let (store, _, db) = open_storage(storage_uri, cache, false, runtime)?;
     with_admin_lock(store, &db, holder, 60, || async {
         db.update_checkpoint_schedule(interval_dur, None)
             .await
@@ -1555,8 +1603,12 @@ async fn checkpoint_remove(
     Ok(())
 }
 
-async fn checkpoint_list(storage: StorageCli, runtime: tokio::runtime::Handle) -> Result<()> {
-    let (_, _, db) = storage.open(false, runtime)?;
+async fn checkpoint_list(
+    storage_uri: &str,
+    cache: &CacheArgs,
+    runtime: tokio::runtime::Handle,
+) -> Result<()> {
+    let (_, _, db) = open_storage(storage_uri, cache, false, runtime)?;
     let (schedules, folder_checkpoints) = db
         .list_checkpoints_unlocked()
         .await
@@ -1601,12 +1653,13 @@ async fn checkpoint_list(storage: StorageCli, runtime: tokio::runtime::Handle) -
 }
 
 async fn checkpoint_serve_dav(
-    storage: StorageCli,
+    storage_uri: &str,
+    cache: &CacheArgs,
     addr: String,
     password: secrecy::SecretString,
     runtime: tokio::runtime::Handle,
 ) -> Result<()> {
-    let (store, cache, _) = storage.open(false, runtime.clone())?;
+    let (store, cache, _) = open_storage(storage_uri, cache, false, runtime.clone())?;
     let db = Arc::new(SlateStorage::new(store, Some(cache), runtime));
 
     let cancel = CancellationToken::new();
@@ -1619,7 +1672,8 @@ async fn checkpoint_serve_dav(
 }
 
 async fn cmd_checkpoint(
-    storage: StorageCli,
+    storage_uri: &str,
+    cache: &CacheArgs,
     action: CheckpointAction,
     holder: &str,
     runtime: tokio::runtime::Handle,
@@ -1628,16 +1682,21 @@ async fn cmd_checkpoint(
         CheckpointAction::Every {
             interval,
             op: EveryOp::Ttl { value },
-        } => checkpoint_set_ttl(storage, interval, value, holder, runtime).await,
+        } => checkpoint_set_ttl(storage_uri, cache, interval, value, holder, runtime).await,
         CheckpointAction::Every {
             interval,
             op: EveryOp::Remove,
-        } => checkpoint_remove(storage, interval, holder, runtime).await,
-        CheckpointAction::List => checkpoint_list(storage, runtime).await,
+        } => checkpoint_remove(storage_uri, cache, interval, holder, runtime).await,
+        CheckpointAction::List => checkpoint_list(storage_uri, cache, runtime).await,
         CheckpointAction::Serve {
             addr,
             webdav_password,
-        } => checkpoint_serve_dav(storage, addr, webdav_password, runtime).await,
+        } => {
+            let webdav_password = webdav_password.ok_or_else(|| {
+                anyhow!("no WebDAV password configured\nset BEPOSITORY_DAV_PASSWORD in /etc/bepository/env or pass --webdav-password")
+            })?;
+            checkpoint_serve_dav(storage_uri, cache, addr, webdav_password, runtime).await
+        }
     }
 }
 

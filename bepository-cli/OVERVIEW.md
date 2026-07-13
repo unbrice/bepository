@@ -13,7 +13,7 @@ and `upgrade.rs` respectively, behind the default `self-manage` feature.
   `DynamicUser=yes` means there is no stable UID for a root-run one-shot
   `init`.)
 - **`get-id`** — print the device ID. Lock-free (`read_meta_unlocked`).
-- **`serve <MASTER_DEVICE_ID>`** — run the daemon. Holds the distributed lock
+- **`serve [MASTER_DEVICE_ID]`** — run the daemon. Holds the distributed lock
   for its lifetime; auto-registers folders proposed by the master. Runs the
   idempotent init path when the store has no identity, and logs the device ID at
   `info!` on every startup.
@@ -67,6 +67,8 @@ and `upgrade.rs` respectively, behind the default `self-manage` feature.
   enforces the 10-minute minimum for checkpoint intervals and TTLs.
 - **Env vars:** most flags mirror `BEPOSITORY_*` variables (`STORAGE_URI`,
   `MASTER_DEVICE_ID`, `LISTEN`, `PRIORITY`, `LEASE`, `LOG`, `MACHINE_ID`,
-  `DAV_PASSWORD`, `NO_CACHE`).
+  `DAV_PASSWORD`, `NO_CACHE`). Storage URI, master device ID, and WebDAV
+  password are optional flags backed by env — on an installed machine (env file
+  present) most commands take no flags; flags only override the env.
 - **Shutdown:** Ctrl-C cancels via `CancellationToken`; repeated presses force
   quit.
