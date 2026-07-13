@@ -100,4 +100,5 @@ ttl = "7days"
    new copy, cleans old copies.
 4. **`fsck --regenerate-id`** — acquires lock, replaces `[identity]`, writes new
    copy, cleans old copies.
-5. **`get-id`** / **`checkpoint list`** — reads meta without a lock.
+5. **`get-id`** / **`checkpoint list`** / **`list-folders`** — reads meta
+   without a lock.

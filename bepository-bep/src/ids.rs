@@ -38,7 +38,7 @@ impl From<String> for FolderId {
 
 impl std::fmt::Display for FolderId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+        f.pad(self.0.as_str())
     }
 }
 

@@ -863,7 +863,7 @@ impl SlateStorage {
     }
 
     /// List folders without requiring the lock (for use in admin operations).
-    async fn list_folders_unlocked(
+    pub async fn list_folders_unlocked(
         &self,
     ) -> Result<Vec<(FolderId, FolderLabel, FolderStorageKey)>, StorageError> {
         Ok(folder_triples_from_meta(&self.read_meta_unlocked().await?))
