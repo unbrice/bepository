@@ -68,12 +68,24 @@ check-packager:
 setup-hooks:
     git config core.hooksPath .githooks
 
-# Amend the last commit with AI co-authorship trailers
-credit-ai:
-    git commit --amend --no-edit \
-        --trailer "Co-authored-by: Gemini <noreply@google.com>" \
-        --trailer "Co-authored-by: Claude <noreply@anthropic.com>" \
-        --trailer "Co-authored-by: GLM <noreply@z.ai>"
+# Append AI co-authorship trailers to REV's description (default @-)
+credit-ai rev="@-":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    desc=$(jj log -r '{{rev}}' --no-graph -T 'description')
+    if [ -z "$desc" ]; then
+        echo "error: {{rev}} has no description yet — jj describe it first" >&2
+        exit 1
+    fi
+    if grep -q "^Co-authored-by: Claude" <<<"$desc"; then
+        echo "Trailers already present; nothing to do."
+        exit 0
+    fi
+    jj describe -r '{{rev}}' -m "$desc
+
+    Co-authored-by: Gemini <noreply@google.com>
+    Co-authored-by: Claude <noreply@anthropic.com>
+    Co-authored-by: GLM <noreply@z.ai>"
 
 
 # Push REV (default @-) as a PR on a <hostname>/<changeid> branch; auto-merges when CI passes
@@ -83,7 +95,7 @@ ship rev="@-":
     cid=$(jj log -r '{{rev}}' --no-graph -T 'change_id.short()')
     bookmark="$(hostname)/${cid}"
     jj bookmark set "$bookmark" -r '{{rev}}' --allow-backwards
-    jj git push --bookmark "$bookmark" --allow-new
+    jj git push --bookmark "$bookmark"
     gh pr view "$bookmark" --json number >/dev/null 2>&1 \
         || gh pr create --head "$bookmark" --fill
     gh pr merge "$bookmark" --rebase --auto

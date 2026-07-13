@@ -126,7 +126,20 @@ Workflow — one change = one PR, CI is the reviewer:
 - `just sync` — after merges: fetch + rebase; merged changes and their bookmarks
   evaporate.
 - `just cut-release <version>` — version bump shipped like any PR; release CI
-  tags `v<version>` and publishes when it lands on master.
+  tags `v<version>` and publishes when it lands on master. It finishes by
+  opening a hash-pin PR assigned to the owner — merging that (admin bypass:
+  `gh pr merge --rebase`) completes the release.
+
+jj sharp edges:
+
+- A PR contains every commit in `trunk()..rev` — move unrelated work off the
+  stack before shipping (`jj rebase -r <rev> -d 'trunk()'`).
+- `just sync` only rebases the stack holding `@`; rebase other heads explicitly:
+  `jj rebase -b <head> -d 'trunk()' --skip-emptied`.
+- A *new* conflict on a change that already merged means it's a stale local
+  duplicate (its diff no longer applies) — `jj abandon` it, never resolve it.
+- Any jj operation is undoable: `jj op log`, then `jj undo` or
+  `jj op restore <id>`.
 
 ## Permissions
 
