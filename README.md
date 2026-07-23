@@ -123,7 +123,11 @@ See [INSTALL.md](INSTALL.md) for the full guide:
 
 1. Pick a storage backend (S3, GCS, SFTP …) and configure credentials.
 2. On each device:
-   1. Install the daemon (native binary, NixOS, or from source).
+   1. Install the daemon (NixOS and source builds: [INSTALL.md](INSTALL.md)):
+
+      ```sh
+      curl -fsSL https://raw.githubusercontent.com/unbrice/bepository/master/install.sh | sh
+      ```
    2. Pair it with your local Syncthing instance (see
       [FAQ for running on a different device](#running-on-different-device)).
 

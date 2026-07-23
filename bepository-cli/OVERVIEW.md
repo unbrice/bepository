@@ -29,7 +29,10 @@ and `upgrade.rs` respectively, behind the default `self-manage` feature.
   `self-manage` feature)* — manage a hardened systemd unit (`DynamicUser=yes`,
   `ProtectSystem=strict`, `EnvironmentFile=/etc/bepository/env`).
   `install-service [--no-auto-upgrade]` also installs a daily self-upgrade
-  timer. Distros that own service files build with `--no-default-features`.
+  timer, persists a command-line `--storage-uri` into the env file, and wires
+  `LoadCredential` drop-ins for absolute credential paths found there (SFTP
+  `?key=`, `GOOGLE_APPLICATION_CREDENTIALS`); `uninstall-service` reverses the
+  rewrite. Distros that own service files build with `--no-default-features`.
 - **`upgrade [--restart-unit <unit>] [--dry-run]`** *(default `self-manage`
   feature)* — self-update from GitHub releases (see `upgrade.rs`).
 
