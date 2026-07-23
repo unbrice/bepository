@@ -55,3 +55,6 @@ abstraction. Networking and TLS are provided by the caller.
 - **Event Capacity**: The engine event channel (64 slots) must be drained
   promptly; `DeviceConnecting` events apply backpressure; a stalled listener
   wedges new connections.
+- **Connection Registry**: A single supervisor task owns connection tasks and
+  alone removes registry entries (on task reap, identity-checked). A duplicate
+  `DeviceId` connection cancels and replaces the displaced one.

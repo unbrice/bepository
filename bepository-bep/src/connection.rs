@@ -558,7 +558,13 @@ where
 {
     let (mut reader, mut raw_writer) = tokio::io::split(stream);
 
-    perform_hello(&mut reader, &mut raw_writer, &device_name).await?;
+    // Honor shutdown during the handshake: a connection cancelled before
+    // reaching the message loop (e.g. displaced by a duplicate DeviceId)
+    // would otherwise block on read here forever.
+    tokio::select! {
+        _ = shutdown.cancelled() => return Ok(CloseReason::Local),
+        res = perform_hello(&mut reader, &mut raw_writer, &device_name) => res?,
+    }
 
     // Set up the writer channel. From here on, no one writes to raw_writer
     // directly — all sends go through MessageWriter -> mpsc -> run_writer_loop.
@@ -592,9 +598,10 @@ where
         .in_current_span(),
     );
 
-    let (mutual_folders, our_cc_folders) =
-        exchange_initial_cluster_config(&storage, &mut reader, &writer, &ctx, &shared_folders)
-            .await?;
+    let (mutual_folders, our_cc_folders) = tokio::select! {
+        _ = shutdown.cancelled() => return Ok(CloseReason::Local),
+        res = exchange_initial_cluster_config(&storage, &mut reader, &writer, &ctx, &shared_folders) => res?,
+    };
 
     let inner = Arc::new(Mutex::new(ConnectionInner {
         storage: storage.clone(),
