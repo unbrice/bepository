@@ -365,7 +365,7 @@ impl SlateStorage {
 
     /// Read meta without holding a lock, for read-only commands like `get-id`.
     ///
-    /// Lists `bepository-*.toml` files and reads the last one found.
+    /// Lists `bepository-*.toml` files and takes the lexicographic max.
     pub async fn read_meta_unlocked(&self) -> Result<Meta, StorageError> {
         let listing = self
             .inner
@@ -1044,7 +1044,8 @@ impl Activated {
         // commits. If `l0_max_ssts` is tighter than that, every cycle
         // the flusher's per-segment `can_dispatch` refuses new imms;
         // writes stall on `max_unflushed_bytes` backpressure until the
-        // commit lands.
+        // commit lands. (Note: the debug_assert! below is compiled out in release,
+        // so it's not a runtime guard).
         if let Some(opts) = settings.compactor_options.as_ref() {
             let scheduler = slatedb::config::SizeTieredCompactionSchedulerOptions::from(
                 &opts.scheduler_options,
@@ -1759,7 +1760,6 @@ fn make_db_settings() -> Settings {
             // exceeds 3 min on a slow link and risks transient timeouts.
             max_sst_size: 128 * 1024 * 1024,
             // Raise size-tiered scheduler's L0 trigger from the default 4 to 32.
-            // This applies to every segment (size-tiered is the only scheduler).
             // For the `b` segment, rows are written in monotonically increasing
             // seqno order, so its L0 SSTs have disjoint key ranges and reads only
             // ever consult one SST at a time — compaction buys it nothing for read
@@ -1767,9 +1767,8 @@ fn make_db_settings() -> Settings {
             // Compacting every 4 L0 SSTs (~32 MiB) under a sustained sync starves
             // memtable flushes; 32 fires roughly 8x less often while staying well
             // below the `l0_max_ssts` per-segment backpressure ceiling.
-            // The metadata segment will also now wait for 32 L0 SSTs before
-            // compacting, which is a deliberate trade for a much lower compaction
-            // duty cycle compared to rewriting every 4 L0s.
+            // (Note: superseded by `BepCompactionScheduler` for metadata segments,
+            // which do a full-merge at `METADATA_MIN_L0 = 4`).
             // `max_compaction_sources` must be >= `min_compaction_sources`,
             // otherwise `clamp_min` accepts the pick and `clamp_max` then
             // truncates it back below `min`, after which the per-tree

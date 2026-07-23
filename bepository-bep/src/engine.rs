@@ -129,8 +129,8 @@ impl<S: Storage> BepEngine<S> {
 
     /// Shut down all active connections.
     ///
-    /// Sends the shutdown signal to every tracked connection and clears the
-    /// connection map. Connections close asynchronously — this method returns
+    /// Sends the shutdown signal to every tracked connection. Entries are removed
+    /// later by per-task cleanup. Connections close asynchronously — this method returns
     /// as soon as the signals are sent.
     pub fn shutdown_all(&self) {
         let conns = self.connections.read();

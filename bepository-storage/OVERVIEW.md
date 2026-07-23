@@ -145,8 +145,8 @@ Provides a virtual filesystem interface:
 - **Reading directories:** Scans file entries and detects virtual directories by
   prefix.
 - **Reading files:** Point-lookups file metadata.
-- **Reading bytes:** Walks block lists, fetching blocks or following
-  cross-directory deduplication references.
+- **Reading bytes:** Walks block lists, fetching blocks by resolving via the
+  stored `blockseq` (or inline data).
 
 ## SlateDB configuration
 

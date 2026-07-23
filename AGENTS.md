@@ -45,8 +45,9 @@ documents its TOML metadata file in `CONFIG.md`.
 - Inbox, commit, block dedup: `bepository-storage/src/store.rs`
 - TOML metadata schema: `bepository-storage/src/meta.rs` (docs:
   `bepository-storage/CONFIG.md`)
-- BEP engine/state machine: `bepository-bep/src/engine.rs`; wire framing:
-  `framing.rs`; retry policy: `retry.rs`
+- BEP engine/connection coordinator: `bepository-bep/src/engine.rs`; session
+  state machine: `connection.rs`; wire framing: `framing.rs`; retry policy:
+  `retry.rs`
 - Lock algorithm: `bepository-lock/src/epoch.rs`; renewal/guard: `guard.rs`
 - CLI (subcommands, storage-URI parsing, serve loop):
   `bepository-cli/src/main.rs` — no longer a single file: service-management is

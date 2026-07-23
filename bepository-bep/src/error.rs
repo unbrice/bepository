@@ -13,8 +13,7 @@ use thiserror::Error;
 pub enum StorageError {
     /// Transient I/O failure that may succeed on retry.
     ///
-    /// Includes object-store timeouts, network blips, and SlateDB
-    /// unavailability (background task failure, WAL errors, etc.).
+    /// Includes network blips or underlying storage unavailability.
     #[error("transient I/O error: {0}")]
     TransientIo(String),
 
