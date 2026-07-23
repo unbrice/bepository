@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 mod api;
+mod block_read;
 mod compaction;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod fault;

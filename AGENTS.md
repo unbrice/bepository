@@ -43,6 +43,8 @@ documents its TOML metadata file in `CONFIG.md`.
   `bepository-storage/src/api.rs` (~1.8k lines — search it, don't scan it)
 - Compaction GC and scheduler: `bepository-storage/src/compaction.rs`
 - Inbox, commit, block dedup: `bepository-storage/src/store.rs`
+- Block resolution (`BlockInfo` → bytes; single definition shared by both
+  readers and fsck): `bepository-storage/src/block_read.rs`
 - TOML metadata schema: `bepository-storage/src/meta.rs` (docs:
   `bepository-storage/CONFIG.md`)
 - BEP engine/connection coordinator: `bepository-bep/src/engine.rs`; session

@@ -256,25 +256,10 @@ async fn read_block_from_reader(
     reader: &DbReader,
     block: &BlockInfo,
 ) -> Result<Bytes, SnapshotError> {
-    if let Some(inline_data) = &block.inline_data {
-        return Ok(Bytes::from(inline_data.clone()));
-    }
-    if let Some(seq) = block.blockseq {
-        store_keys::validate_block_seq(seq).map_err(snap_io("invalid block seq"))?;
-        let data_key = store_keys::block_data_seq_key(seq);
-        if let Some(data) = reader
-            .get(&data_key)
-            .await
-            .map_err(snap_io("read snapshot key"))?
-        {
-            return Ok(data);
-        }
-    }
-
-    Err(SnapshotError::Io(format!(
-        "block not found: {}",
-        hex::encode(&block.hash)
-    )))
+    crate::block_read::resolve_block_data(reader, block)
+        .await
+        .map_err(snap_io("resolve block"))?
+        .ok_or_else(|| SnapshotError::Io(format!("block not found: {}", hex::encode(&block.hash))))
 }
 
 /// Decode a `File` proto and return its `FileInfo` if the entry is live (not deleted).
