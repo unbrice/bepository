@@ -340,7 +340,8 @@ impl CompactionScheduler for BepCompactionScheduler {
         // Destinations must be globally unique across every active spec; if the
         // size-tiered scheduler already picked some for the `b` segment, fold
         // them into the max so the metadata-segment specs below don't collide
-        // and get rejected by `add_compaction`.
+        // and get rejected by `add_compaction`. In-flight compactions have
+        // already reserved their destination SR ids, so fold those in too.
         let mut next_dest = next_free_sr_id(
             manifest
                 .compacted()
@@ -352,7 +353,15 @@ impl CompactionScheduler for BepCompactionScheduler {
                         .iter()
                         .flat_map(|s| s.compacted().iter().map(|sr| sr.id)),
                 )
-                .chain(specs.iter().filter_map(|s| s.destination())),
+                .chain(specs.iter().filter_map(|s| s.destination()))
+                .chain(
+                    state
+                        .compactions()
+                        .into_iter()
+                        .flat_map(|c| c.recent_compactions())
+                        .filter(|c| c.active())
+                        .filter_map(|c| c.spec().destination()),
+                ),
         );
 
         for segment in manifest.segments() {
