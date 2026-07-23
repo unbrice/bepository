@@ -57,8 +57,11 @@ credentials in place beforehand.
 | AWS     | `AWS_SECRET_ACCESS_KEY`          | Your AWS secret access key                                                                                                   |
 | AWS     | `AWS_SESSION_TOKEN`              | Optional: AWS session token                                                                                                  |
 | GCS     | `GOOGLE_APPLICATION_CREDENTIALS` | Path to a service-account JSON key (recommended) — under systemd see [below](#credential-files-under-systemd-loadcredential) |
-| GCS     | `CLOUDSDK_AUTH_ACCESS_TOKEN`     | Short-lived bearer token (`gcloud auth print-access-token`)                                                                  |
 | SFTP    | *(URI only)*                     | Key auth: append `?key=…` to the URI — under systemd see [below](#credential-files-under-systemd-loadcredential)             |
+
+Without configured credentials, `s3://` and `gs://` storage URIs fail fast
+rather than silently probing the EC2/GCE metadata endpoints; append
+`?use_ambient_creds=true` to the URI to opt back into that lookup.
 
 For GCS with a service-account key, drop it in place:
 
@@ -71,7 +74,7 @@ sudo install -m 600 /path/to/sa-key.json /etc/bepository/sa-key.json
 > under `DynamicUser=yes`. Credential files opened by path must be handed to
 > systemd — see
 > [Credential files under systemd](#credential-files-under-systemd-loadcredential).
-> Inline env values (`AWS_*`, `CLOUDSDK_AUTH_ACCESS_TOKEN`) are unaffected.
+> Inline env values (`AWS_*`) are unaffected.
 
 ### Credential files under systemd (LoadCredential)
 

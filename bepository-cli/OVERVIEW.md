@@ -56,7 +56,10 @@ and `upgrade.rs` respectively, behind the default `self-manage` feature.
 - **Storage URIs** (`parse_storage_uri`): plain paths and `file://` use
   `LocalFileSystem`; `sftp://` goes through opendal; `s3://`, `gs://`,
   `http(s)://` use native `object_store`, configured from environment variables;
-  `memory://` for tests.
+  `memory://` for tests. S3/GCS fail fast without explicit credentials
+  (`require_explicit_credentials` — no silent EC2/GCE metadata probe, no
+  machine/pod identity); `use_ambient_creds=true` opts back into the ambient
+  lookup.
 - **Locking:** short-lived admin commands wrap work in `with_lock` (acquire,
   run, always release). `serve` takes `--priority` (preemption) and `--lease`
   (seconds, minimum 180).

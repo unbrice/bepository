@@ -452,21 +452,13 @@ FEDCBA9876543210  bepository-aarch64-unknown-linux-musl\n";
         format!("http://{addr}")
     }
 
-    /// Serializes the two fixture tests that mutate the global
-    /// `BEPOSITORY_RELEASE_BASE_URL` env var, so they can't race under cargo's
-    /// parallel test runner. A `tokio::sync::Mutex` because the guard must be
-    /// held across the client `.await`s below (the project reserves tokio::sync
-    /// for exactly this case).
-    static ENV_GUARD: std::sync::LazyLock<tokio::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
-
     /// End-to-end test of the network + verify path against a local fixture.
     /// This is the test that would have caught B1 (downloading JSON instead of
     /// the binary): `download_and_verify` must return the real asset bytes, and
     /// a wrong checksum must fail without returning bytes.
     #[tokio::test]
     async fn download_and_verify_against_fixture_returns_binary() {
-        let _guard = ENV_GUARD.lock().await;
+        let _env = crate::test_env::EnvGuard::lock_async(&["BEPOSITORY_RELEASE_BASE_URL"]).await;
         let asset_name = "bepository-fake-triple";
         let asset_bytes = b"this is a fake binary payload";
         let mut hasher = Sha256::new();
@@ -481,8 +473,7 @@ FEDCBA9876543210  bepository-aarch64-unknown-linux-musl\n";
             "v99.0.0".to_string(),
         )
         .await;
-        // Safety: serialized by ENV_GUARD; this is the only code path reading
-        // the var, and the guard prevents concurrent test access.
+        // Safety: serialized by _env.
         unsafe { std::env::set_var("BEPOSITORY_RELEASE_BASE_URL", &base) };
 
         let client = Client::new();
@@ -492,15 +483,13 @@ FEDCBA9876543210  bepository-aarch64-unknown-linux-musl\n";
         // The real path B1 broke: must get the binary bytes, not JSON metadata.
         let got = client.download_and_verify(&release, asset).await.unwrap();
         assert_eq!(got, asset_bytes);
-
-        unsafe { std::env::remove_var("BEPOSITORY_RELEASE_BASE_URL") };
     }
 
     /// A checksum mismatch must fail and surface both digests — the current
     /// binary would be left untouched (run() never reaches self_replace).
     #[tokio::test]
     async fn checksum_mismatch_against_fixture_fails_without_returning_bytes() {
-        let _guard = ENV_GUARD.lock().await;
+        let _env = crate::test_env::EnvGuard::lock_async(&["BEPOSITORY_RELEASE_BASE_URL"]).await;
         let asset_name = "bepository-fake-triple";
         let asset_bytes = b"real payload";
         // Deliberately wrong checksum.
@@ -515,7 +504,7 @@ FEDCBA9876543210  bepository-aarch64-unknown-linux-musl\n";
             "v99.0.0".to_string(),
         )
         .await;
-        // Safety: serialized by ENV_GUARD.
+        // Safety: serialized by _env.
         unsafe { std::env::set_var("BEPOSITORY_RELEASE_BASE_URL", &base) };
 
         let client = Client::new();
@@ -526,8 +515,6 @@ FEDCBA9876543210  bepository-aarch64-unknown-linux-musl\n";
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("checksum mismatch"));
-
-        unsafe { std::env::remove_var("BEPOSITORY_RELEASE_BASE_URL") };
     }
 
     /// Older and equal releases are no-ops; the fixture is never hit. Uses the

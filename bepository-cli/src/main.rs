@@ -38,6 +38,8 @@ struct TheirsResolver;
 mod envfile;
 #[cfg(feature = "self-manage")]
 mod service;
+#[cfg(test)]
+mod test_env;
 #[cfg(feature = "self-manage")]
 mod upgrade;
 
@@ -354,17 +356,16 @@ fn merge_object_store_opts(parsed_url: &url::Url) -> Vec<(String, String)> {
             .chain(std::env::vars().map(|(k, v)| (lowercase_aws_key(k), v))),
     );
 
-    // Translate aliases that object_store's GCS builder doesn't recognise natively.
-    // These cover both env-var usage and URL query-param usage (case-insensitive).
-    // Without this, GCS silently falls back to the GCE metadata endpoint and times
-    // out when running off-cloud.
-    const ALIASES: &[(&str, &str)] = &[
-        (
-            "google_application_credentials",
-            "google_service_account_path",
-        ),
-        ("cloudsdk_auth_access_token", "bearer_token"),
-    ];
+    // Empty values are absent: the env template ships empty AWS_* placeholders.
+    opts.retain(|(_, v)| !v.is_empty());
+
+    // Steer the conventional GCS env var to service-account handling (it
+    // conventionally points at a service-account JSON). Covers both env-var
+    // usage and URL query-param usage (case-insensitive).
+    const ALIASES: &[(&str, &str)] = &[(
+        "google_application_credentials",
+        "google_service_account_path",
+    )];
     let extra: Vec<(String, String)> = opts
         .iter()
         .filter_map(|(k, v)| {
@@ -411,8 +412,109 @@ fn open_sftp(uri: &str) -> Result<Arc<dyn ObjectStore>> {
     Ok(Arc::new(object_store_opendal::OpendalStore::new(op)))
 }
 
+/// Mirrors object_store's boolean config parsing (`1|true|on|yes|y`,
+/// case-insensitive) so the preflight accepts any value the builder would.
+fn is_truthy(v: &str) -> bool {
+    matches!(
+        v.to_ascii_lowercase().as_str(),
+        "1" | "true" | "on" | "yes" | "y"
+    )
+}
+
+/// Fails fast unless the storage URI carries explicit S3/GCS credentials.
+///
+/// object_store 0.12 has no "disable metadata" flag: with no credentials it
+/// silently probes the EC2 IMDS (`169.254.169.254`, ~14s × 10-retry hang
+/// off-cloud) and the GCE metadata server. This preflight turns that into an
+/// actionable error. `use_ambient_creds=true` opts back into the implicit
+/// lookup (stripped before opts reach object_store).
+///
+/// The well-known GCS ADC file (`~/.config/gcloud/application_default_credentials.json`)
+/// is intentionally NOT consulted: the systemd unit runs under `DynamicUser=yes`
+/// with no home, so ambient file creds are unreachable by the daemon anyway.
+fn require_explicit_credentials(parsed_url: &url::Url, opts: &[(String, String)]) -> Result<()> {
+    // Our own key, matched loosely (the env file spells it USE_AMBIENT_CREDS)
+    // and stripped before opts reach object_store.
+    if opts
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("use_ambient_creds") && is_truthy(v))
+    {
+        return Ok(());
+    }
+
+    // object_store also routes these https hosts to the S3 builder (parse.rs).
+    let scheme = match (parsed_url.scheme(), parsed_url.host_str()) {
+        ("https", Some(host))
+            if host.ends_with("amazonaws.com") || host.ends_with("r2.cloudflarestorage.com") =>
+        {
+            "s3"
+        }
+        (scheme, _) => scheme,
+    };
+
+    // Provider keys must match the exact lowercase spellings object_store's
+    // case-sensitive parser accepts (query keys and AWS_* env vars arrive
+    // lowercased). Matching loosely would count env vars the builder silently
+    // drops (GOOGLE_SERVICE_ACCOUNT_PATH, SKIP_SIGNATURE, ...) as configured
+    // and re-admit the metadata probe this check exists to prevent.
+    let configured = match scheme {
+        // Pod/machine identity (web identity, ECS/EKS container creds) is
+        // ambient too and cannot be verified from opts (build() resolves
+        // web identity from env only) — gated behind use_ambient_creds.
+        "s3" | "s3a" => opts.iter().any(|(k, v)| match k.as_str() {
+            "aws_skip_signature" | "skip_signature" => is_truthy(v),
+            "aws_access_key_id" | "access_key_id" => true,
+            _ => false,
+        }),
+        "gs" => opts.iter().any(|(k, v)| match k.as_str() {
+            "google_skip_signature" | "skip_signature" => is_truthy(v),
+            // google_application_credentials is normalized to
+            // google_service_account_path by the alias pass upstream.
+            "google_service_account"
+            | "service_account"
+            | "google_service_account_path"
+            | "service_account_path"
+            | "google_service_account_key"
+            | "service_account_key"
+            | "application_credentials" => true,
+            _ => false,
+        }),
+        _ => return Ok(()),
+    };
+    if configured {
+        return Ok(());
+    }
+
+    match scheme {
+        "s3" | "s3a" => Err(anyhow!(
+            "no explicit s3 credentials configured; refusing to probe the cloud \
+             metadata endpoint — set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, put \
+             access_key_id=/secret_access_key= in the storage URI, add \
+             skip_signature=true for anonymous access, or set \
+             use_ambient_creds=true to use ambient machine/pod credentials \
+             (instance metadata, web identity, ECS/EKS)"
+        )),
+        "gs" => Err(anyhow!(
+            "no explicit GCS credentials configured; refusing to probe the cloud \
+             metadata endpoint — set GOOGLE_APPLICATION_CREDENTIALS, put \
+             google_service_account_path=/google_service_account_key= in the storage \
+             URI, add skip_signature=true for anonymous access, or set \
+             use_ambient_creds=true to use ambient machine credentials \
+             (instance metadata, gcloud ADC)"
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn open_object_store(parsed_url: url::Url) -> Result<Arc<dyn ObjectStore>> {
     let opts = merge_object_store_opts(&parsed_url);
+    require_explicit_credentials(&parsed_url, &opts)?;
+
+    // Keep our own escape-hatch key out of object_store's config namespace.
+    let opts: Vec<_> = opts
+        .into_iter()
+        .filter(|(k, _)| !k.eq_ignore_ascii_case("use_ambient_creds"))
+        .collect();
 
     // Strip query string: parse_url_opts uses the URL only for scheme + bucket.
     let mut store_url = parsed_url.clone();
@@ -1852,24 +1954,21 @@ mod tests {
         assert_eq!(run_init(&storage).await.unwrap(), id);
     }
 
-    /// Serializes tests that mutate process env vars (`BEPOSITORY_ENV_FILE`,
-    /// `BEPOSITORY_STORAGE_URI`), which cargo otherwise races on parallel
-    /// threads. Holding a sync mutex across the synchronous bodies (no awaits)
-    /// is fine.
-    static ENV_FILE_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// `load_env_file` sets unset vars, leaves already-set vars untouched, and
     /// treats a missing file as a no-op. Merged into one test so the two
     /// `BEPOSITORY_ENV_FILE` mutations can't race under cargo's parallel runner.
     #[test]
     fn env_file_load_and_missing_file_are_handled() {
-        let _guard = ENV_FILE_TEST_GUARD.lock().unwrap();
         const NEW: &str = "BEPOSITORY_TEST_ENV_FILE_NEW";
         const EXISTING: &str = "BEPOSITORY_TEST_ENV_FILE_EXISTING";
-        // Safety: serialized by ENV_FILE_TEST_GUARD; clean up so the test is
-        // order-independent and leaves no residue.
+        let _env = test_env::EnvGuard::lock(&[
+            NEW,
+            EXISTING,
+            "BEPOSITORY_TEST_ENV_FILE_QUOTED",
+            "BEPOSITORY_ENV_FILE",
+        ]);
+        // Safety: serialized by _env; restored on Drop.
         unsafe {
-            std::env::remove_var(NEW);
             std::env::set_var(EXISTING, "from-process");
         }
         let dir = tempfile::tempdir().unwrap();
@@ -1899,14 +1998,6 @@ mod tests {
             std::env::set_var("BEPOSITORY_ENV_FILE", "/nonexistent/bepository-env-test");
             load_env_file();
         }
-
-        // Cleanup.
-        unsafe {
-            std::env::remove_var(NEW);
-            std::env::remove_var(EXISTING);
-            std::env::remove_var("BEPOSITORY_TEST_ENV_FILE_QUOTED");
-            std::env::remove_var("BEPOSITORY_ENV_FILE");
-        }
     }
     /// `merge_object_store_opts` must lowercase `AWS_*` env keys (object_store's
     /// parser is case-sensitive and silently drops unrecognised keys — the bug
@@ -1914,21 +2005,18 @@ mod tests {
     /// alone so a stray `TOKEN` can't become the S3 session token.
     #[test]
     fn merge_object_store_opts_lowercases_aws_env_keys_only() {
-        let _guard = ENV_FILE_TEST_GUARD.lock().unwrap();
-        const VARS: &[(&str, &str)] = &[
-            ("AWS_ACCESS_KEY_ID", "TestKeyId"),
-            ("AWS_SECRET_ACCESS_KEY", "Secret/MixedCase"),
-            ("TOKEN", "must-not-leak"),
-        ];
-        // Safety: serialized by ENV_FILE_TEST_GUARD; originals restored below.
-        let saved: Vec<_> = VARS
-            .iter()
-            .map(|(k, _)| (*k, std::env::var(k).ok()))
-            .collect();
+        let _env = test_env::EnvGuard::lock(&[
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "TOKEN",
+        ]);
+        // Safety: serialized by _env.
         unsafe {
-            for (k, v) in VARS {
-                std::env::set_var(k, v);
-            }
+            std::env::set_var("AWS_ACCESS_KEY_ID", "TestKeyId");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "Secret/MixedCase");
+            std::env::set_var("AWS_SESSION_TOKEN", "");
+            std::env::set_var("TOKEN", "must-not-leak");
         }
 
         let url = url::Url::parse(
@@ -1937,26 +2025,148 @@ mod tests {
         .unwrap();
         let opts = merge_object_store_opts(&url);
 
-        // Safety: restoring the ambient state.
-        unsafe {
-            for (k, orig) in saved {
-                match orig {
-                    Some(v) => std::env::set_var(k, v),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
-
         let has = |k: &str, v: &str| opts.iter().any(|(ok, ov)| ok == k && ov == v);
         // AWS_* env keys arrive lowercased; values keep their case.
         assert!(has("aws_access_key_id", "TestKeyId"));
         assert!(has("aws_secret_access_key", "Secret/MixedCase"));
         assert!(!opts.iter().any(|(k, _)| k == "AWS_ACCESS_KEY_ID"));
+        // Empty values are filtered out (the env template ships empty AWS_*).
+        assert!(!opts.iter().any(|(k, _)| k == "aws_session_token"));
         // Query-param keys are lowercased too; values untouched.
         assert!(has("region", "eu-central-003"));
         assert!(has("endpoint", "https://ep.example.com"));
         // A stray non-provider env var must not be offered as a config key.
         assert!(!opts.iter().any(|(k, _)| k == "token"));
+    }
+
+    /// Without explicit credentials, `require_explicit_credentials` must fail
+    /// fast instead of letting object_store silently probe EC2/GCE metadata.
+    /// `use_ambient_creds=true` is the documented escape hatch.
+    #[test]
+    fn require_explicit_credentials_blocks_implicit_metadata_fallback() {
+        let _env = test_env::EnvGuard::lock(&[
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AWS_ROLE_ARN",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "GOOGLE_SERVICE_ACCOUNT_PATH",
+            "HOME",
+        ]);
+
+        let check = |uri: &str| {
+            let url = url::Url::parse(uri).unwrap();
+            require_explicit_credentials(&url, &merge_object_store_opts(&url))
+        };
+        let ok = |uri: &str| assert!(check(uri).is_ok(), "expected preflight to pass: {uri}");
+        let blocked = |uri: &str| {
+            let err = check(uri)
+                .err()
+                .unwrap_or_else(|| panic!("expected preflight to block: {uri}"));
+            assert!(
+                err.to_string().contains("metadata"),
+                "error should mention metadata for {uri}, got: {err}"
+            );
+        };
+
+        // No credentials → blocked for both cloud schemes.
+        blocked("s3://bucket/prefix");
+        blocked("gs://bucket/prefix");
+
+        // object_store also routes these https hosts to the S3 builder.
+        blocked("https://bucket.s3.us-east-1.amazonaws.com/prefix");
+        blocked("https://s3.us-east-1.amazonaws.com/bucket/prefix");
+        blocked("https://account-id.r2.cloudflarestorage.com/bucket/prefix");
+
+        // S3: explicit creds, anonymous, and the escape hatch pass.
+        ok("s3://b/p?access_key_id=x&secret_access_key=y");
+        ok("https://bucket.s3.amazonaws.com/p?access_key_id=x&secret_access_key=y");
+        ok("s3://b/p?skip_signature=true");
+        ok("s3://b/p?aws_skip_signature=true");
+        ok("s3://b/p?use_ambient_creds=true");
+        // Truthy spellings mirror object_store's boolean config parsing
+        // (1|true|on|yes|y), consistently for provider keys and our own.
+        ok("s3://b/p?skip_signature=yes");
+        ok("s3://b/p?aws_skip_signature=1");
+        ok("s3://b/p?use_ambient_creds=on");
+
+        // Empty env credentials count as absent (the env template ships empty
+        // AWS_* placeholders) — they must neither configure S3 nor shadow the
+        // ambient chain the escape hatch enables.
+        // Safety: serialized by _env.
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "");
+        }
+        blocked("s3://b/p");
+        ok("s3://b/p?use_ambient_creds=true");
+        // Safety: serialized by _env.
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "envkey");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "envsecret");
+        }
+        ok("s3://b/p");
+        // Safety: serialized by _env.
+        unsafe {
+            std::env::remove_var("AWS_ACCESS_KEY_ID");
+            std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+        }
+
+        // Pod/machine identity is ambient too — gated behind use_ambient_creds
+        // (build() resolves web identity from env only; container creds hit a
+        // metadata endpoint themselves).
+        blocked("s3://b/p?aws_web_identity_token_file=/tmp/tok");
+        blocked("s3://b/p?aws_container_credentials_relative_uri=/role");
+        blocked("s3://b/p?aws_container_credentials_full_uri=http://x");
+        ok("s3://b/p?aws_web_identity_token_file=/tmp/tok&use_ambient_creds=true");
+
+        // GCS: explicit creds, anonymous, and the escape hatch pass.
+        // skip_signature never fetches a token (gcp get_credential returns
+        // None), so it is metadata-free like on S3.
+        ok("gs://b/p?google_service_account=/tmp/sa.json");
+        ok("gs://b/p?service_account=/tmp/sa.json");
+        ok("gs://b/p?google_service_account_path=/tmp/sa.json");
+        ok("gs://b/p?service_account_path=/tmp/sa.json");
+        ok("gs://b/p?google_service_account_key={}");
+        ok("gs://b/p?google_application_credentials=/tmp/sa.json");
+        ok("gs://b/p?skip_signature=true");
+        ok("gs://b/p?google_skip_signature=y");
+        ok("gs://b/p?use_ambient_creds=true");
+
+        // Uppercase env vars object_store silently drops must NOT count as
+        // configured — that would let the metadata probe back in.
+        // Safety: serialized by _env; removed again below.
+        unsafe {
+            std::env::set_var("GOOGLE_SERVICE_ACCOUNT_PATH", "/tmp/sa.json");
+        }
+        blocked("gs://b/p");
+        unsafe {
+            std::env::remove_var("GOOGLE_SERVICE_ACCOUNT_PATH");
+        }
+
+        // The well-known ADC file is intentionally NOT consulted: even with
+        // HOME pointed at a dir containing it, GCS is still blocked.
+        let home = tempfile::tempdir().unwrap();
+        let gcloud_dir = home.path().join(".config/gcloud");
+        std::fs::create_dir_all(&gcloud_dir).unwrap();
+        std::fs::write(
+            gcloud_dir.join("application_default_credentials.json"),
+            "{\"type\": \"authorized_user\"}",
+        )
+        .unwrap();
+        // Safety: serialized by _env; restored on Drop.
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+        blocked("gs://b/p");
+
+        // No credential chain for these schemes → always allowed.
+        ok("https://example.com/bucket");
+        ok("file:///tmp/x");
+        ok("sftp://h/p?key=/tmp/k");
+        ok("memory://");
     }
 
     /// `install-service --storage-uri x` must report a CommandLine value
@@ -1967,11 +2177,8 @@ mod tests {
     #[test]
     fn storage_uri_source_distinguishes_command_line_from_env() {
         use clap::CommandFactory;
-        let _guard = ENV_FILE_TEST_GUARD.lock().unwrap();
+        let _env = test_env::EnvGuard::lock(&["BEPOSITORY_STORAGE_URI"]);
         const URI: &str = "sftp://user@example.com/srv/bepository?key=/tmp/id";
-        // Safety: serialized by ENV_FILE_TEST_GUARD; restored at the end.
-        let saved = std::env::var("BEPOSITORY_STORAGE_URI").ok();
-        unsafe { std::env::remove_var("BEPOSITORY_STORAGE_URI") };
 
         // Flag after the subcommand → CommandLine source → persisted.
         let matches = Cli::command()
@@ -1990,7 +2197,7 @@ mod tests {
         assert_eq!(command_line_storage_uri(&matches).as_deref(), Some(URI));
 
         // Same URI from the environment → env source → not persisted.
-        // Safety: see above.
+        // Safety: serialized by _env.
         unsafe { std::env::set_var("BEPOSITORY_STORAGE_URI", URI) };
         let matches = Cli::command()
             .try_get_matches_from(["bepository", "install-service"])
@@ -2000,13 +2207,69 @@ mod tests {
             Some(clap::parser::ValueSource::EnvVariable)
         );
         assert_eq!(command_line_storage_uri(&matches), None);
+    }
 
-        // Safety: restoring the ambient state.
-        unsafe {
-            match saved {
-                Some(v) => std::env::set_var("BEPOSITORY_STORAGE_URI", v),
-                None => std::env::remove_var("BEPOSITORY_STORAGE_URI"),
-            }
+    /// Canary: the preflight gate hardcodes object_store's config-key
+    /// spellings. If an upgrade changes them, this fails in the upgrade PR
+    /// instead of silently desyncing the gate.
+    #[test]
+    fn object_store_config_key_spellings_match_the_gate() {
+        use object_store::aws::AmazonS3ConfigKey;
+        use object_store::gcp::GoogleConfigKey;
+        use std::str::FromStr;
+
+        for s in ["aws_access_key_id", "access_key_id"] {
+            assert!(
+                matches!(
+                    AmazonS3ConfigKey::from_str(s),
+                    Ok(AmazonS3ConfigKey::AccessKeyId)
+                ),
+                "{s}"
+            );
         }
+        for s in ["aws_skip_signature", "skip_signature"] {
+            assert!(
+                matches!(
+                    AmazonS3ConfigKey::from_str(s),
+                    Ok(AmazonS3ConfigKey::SkipSignature)
+                ),
+                "{s}"
+            );
+        }
+        for s in [
+            "google_service_account",
+            "service_account",
+            "google_service_account_path",
+            "service_account_path",
+        ] {
+            assert!(
+                matches!(
+                    GoogleConfigKey::from_str(s),
+                    Ok(GoogleConfigKey::ServiceAccount)
+                ),
+                "{s}"
+            );
+        }
+        for s in ["google_service_account_key", "service_account_key"] {
+            assert!(
+                matches!(
+                    GoogleConfigKey::from_str(s),
+                    Ok(GoogleConfigKey::ServiceAccountKey)
+                ),
+                "{s}"
+            );
+        }
+        for s in ["google_application_credentials", "application_credentials"] {
+            assert!(
+                matches!(
+                    GoogleConfigKey::from_str(s),
+                    Ok(GoogleConfigKey::ApplicationCredentials)
+                ),
+                "{s}"
+            );
+        }
+        // The deleted CLOUDSDK_AUTH_ACCESS_TOKEN alias mapped to bearer_token,
+        // which 0.12 rejects — the alias was dead code.
+        assert!(GoogleConfigKey::from_str("bearer_token").is_err());
     }
 }
