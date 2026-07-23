@@ -48,11 +48,12 @@ all the benefits of Peer-to-Peer synchronisation.
 First and foremost, reliability:
 
 - Not much field testing.
-- Installation instructions are only tested on NixOS (report success or
-  failure).
+- Installation instructions are only tested on NixOS
+  ([report success or failure](https://github.com/unbrice/bepository/issues)).
 - On-disk format not stable yet (that will be 1.0).
 - Partially implemented using LLMs. I've been careful to not trust it blindly
-  and to be driving the session, please report slop if you see it.
+  and to be driving the session, please
+  [report slop](https://github.com/unbrice/bepository/issues) if you see it.
 
 On the feature front:
 
@@ -137,7 +138,9 @@ bepository checkpoint serve 0.0.0.0:8080
 ```
 
 Open `http://localhost:8080` in a WebDAV client (or a browser) and log in with
-any username and the password you set. Files are organised as:
+any username and the password you set. The server is read-only and takes no
+distributed lock, so it can run alongside the daemon on any host with storage
+credentials. Files are organised as:
 
 ```
 /<folder-label>/<timestamp>/path/to/file
@@ -198,4 +201,11 @@ Technically yes, but it is strongly recommended to run them together.
 `bepository` does not implement relaying or discovery, meaning you would need a
 fixed IP or domain and a clear line of sight between the devices. Furthermore,
 each `bepository` process only accepts connections from a single Syncthing
-instance ("`MASTER_ID`" in the config).
+instance ("`BEPOSITORY_MASTER_DEVICE_ID`" in the config).
+
+### Do I need to open firewall ports?
+
+No. `bepository` listens on loopback by default (`127.0.0.1:22001`) for its
+local Syncthing instance, and implements no relaying or discovery. Only a
+Syncthing master running on a *different* device needs a reachable address for
+`bepository` — see the previous question.
