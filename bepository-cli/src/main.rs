@@ -320,6 +320,21 @@ static REGISTER_SFTP: LazyLock<()> = LazyLock::new(|| {
         .register::<opendal::services::Sftp>(opendal::services::SFTP_SCHEME);
 });
 
+/// object_store's config-key parser only accepts lowercase spellings and
+/// silently drops unrecognised keys, so conventional uppercase env vars
+/// (`AWS_ACCESS_KEY_ID`, ...) would never reach the builder — S3 then falls
+/// back to the EC2 metadata endpoint. Mirror `AmazonS3Builder::from_env`:
+/// lowercase `AWS_`-prefixed keys only; anything else stays untouched so a
+/// stray `TOKEN`/`ENDPOINT`/`PROXY_URL` env var can't silently reconfigure
+/// the store. GCS credentials go through the alias translation below.
+fn lowercase_aws_key(key: String) -> String {
+    if key.starts_with("AWS_") {
+        key.to_ascii_lowercase()
+    } else {
+        key
+    }
+}
+
 fn merge_object_store_opts(parsed_url: &url::Url) -> Vec<(String, String)> {
     // Merge opts: defaults (lowest precedence), then URL query params, then env vars.
     // Later entries win when object_store's builder sees duplicates.
@@ -332,8 +347,8 @@ fn merge_object_store_opts(parsed_url: &url::Url) -> Vec<(String, String)> {
     opts.extend(
         parsed_url
             .query_pairs()
-            .map(|(k, v)| (k.into_owned(), v.into_owned()))
-            .chain(std::env::vars()),
+            .map(|(k, v)| (k.to_lowercase(), v.into_owned()))
+            .chain(std::env::vars().map(|(k, v)| (lowercase_aws_key(k), v))),
     );
 
     // Translate aliases that object_store's GCS builder doesn't recognise natively.
@@ -1873,5 +1888,56 @@ mod tests {
             std::env::remove_var("BEPOSITORY_TEST_ENV_FILE_QUOTED");
             std::env::remove_var("BEPOSITORY_ENV_FILE");
         }
+    }
+
+    /// `merge_object_store_opts` must lowercase `AWS_*` env keys (object_store's
+    /// parser is case-sensitive and silently drops unrecognised keys — the bug
+    /// that sent S3 to the EC2 metadata endpoint), while leaving other env vars
+    /// alone so a stray `TOKEN` can't become the S3 session token.
+    #[test]
+    fn merge_object_store_opts_lowercases_aws_env_keys_only() {
+        let _guard = ENV_FILE_TEST_GUARD.lock().unwrap();
+        const VARS: &[(&str, &str)] = &[
+            ("AWS_ACCESS_KEY_ID", "TestKeyId"),
+            ("AWS_SECRET_ACCESS_KEY", "Secret/MixedCase"),
+            ("TOKEN", "must-not-leak"),
+        ];
+        // Safety: serialized by ENV_FILE_TEST_GUARD; originals restored below.
+        let saved: Vec<_> = VARS
+            .iter()
+            .map(|(k, _)| (*k, std::env::var(k).ok()))
+            .collect();
+        unsafe {
+            for (k, v) in VARS {
+                std::env::set_var(k, v);
+            }
+        }
+
+        let url = url::Url::parse(
+            "s3://bucket/prefix?region=eu-central-003&ENDPOINT=https://ep.example.com",
+        )
+        .unwrap();
+        let opts = merge_object_store_opts(&url);
+
+        // Safety: restoring the ambient state.
+        unsafe {
+            for (k, orig) in saved {
+                match orig {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+
+        let has = |k: &str, v: &str| opts.iter().any(|(ok, ov)| ok == k && ov == v);
+        // AWS_* env keys arrive lowercased; values keep their case.
+        assert!(has("aws_access_key_id", "TestKeyId"));
+        assert!(has("aws_secret_access_key", "Secret/MixedCase"));
+        assert!(!opts.iter().any(|(k, _)| k == "AWS_ACCESS_KEY_ID"));
+        // Query-param keys are lowercased too; values untouched.
+        assert!(has("region", "eu-central-003"));
+        assert!(has("endpoint", "https://ep.example.com"));
+        // A stray non-provider env var must not be offered as a config key.
+        assert!(!opts.iter().any(|(k, _)| k == "token"));
     }
 }
