@@ -62,6 +62,7 @@ EOF
     need_cmd curl
     need_cmd install
     need_cmd mktemp
+    need_cmd systemctl
     SUDO=
     if [ "$(id -u)" -ne 0 ]; then
         command -v sudo >/dev/null 2>&1 || die "not running as root and 'sudo' is missing — this installer writes /usr/local/bin and /etc/systemd/system; re-run as root or install sudo"
