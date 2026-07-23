@@ -572,6 +572,49 @@ async fn block_deduplication() {
     assert_eq!(read2, data);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_store_block_same_file_loses_no_pointers() {
+    let (_storage, folder) = setup_folder("f1").await;
+    let folder = Arc::new(folder);
+
+    const N: usize = 16;
+    let bytes: Vec<u8> = (0..N).map(|i| u8::try_from(i).unwrap()).collect();
+    let hashes: Vec<[u8; 32]> = bytes.iter().map(|&b| [b; 32]).collect();
+    folder
+        .insert_file(make_file_with_blocks_of_size(
+            "docs/big.bin",
+            &[(1, 1)],
+            &hashes,
+            4096,
+        ))
+        .await;
+
+    // Without per-name serialization, each store_block's read-modify-write of
+    // the file entry can overwrite a concurrent call's pointer update.
+    let mut set = tokio::task::JoinSet::new();
+    for (i, hash) in hashes.iter().enumerate() {
+        let folder = Arc::clone(&folder);
+        let hash = *hash;
+        let byte = bytes[i];
+        set.spawn(async move {
+            folder
+                .store_block("docs/big.bin", 0, &hash, Bytes::from(vec![byte; 4096]))
+                .await
+        });
+    }
+    while let Some(res) = set.join_next().await {
+        res.expect("task panicked").expect("store_block failed");
+    }
+
+    for (i, hash) in hashes.iter().enumerate() {
+        let data = folder
+            .read_block("docs/big.bin", 0, 4096, hash)
+            .await
+            .unwrap_or_else(|e| panic!("block {i} unreadable after concurrent store: {e}"));
+        assert_eq!(data, Bytes::from(vec![bytes[i]; 4096]));
+    }
+}
+
 // --- Two-phase file intake (inbox) ---
 
 #[tokio::test]

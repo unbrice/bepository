@@ -151,9 +151,9 @@ pub(crate) struct FolderStore {
     pub(crate) db: Db,
     pub(crate) gc: Arc<CompactionState>,
     /// Per-name async lock pool. Witnessed by `LockedFileName`.
-    /// Protects `stage_file`/`complete_file`/`put_file`/`put_file_with_carry`,
-    /// but `store_block` and `reuse_block` currently mutate `mi`/`mn` outside
-    /// this lock.
+    /// Serializes all `mn`/`ms`/`mi` mutations per name:
+    /// `stage_file`/`complete_file`/`put_file`/`put_file_with_carry` and
+    /// `store_block`/`reuse_block` (witness-gated via `get_file_to_update`).
     /// Compaction may drop dead entries outside this lock; see
     /// `compaction.rs`.
     name_locks: LockPool<String>,
@@ -350,6 +350,11 @@ impl FolderStore {
     /// Writes `mr` reverse refs for the carried separated blocks so the copy
     /// doesn't introduce fsck "missing reverse reference" findings. With no
     /// committed entry at `carry_from`, behaves like [`put_file`](Self::put_file).
+    ///
+    /// Carried blocks are recorded with the compaction GC (same as
+    /// `store_block`/`reuse_block`): the `carry_from` read runs before the
+    /// commit, and this keeps a carried seq live even if the source entry is
+    /// overwritten and a GC snapshot lands in that window.
     pub async fn put_file_with_carry(
         &self,
         file: &FileInfo,
@@ -357,13 +362,15 @@ impl FolderStore {
     ) -> Result<i64, StorageError> {
         let mut stored: crate::proto::storage::FileInfo = file.clone().into();
         let mut batch = WriteBatch::new();
+        let mut carried: Vec<([u8; store_keys::HASH_LEN], u64)> = Vec::new();
         if let Some(src) = self.get_file_proto(carry_from).await? {
             carry_block_pointers(&mut stored, &src);
             for block in &stored.blocks {
-                if block.blockseq.is_some()
+                if let Some(seq) = block.blockseq
                     && let Ok(hash) = block.hash.as_slice().try_into()
                 {
                     batch.put(store_keys::block_reverse_key(hash, &file.name), []);
+                    carried.push((*hash, seq));
                 }
             }
         }
@@ -371,6 +378,9 @@ impl FolderStore {
         let (seq, _) = self
             .commit_with_new_seq(&locked_filename, stored, batch)
             .await?;
+        for (hash, block_seq) in &carried {
+            self.gc.record_block_write(hash, Some(*block_seq));
+        }
         Ok(seq)
     }
 
@@ -571,8 +581,10 @@ impl FolderStore {
 
     // --- Block storage ---
 
-    /// Find the file info to update, either in the inbox or the main index.
-    pub(crate) async fn get_file_to_update(
+    /// Read-only lookup of a file entry, inbox first, then main index.
+    /// Returns the decoded `FileInfo`, the key it was found at, and whether
+    /// that key is an inbox entry.
+    pub(crate) async fn find_file_entry(
         &self,
         epoch: Option<Epoch>,
         name: &str,
@@ -603,10 +615,25 @@ impl FolderStore {
         )))
     }
 
+    /// Find the file info to update, either in the inbox or the main index.
+    ///
+    /// Entry point for per-name read-modify-write: the `LockedFileName`
+    /// witness guarantees the caller holds the per-name lock across the
+    /// read-modify-write window. Read-only callers use [`find_file_entry`].
+    async fn get_file_to_update(
+        &self,
+        locked: &LockedFileName<'_>,
+        epoch: Option<Epoch>,
+    ) -> Result<(crate::proto::storage::FileInfo, Vec<u8>, bool), StorageError> {
+        self.find_file_entry(epoch, locked.name()).await
+    }
+
     /// Store block data with cross-directory dedup.
     ///
-    /// Uses a `WriteBatch` for per-call atomicity (does not provide cross-call exclusion
-    /// for concurrent `store_block` calls on the same file).
+    /// Holds the per-name lock across the whole read-modify-write, so
+    /// concurrent `store_block` calls on the same file serialize and cannot
+    /// lose each other's pointer updates. Mutations land in a single
+    /// `WriteBatch` for per-call atomicity.
     pub async fn store_block(
         &self,
         epoch: Option<Epoch>,
@@ -618,6 +645,8 @@ impl FolderStore {
             .try_into()
             .map_err(|_| StorageError::InvalidInput("block hash must be 32 bytes".into()))?;
 
+        let locked_filename = self.lock_filename(name).await;
+
         let dir = store_keys::dirname(name);
         let mut batch = WriteBatch::new();
 
@@ -625,7 +654,7 @@ impl FolderStore {
         if is_inline {
             // Find and update the FileInfo in inbox or main index.
             let (mut file_info, key_to_update, is_inbox) =
-                self.get_file_to_update(epoch, name).await?;
+                self.get_file_to_update(&locked_filename, epoch).await?;
             let mut updated_any = false;
             for block in &mut file_info.blocks {
                 if block.hash == hash {
@@ -687,7 +716,8 @@ impl FolderStore {
         batch.put(rev_key, []);
 
         // Find and update the FileInfo in inbox or main index.
-        let (mut file_info, key_to_update, is_inbox) = self.get_file_to_update(epoch, name).await?;
+        let (mut file_info, key_to_update, is_inbox) =
+            self.get_file_to_update(&locked_filename, epoch).await?;
         let mut updated_any = false;
         for block in &mut file_info.blocks {
             if block.hash == hash {
@@ -736,6 +766,8 @@ impl FolderStore {
             .try_into()
             .map_err(|_| StorageError::InvalidInput("block hash must be 32 bytes".into()))?;
 
+        let locked_filename = self.lock_filename(name).await;
+
         // Check if block already exists somewhere.
         let existing = self.find_block_dir(hash_arr).await?;
 
@@ -758,7 +790,8 @@ impl FolderStore {
         batch.put(rev_key, []);
 
         // Find and update the FileInfo in inbox or main index.
-        let (mut file_info, key_to_update, is_inbox) = self.get_file_to_update(epoch, name).await?;
+        let (mut file_info, key_to_update, is_inbox) =
+            self.get_file_to_update(&locked_filename, epoch).await?;
         let mut updated_any = false;
         for block in &mut file_info.blocks {
             if block.hash == hash {

@@ -107,7 +107,9 @@ persistence from the wire format, ensuring stability across bepository versions.
 ## Invariants
 
 - **Index mutation serialization:** `name_locks` serializes `mn`, `ms`, `mi`
-  mutations per name; `seq_lock` serializes the `IX_KEY` allocation.
+  mutations per name — commits (`stage_file`/`complete_file`/`put_file`) and
+  block-pointer updates (`store_block`/`reuse_block`, witness-gated through
+  `LockedFileName`); `seq_lock` serializes the `IX_KEY` allocation.
   `commit_with_new_seq` must remain the sole writer of `mn` and `ms`; enforced
   at the type level by `LockedFileName`. Compaction may drop dead `mn`, `ms`,
   `mi` entries outside any lock (see Compaction GC); `mx` is preserved.

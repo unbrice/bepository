@@ -1661,7 +1661,7 @@ impl StorageFolder for SlateFolder {
     ) -> Result<bool, StorageError> {
         let is_inline = size < 4096;
         if is_inline {
-            match self.store.get_file_to_update(self.epoch, file).await {
+            match self.store.find_file_entry(self.epoch, file).await {
                 Ok((file_info, _, _)) => {
                     for block in &file_info.blocks {
                         if block.offset == offset && block.hash == hash {
