@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::num::NonZeroU32;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -49,8 +50,8 @@ impl<M: Eq + std::hash::Hash, E: Clone> FaultState<M, E> {
         }
     }
 
-    fn set(&self, method: M, count: u32, error: E) {
-        self.rules.lock().insert(method, (count, error));
+    fn set(&self, method: M, count: NonZeroU32, error: E) {
+        self.rules.lock().insert(method, (count.get(), error));
     }
 
     fn clear(&self, method: M) {
@@ -85,7 +86,6 @@ pub enum StorageMethod {
     StoreBlock,
     CompleteFile,
     ReuseBlock,
-    HasBlock,
     ResolveConflict,
     LocalSequence,
     RemoteState,
@@ -110,7 +110,7 @@ impl FaultConfig {
     }
 
     /// Fail the next `count` calls to `method` with `error`.
-    pub fn set(&self, method: StorageMethod, count: u32, error: StorageError) {
+    pub fn set(&self, method: StorageMethod, count: NonZeroU32, error: StorageError) {
         self.inner.set(method, count, error);
     }
 
@@ -291,17 +291,6 @@ impl<F: StorageFolder> StorageFolder for FaultFolder<F> {
         self.faults.check(StorageMethod::ReuseBlock)?;
         self.inner.reuse_block(name, offset, hash, size).await
     }
-
-    async fn has_block(
-        &self,
-        file: &str,
-        offset: i64,
-        hash: &[u8],
-        size: i32,
-    ) -> Result<bool, StorageError> {
-        self.faults.check(StorageMethod::HasBlock)?;
-        self.inner.has_block(file, offset, hash, size).await
-    }
 }
 
 #[async_trait]
@@ -330,6 +319,16 @@ where
 
     async fn get_block(&self, name: &str, offset: i64) -> Option<Bytes> {
         self.inner.get_block(name, offset).await
+    }
+
+    async fn has_block(
+        &self,
+        file: &str,
+        offset: i64,
+        hash: &[u8],
+        size: i32,
+    ) -> Result<bool, StorageError> {
+        self.inner.has_block(file, offset, hash, size).await
     }
 }
 
@@ -360,8 +359,8 @@ impl StreamFaultConfig {
 
     /// Fail the next `count` polls of `method` with an error of `kind`.
     ///
-    /// To simulate a permanent connection drop: `set(Read, u32::MAX, ConnectionReset)`.
-    pub fn set(&self, method: StreamMethod, count: u32, kind: io::ErrorKind) {
+    /// To simulate a permanent connection drop: `set(Read, NonZeroU32::MAX, ConnectionReset)`.
+    pub fn set(&self, method: StreamMethod, count: NonZeroU32, kind: io::ErrorKind) {
         self.inner.set(method, count, kind);
     }
 
@@ -384,7 +383,7 @@ impl Default for StreamFaultConfig {
 /// Wraps any `AsyncRead + AsyncWrite` stream to enable fault injection.
 ///
 /// Faults fire at the `poll_read` / `poll_write` level (not per BEP message).
-/// Setting `count = u32::MAX` simulates a permanent connection drop.
+/// Setting `count = NonZeroU32::MAX` simulates a permanent connection drop.
 pub struct FaultStream<T> {
     pub inner: T,
     faults: StreamFaultConfig,

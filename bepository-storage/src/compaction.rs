@@ -493,7 +493,7 @@ impl CompactionFilter for GcFilter {
             if !self.job.gc.known_live_hash_contains(self.job.job_id, &hash) {
                 self.stats.reverse_refs_tombstoned += 1;
                 self.stats.record_dropped(key);
-                return Ok(CompactionFilterDecision::Modify(ValueDeletable::Tombstone));
+                return Ok(self.prune_decision());
             }
             self.stats.reverse_refs_kept += 1;
             self.stats.kept += 1;
@@ -505,7 +505,7 @@ impl CompactionFilter for GcFilter {
             if epoch < self.epoch {
                 self.stats.inbox_tombstoned += 1;
                 self.stats.record_dropped(key);
-                return Ok(CompactionFilterDecision::Modify(ValueDeletable::Tombstone));
+                return Ok(self.prune_decision());
             }
             self.stats.inbox_kept += 1;
             self.stats.kept += 1;
@@ -781,6 +781,13 @@ mod tests {
         ));
 
         assert_eq!(filter.stats.reverse_refs_tombstoned, 1);
+
+        // Bottom run — drop outright.
+        let job_bottom = gc.register(bloom_hashes.clone(), bloom_seqs.clone());
+        let mut filter_bottom = make_gc_filter_with_floor(job_bottom, epoch(1), None, true);
+        let decision = filter_bottom.filter(&make_row(&rev_key)).await.unwrap();
+        assert!(matches!(decision, CompactionFilterDecision::Drop));
+        assert_eq!(filter_bottom.stats.reverse_refs_tombstoned, 1);
     }
 
     #[tokio::test]
@@ -810,6 +817,13 @@ mod tests {
 
         assert_eq!(filter.stats.inbox_tombstoned, 1);
         assert_eq!(filter.stats.kept, 1);
+
+        // Bottom run — drop outright.
+        let job_bottom = gc.register(bloom_hashes.clone(), bloom_seqs.clone());
+        let mut filter_bottom = make_gc_filter_with_floor(job_bottom, current_epoch, None, true);
+        let decision = filter_bottom.filter(&make_row(&old_key)).await.unwrap();
+        assert!(matches!(decision, CompactionFilterDecision::Drop));
+        assert_eq!(filter_bottom.stats.inbox_tombstoned, 1);
     }
 
     #[tokio::test]

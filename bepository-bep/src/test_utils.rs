@@ -222,9 +222,27 @@ impl StorageInspectorForTests for MemoryFolder {
         let blocks = self.blocks.read();
         blocks.get(&hash).cloned()
     }
+
+    async fn has_block(
+        &self,
+        _file: &str,
+        _offset: i64,
+        hash: &[u8],
+        _size: i32,
+    ) -> Result<bool, StorageError> {
+        Ok(self.block_present(hash))
+    }
 }
 
 impl MemoryFolder {
+    /// Whether a block with this hash is stored. Malformed hashes report false.
+    fn block_present(&self, hash: &[u8]) -> bool {
+        let Ok(hash) = <[u8; 32]>::try_from(hash) else {
+            return false;
+        };
+        self.blocks.read().contains_key(&hash)
+    }
+
     /// Resolve the 32-byte hash for a block at `(name, offset)` by scanning the
     /// committed index. Panics if not found — intended for test setup only.
     fn block_hash(&self, name: &str, offset: i64) -> [u8; 32] {
@@ -446,27 +464,12 @@ impl StorageFolder for MemoryFolder {
 
     async fn reuse_block(
         &self,
-        name: &str,
-        offset: i64,
-        hash: &[u8],
-        size: i32,
-    ) -> Result<bool, StorageError> {
-        self.has_block(name, offset, hash, size).await
-    }
-
-    async fn has_block(
-        &self,
-        _file: &str,
+        _name: &str,
         _offset: i64,
         hash: &[u8],
         _size: i32,
     ) -> Result<bool, StorageError> {
-        let hash: [u8; 32] = match hash.try_into() {
-            Ok(h) => h,
-            Err(_) => return Ok(false),
-        };
-        let blocks = self.blocks.read();
-        Ok(blocks.contains_key(&hash))
+        Ok(self.block_present(hash))
     }
 
     async fn set_remote_state(

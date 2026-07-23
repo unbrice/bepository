@@ -13,6 +13,7 @@ pub mod ids;
 pub mod proto;
 pub mod retry;
 pub mod storage;
+pub mod validate;
 
 #[cfg(any(test, feature = "test-utils"))]
 pub mod fault;

@@ -143,12 +143,19 @@ async fn check_sequences(
             let Some(fi) = file.file_info else { continue };
             max_observed_file_seq = max_observed_file_seq.max(fi.sequence);
 
-            let seq_key = store_keys::seq_key(fi.sequence)?;
-            if db.get(&seq_key).await.map_err(slate_err)?.is_none() {
-                errors.push(format!(
-                    "File {name} has sequence {} but no ms/ entry exists",
+            match store_keys::seq_key(fi.sequence) {
+                Ok(seq_key) => {
+                    if db.get(&seq_key).await.map_err(slate_err)?.is_none() {
+                        errors.push(format!(
+                            "File {name} has sequence {} but no ms/ entry exists",
+                            fi.sequence
+                        ));
+                    }
+                }
+                Err(e) => errors.push(format!(
+                    "File {name} has invalid sequence {}: {e}",
                     fi.sequence
-                ));
+                )),
             }
         }
     }
@@ -252,6 +259,14 @@ async fn collect_expected_blocks(
                     hex::encode(hash)
                 )),
                 Ok(Some(data)) if level == FsckLevel::Full => {
+                    if usize::try_from(block.size).ok() != Some(data.len()) {
+                        errors.push(format!(
+                            "Block {} of file {name} declares size {} but resolved data is {} bytes",
+                            hex::encode(hash),
+                            block.size,
+                            data.len()
+                        ));
+                    }
                     let computed = Sha256::digest(&data);
                     if computed[..] != hash[..] {
                         errors.push(format!(
@@ -884,6 +899,90 @@ mod tests {
         assert!(
             errors.iter().any(|e| e.contains("Data checksum mismatch")),
             "Expected a checksum mismatch at Full, got: {errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_folder_integrity_block_size_mismatch() {
+        // Full-level fsck flags a block whose declared size disagrees with
+        // the resolved data length.
+        let store = test_store().await;
+
+        let data = b"data";
+        let hash: [u8; 32] = Sha256::digest(data).into();
+        let file_info = crate::proto::storage::FileInfo {
+            name: "file1".to_string(),
+            sequence: 1,
+            blocks: vec![crate::proto::storage::BlockInfo {
+                offset: 0,
+                size: 99,
+                hash: hash.to_vec(),
+                blockseq: Some(store_keys::MIN_BLOCK_SEQ),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let file = File {
+            file_info: Some(file_info.clone()),
+        };
+        store
+            .db
+            .put(store_keys::file_key(&file_info.name), file.encode_to_vec())
+            .await
+            .unwrap();
+        store
+            .db
+            .put(store_keys::seq_key(1).unwrap(), file_info.name.as_bytes())
+            .await
+            .unwrap();
+        helper_put_block(&store, "", &hash, data, store_keys::MIN_BLOCK_SEQ).await;
+        store
+            .db
+            .put(store_keys::block_reverse_key(&hash, &file_info.name), b"")
+            .await
+            .unwrap();
+
+        let errors = check_folder_integrity(&store, FsckLevel::Structural)
+            .await
+            .unwrap();
+        assert!(errors.is_empty(), "Structural should pass: {errors:?}");
+
+        let errors = check_folder_integrity(&store, FsckLevel::Full)
+            .await
+            .unwrap();
+        assert!(
+            errors.iter().any(|e| e.contains("declares size 99")),
+            "Expected a block size mismatch at Full, got: {errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_folder_integrity_invalid_sequence_continues() {
+        // A file whose sequence cannot be encoded into an ms/ key must be
+        // reported as a finding, not abort the folder's fsck.
+        let store = test_store().await;
+
+        let file_info = crate::proto::storage::FileInfo {
+            name: "file1".to_string(),
+            sequence: -1,
+            ..Default::default()
+        };
+        let file = File {
+            file_info: Some(file_info.clone()),
+        };
+        store
+            .db
+            .put(store_keys::file_key(&file_info.name), file.encode_to_vec())
+            .await
+            .unwrap();
+
+        let errors = check_folder_integrity(&store, FsckLevel::Full)
+            .await
+            .expect("invalid sequence must not abort fsck");
+        assert!(
+            errors.iter().any(|e| e.contains("invalid sequence")),
+            "Expected an invalid-sequence finding, got: {errors:?}"
         );
     }
 }

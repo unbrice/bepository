@@ -1432,6 +1432,33 @@ impl StorageInspectorForTests for SlateFolder {
         }
         None
     }
+
+    /// Check whether a block with the given hash and size is already stored.
+    async fn has_block(
+        &self,
+        file: &str,
+        offset: i64,
+        hash: &[u8],
+        size: i32,
+    ) -> Result<bool, StorageError> {
+        let is_inline = crate::store_keys::is_inline_block(size);
+        if is_inline {
+            match self.store.find_file_entry(self.epoch, file).await {
+                Ok((file_info, _, _)) => {
+                    for block in &file_info.blocks {
+                        if block.offset == offset && block.hash == hash {
+                            return Ok(block.inline_data.is_some());
+                        }
+                    }
+                    Ok(false)
+                }
+                Err(StorageError::NotFound(_)) => Ok(false),
+                Err(e) => Err(e),
+            }
+        } else {
+            self.store.has_block(hash).await
+        }
+    }
 }
 
 impl SlateFolder {
@@ -1539,6 +1566,8 @@ impl StorageFolder for SlateFolder {
         _remote_device: &DeviceId,
     ) -> Result<UpdateResult, StorageError> {
         validate_file_name(&remote_file.name)?;
+        bepository_bep::validate::validate_file_info(remote_file)
+            .map_err(|e| StorageError::InvalidInput(e.to_string()))?;
         let epoch = self.require_epoch()?;
         let local_file = self.store.get_file(&remote_file.name).await?;
 
@@ -1646,36 +1675,10 @@ impl StorageFolder for SlateFolder {
         hash: &[u8],
         size: i32,
     ) -> Result<bool, StorageError> {
-        if size < 4096 {
+        if crate::store_keys::is_inline_block(size) {
             return Ok(false);
         }
         self.store.reuse_block(self.epoch, name, hash).await
-    }
-
-    async fn has_block(
-        &self,
-        file: &str,
-        offset: i64,
-        hash: &[u8],
-        size: i32,
-    ) -> Result<bool, StorageError> {
-        let is_inline = size < 4096;
-        if is_inline {
-            match self.store.find_file_entry(self.epoch, file).await {
-                Ok((file_info, _, _)) => {
-                    for block in &file_info.blocks {
-                        if block.offset == offset && block.hash == hash {
-                            return Ok(block.inline_data.is_some());
-                        }
-                    }
-                    Ok(false)
-                }
-                Err(StorageError::NotFound(_)) => Ok(false),
-                Err(e) => Err(e),
-            }
-        } else {
-            self.store.has_block(hash).await
-        }
     }
 }
 

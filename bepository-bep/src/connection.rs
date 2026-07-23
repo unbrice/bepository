@@ -30,6 +30,7 @@ use crate::storage::{Sequence, Storage, StorageFolder, UpdateResult};
 #[derive(Clone)]
 pub struct ConnectionOptions {
     /// Max concurrent outstanding block requests per connection.
+    /// 0 is invalid and clamped to 1 (it would stall all transfers forever).
     pub max_pending_requests: usize,
     /// Send a Ping if no message received for this long.
     pub ping_interval: Duration,
@@ -45,6 +46,12 @@ impl Default for ConnectionOptions {
             retry_policy: Arc::new(ExponentialBackoff::default()),
         }
     }
+}
+
+/// `max_pending_requests` of 0 would stall all transfers forever (every block
+/// defers and `drain_deferred` never fires) — clamp to 1.
+fn clamp_max_pending_requests(v: usize) -> usize {
+    v.max(1)
 }
 
 /// Why a connection closed.
@@ -603,13 +610,20 @@ where
         res = exchange_initial_cluster_config(&storage, &mut reader, &writer, &ctx, &shared_folders) => res?,
     };
 
+    // 0 would stall all transfers forever: every block defers and
+    // `drain_deferred` never fires. Clamp to 1.
+    let max_pending_requests = clamp_max_pending_requests(options.max_pending_requests);
+    if max_pending_requests != options.max_pending_requests {
+        tracing::warn!("max_pending_requests is 0; clamping to 1");
+    }
+
     let inner = Arc::new(Mutex::new(ConnectionInner {
         storage: storage.clone(),
         mutual_folders,
         our_cc_folders,
         pending_requests: HashMap::new(),
         next_request_id: 0,
-        max_pending_requests: options.max_pending_requests,
+        max_pending_requests,
         deferred_blocks: std::collections::VecDeque::new(),
     }));
 
@@ -902,6 +916,7 @@ where
 
     let mut needed: Vec<FileInfo> = Vec::new();
     for file in files {
+        crate::validate::validate_file_info(file)?;
         let result = ctx
             .retry("apply_update", || {
                 folder.apply_update(file, &ctx.remote_device)
@@ -1284,6 +1299,7 @@ async fn send_index_update(
 ///
 /// Returns without sending if the file still has pending or deferred block requests,
 /// or if `complete_file` returns `None` (version mismatch / not staged).
+// TODO: inline the previous maybe_complete_file and rename this maybe_complete_file.
 async fn complete_and_notify<S: Storage>(
     inner: &Arc<Mutex<ConnectionInner<S>>>,
     folder: &S::Folder,
@@ -1528,5 +1544,11 @@ mod tests {
         let res = writer.send(MessageType::Ping, &msg).await;
 
         assert!(matches!(res, Err(BepError::WriterClosed)));
+    }
+
+    #[test]
+    fn max_pending_requests_zero_is_clamped_to_one() {
+        assert_eq!(1, clamp_max_pending_requests(0));
+        assert_eq!(16, clamp_max_pending_requests(16));
     }
 }

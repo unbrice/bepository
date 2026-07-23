@@ -205,18 +205,6 @@ pub trait StorageFolder: Clone + Send + Sync + 'static {
         hash: &[u8],
         size: i32,
     ) -> Result<bool, StorageError>;
-
-    /// Check whether a block with the given hash and size is already stored.
-    ///
-    /// Used to skip requesting blocks the backend already has (e.g. after a
-    /// file move/rename).
-    async fn has_block(
-        &self,
-        file: &str,
-        offset: i64,
-        hash: &[u8],
-        size: i32,
-    ) -> Result<bool, StorageError>;
 }
 
 /// Helper trait for test inspection and setup.
@@ -246,6 +234,15 @@ pub trait StorageInspectorForTests: StorageFolder {
 
     /// Get raw block data for a file at a specific offset.
     async fn get_block(&self, name: &str, offset: i64) -> Option<Bytes>;
+
+    /// Check whether a block with the given hash and size is already stored.
+    async fn has_block(
+        &self,
+        file: &str,
+        offset: i64,
+        hash: &[u8],
+        size: i32,
+    ) -> Result<bool, StorageError>;
 }
 
 /// Storage backend trait — decouples BEP protocol logic from storage implementation.

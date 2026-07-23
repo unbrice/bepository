@@ -457,6 +457,10 @@ impl FolderStore {
     ///
     /// Returns `Ok(None)` if the inbox is empty (idempotent re-call) or if
     /// the staged entry's version differs from `expected_version`.
+    ///
+    /// Errors if, after carrying block pointers from the prior committed
+    /// entry, any staged block still has neither inline data nor a blockseq —
+    /// promoting it would commit silent corruption.
     #[tracing::instrument(level = "debug", skip_all, fields(file = %name, epoch = %epoch.as_base32()))]
     pub async fn complete_file(
         &self,
@@ -487,6 +491,23 @@ impl FolderStore {
         let staged_bep_version: Option<Vector> = staged.version.clone().map(Into::into);
         if staged_bep_version.as_ref() != expected_version {
             return Ok(None);
+        }
+
+        // Refuse to promote an incompletely staged file: after carrying
+        // pointers from the prior committed entry (as the commit will), every
+        // block must carry inline data or point at a committed block-data key.
+        let mut completed = staged.clone();
+        if let Some(old) = self.get_file_proto(locked_filename.name()).await? {
+            carry_block_pointers(&mut completed, &old);
+        }
+        if completed
+            .blocks
+            .iter()
+            .any(|b| b.inline_data.is_none() && b.blockseq.is_none())
+        {
+            return Err(StorageError::Internal(format!(
+                "staged file {name} has blocks with neither inline data nor blockseq"
+            )));
         }
 
         let mut batch = WriteBatch::new();
@@ -650,7 +671,7 @@ impl FolderStore {
         let dir = store_keys::dirname(name);
         let mut batch = WriteBatch::new();
 
-        let is_inline = data.len() < 4096;
+        let is_inline = data.len() < store_keys::INLINE_BLOCK_THRESHOLD as usize;
         if is_inline {
             // Find and update the FileInfo in inbox or main index.
             let (mut file_info, key_to_update, is_inbox) =
@@ -863,6 +884,7 @@ impl FolderStore {
     /// When a compaction GC is active, also verifies the hash is recognised by
     /// the known_live filter (or was written since the snapshot), so that callers
     /// don't mistakenly skip a block that compaction is about to remove.
+    #[cfg(any(test, feature = "test-utils"))]
     pub async fn has_block(&self, hash: &[u8]) -> Result<bool, StorageError> {
         let hash_arr: &[u8; store_keys::HASH_LEN] = match hash.try_into() {
             Ok(h) => h,

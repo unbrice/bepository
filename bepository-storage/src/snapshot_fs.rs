@@ -167,7 +167,12 @@ impl SnapshotFs for SlateStorage {
             .ok_or(SnapshotError::NotFound)?;
 
         let fi = decode_live_file_info(raw)?.ok_or(SnapshotError::NotFound)?;
-        if fi.size == 0 {
+        let file_size =
+            u64::try_from(fi.size).map_err(|_| SnapshotError::Io("negative file size".into()))?;
+        // Clamp the request to the file size so a huge `len` cannot drive an
+        // unbounded allocation in `copy_range_from_blocks`.
+        let len = usize::try_from(file_size.saturating_sub(offset).min(len as u64)).unwrap_or(len);
+        if len == 0 {
             return Ok(Bytes::new());
         }
 
@@ -201,8 +206,8 @@ fn relative_under(dir: &str, full_name: &str) -> Option<String> {
 
 /// Copy the byte range `[offset, offset+len)` of `fi`'s blocks into `out`,
 /// reading each block via `read_block_from_reader`. Stops once `len` bytes
-/// have been written. Caller is responsible for the `len == 0` and `fi.size == 0`
-/// fast paths.
+/// have been written. Caller is responsible for clamping `len` to the file
+/// size and for the `len == 0` fast path.
 async fn copy_range_from_blocks(
     reader: &DbReader,
     fi: &FileInfo,
@@ -235,7 +240,15 @@ async fn copy_range_from_blocks(
         let take = blk_size.saturating_sub(skip).min(remaining);
 
         let data = read_block_from_reader(reader, block).await?;
-        out.extend_from_slice(&data[skip..skip + take]);
+        let slice = data.get(skip..skip + take).ok_or_else(|| {
+            SnapshotError::Io(format!(
+                "block {} declares size {} but resolved data is {} bytes",
+                hex::encode(&block.hash),
+                block.size,
+                data.len()
+            ))
+        })?;
+        out.extend_from_slice(slice);
         remaining -= take;
         if remaining == 0 {
             break;

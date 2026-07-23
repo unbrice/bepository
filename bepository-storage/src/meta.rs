@@ -70,7 +70,11 @@ mod checkpoint_map {
         let mut res = BTreeMap::new();
         for (k, v) in m {
             let dur = humantime::parse_duration(&k).map_err(serde::de::Error::custom)?;
-            res.insert(dur, v);
+            if res.insert(dur, v).is_some() {
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate checkpoint interval: {k}"
+                )));
+            }
         }
         Ok(res)
     }
@@ -202,3 +206,26 @@ where
 pub const META_PREFIX: &str = "bepository-";
 /// Filename suffix for meta files.
 pub const META_SUFFIX: &str = ".toml";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checkpoint_map_round_trip() {
+        let toml = "[checkpoint.\"1h\"]\nttl = \"24h\"\n";
+        let meta: Meta = toml::from_str(toml).unwrap();
+        assert_eq!(meta.checkpoint.len(), 1);
+        assert!(meta.checkpoint.contains_key(&Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn checkpoint_map_rejects_duplicate_normalized_intervals() {
+        let toml = "[checkpoint.\"60s\"]\nttl = \"1h\"\n\n[checkpoint.\"1m\"]\nttl = \"2h\"\n";
+        let err = toml::from_str::<Meta>(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate checkpoint interval"),
+            "unexpected error: {err}"
+        );
+    }
+}
