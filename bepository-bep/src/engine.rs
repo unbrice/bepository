@@ -3,12 +3,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::RwLock;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
@@ -26,6 +29,11 @@ const EVENT_CHANNEL_CAPACITY: usize = 64;
 /// How long to wait for the event handler to accept/reject a device.
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Max queued connection-spawn requests. Steady-state depth is ~1 (the
+/// supervisor drains straight into its JoinSet); the bound exists so a wedged
+/// supervisor fails new connections fast instead of growing a queue.
+const SPAWN_QUEUE_CAPACITY: usize = 8;
+
 /// Coordinator that manages multiple BEP connections.
 ///
 /// Generic over the storage backend. Callers provide already-established
@@ -41,7 +49,8 @@ pub struct BepEngine<S: Storage> {
     device_name: String,
     shared_folders: Vec<FolderId>,
     connection_options: ConnectionOptions,
-    connections: Arc<RwLock<HashMap<DeviceId, ConnectionEntry>>>,
+    connections: Arc<RwLock<HashMap<DeviceId, Arc<ConnectionEntry>>>>,
+    spawn_tx: mpsc::Sender<PendingConnection>,
     event_tx: EventSender,
     event_rx: Option<EventReceiver>,
     /// True once take_event_receiver() has been called.
@@ -50,6 +59,65 @@ pub struct BepEngine<S: Storage> {
 
 struct ConnectionEntry {
     shutdown: CancellationToken,
+}
+
+/// A connection handed to the supervisor for spawning and reaping.
+struct PendingConnection {
+    task: Pin<Box<dyn Future<Output = ()> + Send>>,
+    device: DeviceId,
+    entry: Arc<ConnectionEntry>,
+}
+
+/// Sole spawner and reaper of connection tasks: the only place where
+/// connection-map entries are removed. Exits once the engine is dropped
+/// (spawn channel closed) and every connection task has finished.
+async fn run_supervisor(
+    mut spawn_rx: mpsc::Receiver<PendingConnection>,
+    connections: Arc<RwLock<HashMap<DeviceId, Arc<ConnectionEntry>>>>,
+) {
+    let mut join_set: JoinSet<(DeviceId, Arc<ConnectionEntry>)> = JoinSet::new();
+    // Task id → registration, so panicked tasks (which produce no output) can
+    // still have their map entry reaped.
+    let mut by_id: HashMap<tokio::task::Id, (DeviceId, Arc<ConnectionEntry>)> = HashMap::new();
+
+    loop {
+        tokio::select! {
+            req = spawn_rx.recv() => {
+                match req {
+                    Some(req) => {
+                        let reg = (req.device, req.entry.clone());
+                        let handle = join_set.spawn(async move {
+                            (req.task).await;
+                            (req.device, req.entry)
+                        });
+                        by_id.insert(handle.id(), reg);
+                    }
+                    None if join_set.is_empty() => break, // engine dropped
+                    None => {} // keep reaping until the JoinSet drains
+                }
+            }
+            done = join_set.join_next_with_id(), if !join_set.is_empty() => {
+                let (device, entry) = match done {
+                    Some(Ok((id, output))) => {
+                        by_id.remove(&id);
+                        output
+                    }
+                    Some(Err(e)) => {
+                        let Some(reg) = by_id.remove(&e.id()) else { continue };
+                        tracing::error!(remote_device = %reg.0, error = %e, "connection task panicked");
+                        reg
+                    }
+                    None => continue, // unreachable: guarded by is_empty above
+                };
+                // Remove only if the entry is still this connection — a newer
+                // connection for the same device must not be unregistered.
+                let mut conns = connections.write();
+                if conns.get(&device).is_some_and(|e| Arc::ptr_eq(e, &entry)) {
+                    conns.remove(&device);
+                }
+            }
+        }
+    }
 }
 
 impl<S: Storage> BepEngine<S> {
@@ -65,6 +133,12 @@ impl<S: Storage> BepEngine<S> {
         resolver: Arc<dyn ConflictResolver>,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let connections = Arc::new(RwLock::new(HashMap::new()));
+        let (spawn_tx, spawn_rx) = mpsc::channel(SPAWN_QUEUE_CAPACITY);
+        // The JoinHandle is dropped: dropping a handle never kills or leaks a
+        // task — the supervisor runs until every `spawn_tx` sender is dropped
+        // (i.e. the engine is gone) and its JoinSet has drained, then exits.
+        tokio::spawn(run_supervisor(spawn_rx, connections.clone()));
         Self {
             storage: Arc::new(storage),
             resolver,
@@ -72,7 +146,8 @@ impl<S: Storage> BepEngine<S> {
             device_name,
             shared_folders,
             connection_options: ConnectionOptions::default(),
-            connections: Arc::new(RwLock::new(HashMap::new())),
+            connections,
+            spawn_tx,
             event_tx,
             event_rx: Some(event_rx),
             has_event_listener: false,
@@ -179,28 +254,29 @@ impl<S: Storage> BepEngine<S> {
         let connections = self.connections.clone();
         let rd = remote_device;
 
-        // Track this connection.
+        // Track this connection. A duplicate DeviceId replaces the old entry and
+        // cancels its shutdown token so the displaced connection terminates.
+        let entry = Arc::new(ConnectionEntry {
+            shutdown: shutdown.clone(),
+        });
         {
             let mut conns = connections.write();
-            conns.insert(
-                remote_device,
-                ConnectionEntry {
-                    shutdown: shutdown.clone(),
-                },
-            );
+            if let Some(old) = conns.insert(remote_device, entry.clone()) {
+                tracing::warn!(remote_device = %rd, "duplicate connection, replacing existing");
+                old.shutdown.cancel();
+            }
         }
 
-        // Spawn the connection task.
+        // Hand the connection to the supervisor — the sole spawner and reaper
+        // of connection tasks.
         let conn_shutdown = shutdown.clone();
-        let connections_cleanup = connections.clone();
-        let rd_cleanup = rd;
-        tokio::spawn(
+        let task = Box::pin(
             async move {
                 connection::run_connection(
                     storage,
                     resolver,
                     local_device,
-                    remote_device,
+                    rd,
                     device_name,
                     shared_folders,
                     options,
@@ -209,11 +285,26 @@ impl<S: Storage> BepEngine<S> {
                     conn_shutdown,
                 )
                 .await;
-
-                connections_cleanup.write().remove(&rd_cleanup);
             }
             .in_current_span(),
         );
+        if let Err(e) = self.spawn_tx.try_send(PendingConnection {
+            task,
+            device: rd,
+            entry: entry.clone(),
+        }) {
+            // Supervisor wedged (Full) or dead (Closed): undo our registration
+            // and fail the connection — the remote reconnects on its normal
+            // backoff.
+            tracing::warn!(remote_device = %rd, error = ?e, "connection spawn rejected");
+            let mut conns = connections.write();
+            if conns.get(&rd).is_some_and(|e| Arc::ptr_eq(e, &entry)) {
+                conns.remove(&rd);
+            }
+            return Err(BepError::Internal(
+                "connection supervisor unavailable".into(),
+            ));
+        }
 
         // Spawn a task to emit the disconnect event when the connection closes.
         let event_tx = self.event_tx.clone();
@@ -260,18 +351,80 @@ impl<S: Storage> BepEngine<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{BackupResolver, LOCAL_DEV, MemoryStorage};
+    use crate::test_utils::{BackupResolver, LOCAL_DEV, MemoryStorage, REMOTE_DEV};
 
-    #[tokio::test]
-    async fn engine_creation() {
-        let storage = MemoryStorage::new();
-        let engine = BepEngine::new(
-            storage,
+    fn test_engine() -> BepEngine<MemoryStorage> {
+        BepEngine::new(
+            MemoryStorage::new(),
             LOCAL_DEV,
             "test".into(),
             vec!["folder1".into()],
             Arc::new(BackupResolver),
-        );
+        )
+    }
+
+    /// Reaping goes through the supervisor task, so map removal trails task
+    /// exit by a scheduling hop; poll until the supervisor has caught up.
+    /// Bounded by wall-clock time so a broken supervisor fails the test
+    /// instead of hanging it (neither the stock harness nor `#[tokio::test]`
+    /// has a per-test timeout).
+    async fn wait_until(what: &str, timeout: Duration, cond: impl Fn() -> bool) {
+        tokio::time::timeout(timeout, async {
+            while !cond() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+    }
+
+    #[tokio::test]
+    async fn engine_creation() {
+        let engine = test_engine();
         assert!(engine.peers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn closed_connection_is_untracked() {
+        let engine = test_engine();
+        let (stream, _peer) = tokio::io::duplex(1024);
+        let h = engine.connect(stream, REMOTE_DEV).await.unwrap();
+        assert_eq!(engine.peers(), vec![REMOTE_DEV]);
+
+        h.shutdown.cancel();
+        let _ = h.closed.await;
+        wait_until("peer to be untracked", Duration::from_secs(5), || {
+            engine.peers().is_empty()
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_device_connection_cancels_old_and_keeps_new_tracked() {
+        let engine = test_engine();
+
+        let (stream1, _peer1) = tokio::io::duplex(1024);
+        let h1 = engine.connect(stream1, REMOTE_DEV).await.unwrap();
+        let (stream2, _peer2) = tokio::io::duplex(1024);
+        let h2 = engine.connect(stream2, REMOTE_DEV).await.unwrap();
+
+        // The displaced connection is cancelled; the new one stays tracked.
+        assert!(h1.shutdown.is_cancelled());
+        assert!(!h2.shutdown.is_cancelled());
+        let _ = h1.closed.await;
+        // Reaping the old connection must not remove the new one's entry.
+        wait_until(
+            "new connection to stay tracked",
+            Duration::from_secs(5),
+            || engine.peers() == vec![REMOTE_DEV],
+        )
+        .await;
+
+        h2.shutdown.cancel();
+        let _ = h2.closed.await;
+        wait_until("peer to be untracked", Duration::from_secs(5), || {
+            engine.peers().is_empty()
+        })
+        .await;
     }
 }
