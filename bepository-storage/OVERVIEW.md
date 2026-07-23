@@ -146,7 +146,9 @@ Provides a virtual filesystem interface:
   prefix.
 - **Reading files:** Point-lookups file metadata.
 - **Reading bytes:** Walks block lists, fetching blocks by resolving via the
-  stored `blockseq` (or inline data).
+  stored `blockseq` (or inline data). That resolution has a single definition
+  (`block_read.rs`), shared with `FolderStore::read_block` and validated against
+  every committed block by fsck.
 
 ## SlateDB configuration
 

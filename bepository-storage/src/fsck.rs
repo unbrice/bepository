@@ -207,6 +207,7 @@ impl<F: for<'a> Fn(&'a [u8]) -> Option<&'a str>> DirGroupIter<F> {
 
 async fn collect_expected_blocks(
     db: &slatedb::Db,
+    level: FsckLevel,
     file_kvs: &[slatedb::KeyValue],
     errors: &mut Vec<String>,
 ) -> Result<HashSet<[u8; 32]>, StorageError> {
@@ -238,6 +239,36 @@ async fn collect_expected_blocks(
                 continue;
             }
             let hash: [u8; 32] = block.hash.as_slice().try_into().unwrap();
+
+            // Validate the exact path the readers use (inline data, then
+            // blockseq → bd); the mb/mr legs checked elsewhere serve dedup.
+            match crate::block_read::resolve_block_data(db, &block).await {
+                Err(e) => errors.push(format!(
+                    "Block {} of file {name} fails reader-path resolution: {e}",
+                    hex::encode(hash)
+                )),
+                Ok(None) => errors.push(format!(
+                    "Block {} of file {name} not resolvable via the reader path (inline data or blockseq)",
+                    hex::encode(hash)
+                )),
+                Ok(Some(data)) if level == FsckLevel::Full => {
+                    let computed = Sha256::digest(&data);
+                    if computed[..] != hash[..] {
+                        errors.push(format!(
+                            "Data checksum mismatch for block {} of file {name}",
+                            hex::encode(hash)
+                        ));
+                    }
+                }
+                Ok(Some(_)) => {}
+            }
+
+            // Inline blocks live entirely in the mn entry; they have no mb
+            // pointer or mr reverse ref by design.
+            if block.inline_data.is_some() {
+                continue;
+            }
+
             expected.insert(hash);
 
             let rev_key = store_keys::block_reverse_key(&hash, &name);
@@ -343,7 +374,7 @@ async fn check_directory_blocks(
         let file_kvs = files.take_dir(&dir).await?;
         let block_kvs = blocks.take_dir(&dir).await?;
 
-        let mut expected = collect_expected_blocks(db, &file_kvs, errors).await?;
+        let mut expected = collect_expected_blocks(db, level, &file_kvs, errors).await?;
         check_block_entries(db, &dir, level, &mut expected, &block_kvs, errors).await?;
 
         for missing in &expected {
@@ -417,6 +448,7 @@ mod tests {
                 offset: 0,
                 size: 4,
                 hash: vec![0u8; 32],
+                blockseq: Some(store_keys::MIN_BLOCK_SEQ),
                 ..Default::default()
             }],
             ..Default::default()
@@ -542,6 +574,7 @@ mod tests {
                 offset: 0,
                 size: 4,
                 hash: hash.to_vec(),
+                blockseq: Some(store_keys::MIN_BLOCK_SEQ),
                 ..Default::default()
             }],
             ..Default::default()
@@ -711,6 +744,146 @@ mod tests {
         assert!(
             errors.is_empty(),
             "Expected no errors for deleted file, got: {errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_folder_integrity_reader_path_divergence() {
+        // The mb/mr legs are intact, but the FileInfo blockseq the readers
+        // actually resolve through dangles — fsck must flag the reader path.
+        let store = test_store().await;
+
+        let hash = [7u8; 32];
+        let file_info = crate::proto::storage::FileInfo {
+            name: "dir1/file1".to_string(),
+            sequence: 1,
+            blocks: vec![crate::proto::storage::BlockInfo {
+                offset: 0,
+                size: 4,
+                hash: hash.to_vec(),
+                // Points at a seqno with no bd entry; the mb leg below is valid.
+                blockseq: Some(store_keys::MIN_BLOCK_SEQ + 1),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let file = File {
+            file_info: Some(file_info.clone()),
+        };
+        store
+            .db
+            .put(store_keys::file_key(&file_info.name), file.encode_to_vec())
+            .await
+            .unwrap();
+        store
+            .db
+            .put(store_keys::seq_key(1).unwrap(), file_info.name.as_bytes())
+            .await
+            .unwrap();
+        helper_put_block(&store, "dir1", &hash, b"data", store_keys::MIN_BLOCK_SEQ).await;
+        store
+            .db
+            .put(store_keys::block_reverse_key(&hash, &file_info.name), b"")
+            .await
+            .unwrap();
+
+        let errors = check_folder_integrity(&store, FsckLevel::Structural)
+            .await
+            .unwrap();
+        assert!(
+            errors.iter().any(|e| e.contains("not resolvable")),
+            "Expected a reader-path resolution error, got: {errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_folder_integrity_inline_blocks_not_flagged() {
+        // Inline blocks live in the mn entry and write no mb/mr keys — fsck
+        // must not demand them.
+        let store = test_store().await;
+
+        let data = b"small";
+        let hash: [u8; 32] = Sha256::digest(data).into();
+        let file_info = crate::proto::storage::FileInfo {
+            name: "file1".to_string(),
+            sequence: 1,
+            blocks: vec![crate::proto::storage::BlockInfo {
+                offset: 0,
+                size: 5,
+                hash: hash.to_vec(),
+                inline_data: Some(data.to_vec()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let file = File {
+            file_info: Some(file_info.clone()),
+        };
+        store
+            .db
+            .put(store_keys::file_key(&file_info.name), file.encode_to_vec())
+            .await
+            .unwrap();
+        store
+            .db
+            .put(store_keys::seq_key(1).unwrap(), file_info.name.as_bytes())
+            .await
+            .unwrap();
+
+        for level in [FsckLevel::Structural, FsckLevel::Full] {
+            let errors = check_folder_integrity(&store, level).await.unwrap();
+            assert!(
+                errors.is_empty(),
+                "Expected no errors at {level:?}, got: {errors:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_check_folder_integrity_inline_data_corruption() {
+        // Corrupt inline data is caught at Full by re-hashing it in place.
+        let store = test_store().await;
+
+        let file_info = crate::proto::storage::FileInfo {
+            name: "file1".to_string(),
+            sequence: 1,
+            blocks: vec![crate::proto::storage::BlockInfo {
+                offset: 0,
+                size: 5,
+                hash: vec![0u8; 32],
+                inline_data: Some(b"small".to_vec()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let file = File {
+            file_info: Some(file_info.clone()),
+        };
+        store
+            .db
+            .put(store_keys::file_key(&file_info.name), file.encode_to_vec())
+            .await
+            .unwrap();
+        store
+            .db
+            .put(store_keys::seq_key(1).unwrap(), file_info.name.as_bytes())
+            .await
+            .unwrap();
+
+        let errors = check_folder_integrity(&store, FsckLevel::Structural)
+            .await
+            .unwrap();
+        assert!(errors.is_empty(), "Structural should pass: {errors:?}");
+
+        let errors = check_folder_integrity(&store, FsckLevel::Full)
+            .await
+            .unwrap();
+        assert!(
+            errors.iter().any(|e| e.contains("Data checksum mismatch")),
+            "Expected a checksum mismatch at Full, got: {errors:?}"
         );
     }
 }

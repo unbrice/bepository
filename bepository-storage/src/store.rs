@@ -809,16 +809,11 @@ impl FolderStore {
                 .map_err(|e| StorageError::Corruption(format!("decode File: {e}")))?;
             if let Some(fi) = file_wrapper.file_info {
                 for block in fi.blocks {
-                    if block.hash == hash {
-                        if let Some(inline_data) = block.inline_data {
-                            return Ok(Bytes::from(inline_data));
-                        } else if let Some(seq) = block.blockseq {
-                            store_keys::validate_block_seq(seq)?;
-                            let data_key = store_keys::block_data_seq_key(seq);
-                            if let Some(data) = self.db.get(&data_key).await.map_err(slate_err)? {
-                                return Ok(data);
-                            }
-                        }
+                    if block.hash == hash
+                        && let Some(data) =
+                            crate::block_read::resolve_block_data(&self.db, &block).await?
+                    {
+                        return Ok(data);
                     }
                 }
             }
