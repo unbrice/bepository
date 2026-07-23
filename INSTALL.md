@@ -6,6 +6,18 @@ Installing and configuring `bepository` is a 3-step process:
 2. Install the binary.
 3. Configure Syncthing.
 
+## Contents
+
+- [Step 1: Storage and Credentials](#step-1-storage-and-credentials) —
+  [Storage URI](#storage-uri) · [Credentials](#credentials) ·
+  [Credential files under systemd](#credential-files-under-systemd-loadcredential)
+  · [Cache](#optional-configure-cache)
+- [Step 2: Install the Service](#step-2-install-the-service) —
+  [Native binary](#native-binary-recommended) · [NixOS](#nixos) ·
+  [Build from source](#build-from-source)
+- [Step 3: Syncthing Integration](#step-3-syncthing-integration)
+- [Verify & Troubleshoot](#verify--troubleshoot)
+
 ---
 
 ## Step 1: Storage and Credentials
@@ -29,57 +41,61 @@ The `BEPOSITORY_STORAGE_URI` defines where to store data. Non-secret config
 ### Credentials
 
 Credentials live in `/etc/bepository/env`, which the service reads (but cannot
-write to).
+write to). `install-service` (Step 2) creates this file from an annotated
+example if it doesn't exist yet — create it manually now only if you want
+credentials in place beforehand.
 
-| Backend | Variable                         | Notes                                                                                                |
-| ------- | -------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| AWS     | `AWS_ACCESS_KEY_ID`              | Your AWS access key ID                                                                               |
-| AWS     | `AWS_SECRET_ACCESS_KEY`          | Your AWS secret access key                                                                           |
-| AWS     | `AWS_SESSION_TOKEN`              | Optional: AWS session token                                                                          |
-| GCS     | `GOOGLE_APPLICATION_CREDENTIALS` | Path to a service-account JSON key (recommended; place it at `/etc/bepository/sa-key.json` and 0600) |
-| GCS     | `CLOUDSDK_AUTH_ACCESS_TOKEN`     | Short-lived bearer token (`gcloud auth print-access-token`)                                          |
-| SFTP    | *(URI only)*                     | Key auth: append `?key=/etc/bepository/id_ed25519` to the URI                                        |
+| Backend | Variable                         | Notes                                                                                                                        |
+| ------- | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| AWS     | `AWS_ACCESS_KEY_ID`              | Your AWS access key ID                                                                                                       |
+| AWS     | `AWS_SECRET_ACCESS_KEY`          | Your AWS secret access key                                                                                                   |
+| AWS     | `AWS_SESSION_TOKEN`              | Optional: AWS session token                                                                                                  |
+| GCS     | `GOOGLE_APPLICATION_CREDENTIALS` | Path to a service-account JSON key (recommended) — under systemd see [below](#credential-files-under-systemd-loadcredential) |
+| GCS     | `CLOUDSDK_AUTH_ACCESS_TOKEN`     | Short-lived bearer token (`gcloud auth print-access-token`)                                                                  |
+| SFTP    | *(URI only)*                     | Key auth: append `?key=…` to the URI — under systemd see [below](#credential-files-under-systemd-loadcredential)             |
 
-For GCS with a service-account key, drop it in place and reference it from the
-env file:
+For GCS with a service-account key, drop it in place:
 
 ```sh
 sudo install -m 600 /path/to/sa-key.json /etc/bepository/sa-key.json
-# then add to /etc/bepository/env:
-#   GOOGLE_APPLICATION_CREDENTIALS=/etc/bepository/sa-key.json
 ```
 
 > [!WARNING]
-> **Credential files opened by path need `LoadCredential`.** The service runs
-> under `DynamicUser=yes` (a fresh, unprivileged UID per boot), so even a `0600`
-> key owned by `root` is **not readable** by the process. (`EnvironmentFile`
-> works because systemd reads *it* as root; but a file the process opens itself
-> — like `GOOGLE_APPLICATION_CREDENTIALS` or an SFTP `?key=…` — is opened as the
-> dynamic user and gets `Permission denied`.) Inline env values (`AWS_*`,
-> `CLOUDSDK_AUTH_ACCESS_TOKEN`) are unaffected.
->
-> Hand the key to systemd instead, which reads it as root at start and
-> re-exposes it owned by the dynamic user. Add a drop-in:
->
-> ```sh
-> sudo systemctl edit bepository
-> # In the editor, add:
-> #   [Service]
-> #   LoadCredential=sa-key.json:/etc/bepository/sa-key.json
-> ```
->
-> then point the env file at the credential path:
->
-> ```sh
-> # in /etc/bepository/env:
-> GOOGLE_APPLICATION_CREDENTIALS=/run/credentials/bepository.service/sa-key.json
-> ```
->
-> The same applies to an SFTP key:
-> `LoadCredential=id_ed25519:/etc/bepository/id_ed25519` and
-> `?key=/run/credentials/bepository.service/id_ed25519` in the storage URI.
-> NixOS users, see the [NixOS section](#nixos) below — the module wires
-> `LoadCredential` via `systemd.services.bepository.serviceConfig`.
+> A root-owned `0600` key file is **not readable** by the service, which runs
+> under `DynamicUser=yes`. Credential files opened by path must be handed to
+> systemd — see
+> [Credential files under systemd](#credential-files-under-systemd-loadcredential).
+> Inline env values (`AWS_*`, `CLOUDSDK_AUTH_ACCESS_TOKEN`) are unaffected.
+
+### Credential files under systemd (LoadCredential)
+
+The service runs under `DynamicUser=yes` (a fresh, unprivileged UID per boot).
+`EnvironmentFile` works because systemd reads *it* as root, but a file the
+process opens itself — like `GOOGLE_APPLICATION_CREDENTIALS` or an SFTP `?key=…`
+— is opened as the dynamic user and gets `Permission denied`.
+
+Hand the key to systemd instead: it reads the file as root at start and
+re-exposes it owned by the dynamic user. Add a drop-in:
+
+```sh
+sudo systemctl edit bepository
+# In the editor, add:
+#   [Service]
+#   LoadCredential=sa-key.json:/etc/bepository/sa-key.json
+```
+
+then point the env file at the credential path systemd exposes:
+
+```sh
+# in /etc/bepository/env:
+GOOGLE_APPLICATION_CREDENTIALS=/run/credentials/bepository.service/sa-key.json
+```
+
+The same applies to an SFTP key:
+`LoadCredential=id_ed25519:/etc/bepository/id_ed25519` and
+`?key=/run/credentials/bepository.service/id_ed25519` in the storage URI. NixOS
+users, see the [NixOS section](#nixos) below — the module wires `LoadCredential`
+via `systemd.services.bepository.serviceConfig`.
 
 ### Optional: Configure Cache
 
@@ -101,15 +117,7 @@ ad-hoc commands, pass `--no-cache`, or override the directory with
 
 ## Step 2: Install the Service
 
-To try `bepository` without committing to a system service, run it directly in a
-terminal (uses an ephemeral in-memory store; substitute a real URI to persist):
-
-```sh
-BEPOSITORY_STORAGE_URI=memory:// BEPOSITORY_MASTER_DEVICE_ID=<your-syncthing-id> \
-  bepository serve
-```
-
-For a permanent install, choose the method that best fits your environment.
+Choose the installation method that best fits your environment.
 
 ### Decision Table
 
@@ -120,6 +128,9 @@ For a permanent install, choose the method that best fits your environment.
 | **Build from source** | Developers / non-Linux | Requires Rust stable and `protoc`.                                         |
 
 ### Native binary (Recommended)
+
+Prebuilt static binaries (musl) are published for **x86_64** and **aarch64**
+Linux only — on other architectures, [build from source](#build-from-source).
 
 ```sh
 # 1. Download the static binary for your architecture
@@ -262,7 +273,9 @@ just release-cli        # optimised build in target/release/bepository
 `serve` initializes storage automatically on first startup (generating the TLS
 identity that defines bepository's Device ID), so there is no separate `init`
 step for the native and NixOS installs. You just need the Device ID to pair with
-Syncthing.
+Syncthing. The master's device ID is normally set via
+`BEPOSITORY_MASTER_DEVICE_ID` in the env file; for one-off runs you can pass it
+positionally instead: `bepository serve <MASTER_DEVICE_ID>`.
 
 ### 1. Get bepository's Device ID
 
@@ -286,7 +299,9 @@ sudo bepository get-id
 2. In your master Syncthing web UI, go to **Add Remote Device** and paste the
    ID.
 3. Set the address to `tcp://127.0.0.1:22001` (match `BEPOSITORY_LISTEN`, and
-   the host if running remotely).
+   the host if running remotely). The installed config pins `127.0.0.1:22001`;
+   the binary default is an ephemeral loopback port (`127.0.0.1:0`), with the
+   bound address printed at startup as `Listening on: …`.
 4. Share folders with the new device. Syncthing will connect, exchange indexes,
    and start syncing with cold storage. If multiple bepository instances share
    cold storage, only one will be active at a time.
