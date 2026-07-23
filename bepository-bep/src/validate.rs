@@ -80,7 +80,6 @@ mod tests {
             offset,
             size,
             hash: vec![0; 32],
-            ..Default::default()
         }
     }
 
