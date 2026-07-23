@@ -163,7 +163,9 @@ impl<S: Storage> BepEngine<S> {
     ///
     /// The receiver yields [`EngineEvent`]s including device acceptance
     /// requests and disconnection notifications. If no receiver is taken,
-    /// all devices are accepted automatically.
+    /// all devices are accepted automatically and no events are emitted.
+    /// Events are best-effort: a full channel rejects new connections and
+    /// drops disconnect notifications rather than blocking.
     pub fn take_event_receiver(&mut self) -> Option<EventReceiver> {
         self.event_rx
             .take()
@@ -224,13 +226,17 @@ impl<S: Storage> BepEngine<S> {
         // Ask the event handler for permission (if one is listening).
         if self.has_event_listener {
             let (accept_tx, accept_rx) = oneshot::channel();
-            let _ = self
-                .event_tx
-                .send(EngineEvent::DeviceConnecting {
-                    device: remote_device,
-                    respond: accept_tx,
-                })
-                .await;
+            // Non-blocking: a full channel means the listener is stalled.
+            // Reject immediately — a blocking send would wedge every new
+            // connection behind the stalled listener (ACCEPT_TIMEOUT only
+            // covers the reply wait, which starts after the send).
+            if let Err(e) = self.event_tx.try_send(EngineEvent::DeviceConnecting {
+                device: remote_device,
+                respond: accept_tx,
+            }) {
+                tracing::warn!(remote_device = %remote_device, error = %e, "event channel unavailable, rejecting connection");
+                return Err(BepError::DeviceRejected);
+            }
 
             let accepted = tokio::time::timeout(ACCEPT_TIMEOUT, accept_rx)
                 .await
@@ -306,33 +312,34 @@ impl<S: Storage> BepEngine<S> {
             ));
         }
 
-        // Spawn a task to emit the disconnect event when the connection closes.
-        let event_tx = self.event_tx.clone();
+        // Spawn a task to forward the close to the user handle and emit the
+        // disconnect event. The event is best-effort: skipped entirely when no
+        // listener was ever taken, dropped (not blocked on) when the channel
+        // is full — a stalled listener must not wedge this detached task.
+        let event_tx = self.has_event_listener.then(|| self.event_tx.clone());
         let rd_disconnect = rd;
         let (close_tx_user, close_rx_user) = oneshot::channel();
         tokio::spawn(
             async move {
-                match close_rx.await {
-                    Ok(reason) => {
-                        let event_reason = reason.clone();
-                        let _ = event_tx
-                            .send(EngineEvent::DeviceDisconnected {
-                                device: rd_disconnect,
-                                reason: event_reason,
-                            })
-                            .await;
-                        let _ = close_tx_user.send(reason);
-                    }
-                    Err(_) => {
-                        let _ = event_tx
-                            .send(EngineEvent::DeviceDisconnected {
-                                device: rd_disconnect,
-                                reason: CloseReason::Error(BepError::NetworkError(
-                                    "connection task dropped".into(),
-                                )),
-                            })
-                            .await;
-                    }
+                let (reason, user_reason) = match close_rx.await {
+                    Ok(reason) => (reason.clone(), Some(reason)),
+                    Err(_) => (
+                        CloseReason::Error(BepError::NetworkError(
+                            "connection task dropped".into(),
+                        )),
+                        None,
+                    ),
+                };
+                if let Some(event_tx) = event_tx
+                    && let Err(e) = event_tx.try_send(EngineEvent::DeviceDisconnected {
+                        device: rd_disconnect,
+                        reason,
+                    })
+                {
+                    tracing::warn!(remote_device = %rd_disconnect, error = %e, "disconnect event dropped");
+                }
+                if let Some(user_reason) = user_reason {
+                    let _ = close_tx_user.send(user_reason);
                 }
             }
             .in_current_span(),
@@ -426,5 +433,77 @@ mod tests {
             engine.peers().is_empty()
         })
         .await;
+    }
+
+    /// Fill the engine's event channel with filler disconnect events.
+    fn fill_event_channel<S: Storage>(engine: &BepEngine<S>) {
+        for _ in 0..EVENT_CHANNEL_CAPACITY {
+            engine
+                .event_tx
+                .try_send(EngineEvent::DeviceDisconnected {
+                    device: REMOTE_DEV,
+                    reason: CloseReason::Error(BepError::Internal("filler".into())),
+                })
+                .expect("channel should accept filler events");
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_event_listener_rejects_connections_fast() {
+        let mut engine = test_engine();
+        // Listener taken but never drained; channel full.
+        let _events = engine.take_event_receiver().unwrap();
+        fill_event_channel(&engine);
+
+        let (stream, _peer) = tokio::io::duplex(1024);
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), engine.connect(stream, REMOTE_DEV)).await;
+        assert!(
+            matches!(result, Ok(Err(BepError::DeviceRejected))),
+            "expected fast DeviceRejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_event_channel_without_listener_does_not_wedge_close() {
+        // No listener ever taken: the receiver lives inside the engine, so the
+        // channel stays open and fills up. Closing a connection must still
+        // deliver `closed` to the user handle.
+        let engine = test_engine();
+        fill_event_channel(&engine);
+
+        let (stream, _peer) = tokio::io::duplex(1024);
+        let h = engine.connect(stream, REMOTE_DEV).await.unwrap();
+        h.shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), h.closed)
+            .await
+            .expect("close wedged behind a full event channel")
+            .ok();
+    }
+
+    #[tokio::test]
+    async fn stalled_listener_drops_disconnect_event_but_delivers_close() {
+        let mut engine = test_engine();
+        let mut events = engine.take_event_receiver().unwrap();
+        let engine = Arc::new(engine);
+
+        // Accept one connection normally.
+        let (stream, _peer) = tokio::io::duplex(1024);
+        let connectee = engine.clone();
+        let connect = tokio::spawn(async move { connectee.connect(stream, REMOTE_DEV).await });
+        match events.recv().await {
+            Some(EngineEvent::DeviceConnecting { respond, .. }) => respond.send(true).unwrap(),
+            other => panic!("expected DeviceConnecting, got {other:?}"),
+        }
+        let h = connect.await.unwrap().unwrap();
+
+        // Stall the listener, then close: the disconnect event is dropped, but
+        // the close notification must still reach the user handle.
+        fill_event_channel(&engine);
+        h.shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), h.closed)
+            .await
+            .expect("close wedged behind stalled listener")
+            .ok();
     }
 }

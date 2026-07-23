@@ -52,9 +52,9 @@ abstraction. Networking and TLS are provided by the caller.
   in memory. Promotion to pending happens as slots free.
 - **Atomic Promotion**: `complete_file` is only called when no pending or
   deferred requests remain for a file, ensuring data integrity.
-- **Event Capacity**: The engine event channel (64 slots) must be drained
-  promptly; `DeviceConnecting` events apply backpressure; a stalled listener
-  wedges new connections.
+- **Event Capacity**: Event sends never block. A full 64-slot channel rejects
+  new connections (`DeviceConnecting` overflow) and drops `DeviceDisconnected`
+  notifications; disconnect events are only emitted once a listener is taken.
 - **Connection Registry**: A single supervisor task owns connection tasks and
   alone removes registry entries (on task reap, identity-checked). A duplicate
   `DeviceId` connection cancels and replaces the displaced one.
