@@ -294,30 +294,21 @@ Acceptance: a test that constructs the "pointer survives, data dropped"
 interleaving and shows it cannot occur, then remove the check and re-measure
 dedup throughput.
 
-### Skip refetching blocks already present in the prior version of a file
+### Skip re-checking blocks carried from the prior version of a file
 
-When the master sends an updated `FileInfo` for a name already tracked, the
-inbox / commit path currently treats every block on the new block list as
-something that *may* need to be fetched from the master and re-stored. For each
-block whose `(hash, offset, size)` triple appears unchanged between the old `mn`
-entry and the incoming one, we should:
+The commit path carries block pointers (`blockseq`/`inline_data`) forward from
+the prior same-name `mn` entry for blocks with unchanged hashes
+(`carry_block_pointers` in `store.rs`, called by `commit_with_new_seq`). This
+was a correctness fix — metadata-only commits and conflict resolutions otherwise
+orphaned the block data — and as a side effect unchanged blocks keep their
+compaction-stable seqno and are never re-stored.
 
-1. skip the network fetch entirely,
-2. reuse the existing `BlockInfo` (carrying its `blockseq` for separated blocks
-   or its inline `bytes` for inline blocks) directly in the new `mn` entry, and
-3. skip emitting a fresh `mr` reverse ref since the existing one already covers
-   this name.
-
-This is per-file dedup-by-prior-version, distinct from the cross-file cross-dir
-dedup that `reuse_block` already does via the `mb<dir>/<hash>` lookup. The
-seqno-keyed layout makes it especially cheap: the prior `BlockInfo.blockseq` is
-compaction-stable and the pointed-at `bd<seq>` row is guaranteed live by virtue
-of the old `mn` entry still referencing it.
-
-Lives in the commit path (likely `bepository-bep` / inbox machinery), not in the
-storage crate. Acceptance: a test that commits version v1 of a file, then
-commits v2 sharing N of v1's blocks, and asserts no network fetches for those N
-blocks (and no `bd<new_seq>` rows allocated for them).
+What remains is engine-side: after a content-changing update the engine still
+calls `reuse_block` for every block, paying a `find_block_dir` reverse-ref scan
+plus an `mn` rewrite per block to re-link a pointer the commit carried anyway.
+Teaching the engine to skip blocks whose hash is unchanged from the prior
+version is a pure performance optimization (no network fetch happens today —
+`reuse_block` already suppresses it).
 
 ### Compaction scheduler
 

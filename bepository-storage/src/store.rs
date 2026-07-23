@@ -151,8 +151,9 @@ pub(crate) struct FolderStore {
     pub(crate) db: Db,
     pub(crate) gc: Arc<CompactionState>,
     /// Per-name async lock pool. Witnessed by `LockedFileName`.
-    /// Protects `stage_file`/`complete_file`/`put_file`, but `store_block`
-    /// and `reuse_block` currently mutate `mi`/`mn` outside this lock.
+    /// Protects `stage_file`/`complete_file`/`put_file`/`put_file_with_carry`,
+    /// but `store_block` and `reuse_block` currently mutate `mi`/`mn` outside
+    /// this lock.
     /// Compaction may drop dead entries outside this lock; see
     /// `compaction.rs`.
     name_locks: LockPool<String>,
@@ -250,6 +251,17 @@ impl FolderStore {
     // --- File index (n/ and s/ keys) ---
 
     pub async fn get_file(&self, name: &str) -> Result<Option<FileInfo>, StorageError> {
+        match self.get_file_proto(name).await? {
+            Some(fi) => Ok(Some(fi.try_into()?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Read the raw stored `FileInfo` (block pointers included) for `name`.
+    async fn get_file_proto(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::proto::storage::FileInfo>, StorageError> {
         let key = store_keys::file_key(name);
         match self.db.get(key).await.map_err(slate_err)? {
             Some(bytes) => {
@@ -258,7 +270,7 @@ impl FolderStore {
                 let fi = file.file_info.ok_or_else(|| {
                     StorageError::Corruption(format!("missing file_info in File for {name}"))
                 })?;
-                Ok(Some(fi.try_into()?))
+                Ok(Some(fi))
             }
             None => Ok(None),
         }
@@ -271,6 +283,12 @@ impl FolderStore {
     /// fn is the sole writer of `file_key`/`seq_key`. Compaction may drop
     /// dead entries concurrently; memtable writes win on reads.
     ///
+    /// Block pointers (`blockseq`/`inline_data`) are carried forward from the
+    /// prior committed entry for blocks with matching hashes: wire
+    /// `FileInfo`s have no pointer fields, so without this every
+    /// metadata-only commit or conflict resolution would orphan the block
+    /// data, leaving it unreadable and GC-eligible.
+    ///
     /// INVARIANT: must remain the sole writer of `file_key`/`seq_key` in
     /// this module.
     async fn commit_with_new_seq(
@@ -281,12 +299,14 @@ impl FolderStore {
     ) -> Result<(i64, FileInfo), StorageError> {
         let name = locked_filename.name();
 
-        // Remove old sequence entry if file already exists.
+        // Carry block pointers from, and remove the old sequence entry of,
+        // the prior committed version (if any).
         // Safe outside seq_lock — see function doc.
-        if let Some(old) = self.get_file(name).await?
-            && old.sequence > 0
-        {
-            batch.delete(store_keys::seq_key(old.sequence)?);
+        if let Some(old) = self.get_file_proto(name).await? {
+            carry_block_pointers(&mut stored, &old);
+            if old.sequence > 0 {
+                batch.delete(store_keys::seq_key(old.sequence)?);
+            }
         }
 
         let _guard = self.seq_lock.lock().await;
@@ -319,6 +339,37 @@ impl FolderStore {
         let locked_filename = self.lock_filename(&file.name).await;
         let (seq, _) = self
             .commit_with_new_seq(&locked_filename, file.clone().into(), WriteBatch::new())
+            .await?;
+        Ok(seq)
+    }
+
+    /// Commit `file` at its name, additionally carrying block pointers from
+    /// the committed entry at `carry_from` (a *different* name, e.g. the
+    /// original path of a conflict-copy loser).
+    ///
+    /// Writes `mr` reverse refs for the carried separated blocks so the copy
+    /// doesn't introduce fsck "missing reverse reference" findings. With no
+    /// committed entry at `carry_from`, behaves like [`put_file`](Self::put_file).
+    pub async fn put_file_with_carry(
+        &self,
+        file: &FileInfo,
+        carry_from: &str,
+    ) -> Result<i64, StorageError> {
+        let mut stored: crate::proto::storage::FileInfo = file.clone().into();
+        let mut batch = WriteBatch::new();
+        if let Some(src) = self.get_file_proto(carry_from).await? {
+            carry_block_pointers(&mut stored, &src);
+            for block in &stored.blocks {
+                if block.blockseq.is_some()
+                    && let Ok(hash) = block.hash.as_slice().try_into()
+                {
+                    batch.put(store_keys::block_reverse_key(hash, &file.name), []);
+                }
+            }
+        }
+        let locked_filename = self.lock_filename(&file.name).await;
+        let (seq, _) = self
+            .commit_with_new_seq(&locked_filename, stored, batch)
             .await?;
         Ok(seq)
     }
@@ -870,6 +921,32 @@ pub(crate) fn slate_err(e: slatedb::Error) -> StorageError {
         ErrorKind::Data => StorageError::Corruption(format!("slatedb data error: {e}")),
         ErrorKind::Invalid => StorageError::InvalidInput(format!("slatedb invalid: {e}")),
         _ => StorageError::TransientIo(format!("slatedb: {e}")),
+    }
+}
+
+/// Copy block pointers (`blockseq`/`inline_data`) from `old` into `new` for
+/// blocks that carry no pointer yet, matched by hash.
+///
+/// Hash match alone is sufficient: blocks are content-addressed, so equal
+/// hashes imply identical content (and size).
+fn carry_block_pointers(
+    new: &mut crate::proto::storage::FileInfo,
+    old: &crate::proto::storage::FileInfo,
+) {
+    let mut by_hash: HashMap<&[u8], &crate::proto::storage::BlockInfo> = HashMap::new();
+    for block in &old.blocks {
+        if block.blockseq.is_some() || block.inline_data.is_some() {
+            by_hash.entry(&block.hash).or_insert(block);
+        }
+    }
+    for block in &mut new.blocks {
+        if block.blockseq.is_none()
+            && block.inline_data.is_none()
+            && let Some(src) = by_hash.get(block.hash.as_slice())
+        {
+            block.blockseq = src.blockseq;
+            block.inline_data = src.inline_data.clone();
+        }
     }
 }
 
