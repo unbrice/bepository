@@ -35,6 +35,7 @@ use uuid::Uuid;
 /// The local version is noted but not backed up — the remote host retains it.
 struct TheirsResolver;
 
+mod envfile;
 #[cfg(feature = "self-manage")]
 mod service;
 #[cfg(feature = "self-manage")]
@@ -206,7 +207,9 @@ enum Commands {
     /// Install the systemd service unit (and upgrade timer, unless
     /// `--no-auto-upgrade`), enable it, and seed `/etc/bepository/env`.
     ///
-    /// Requires root. Idempotent.
+    /// A `--storage-uri` passed on the command line is persisted into the env
+    /// file, and absolute credential paths in it are wired into
+    /// `LoadCredential` drop-ins. Requires root. Idempotent.
     #[cfg(feature = "self-manage")]
     InstallService {
         /// Do not install the daily self-upgrade timer.
@@ -1132,10 +1135,8 @@ fn init_tracing(trace_level: Option<String>) -> Result<()> {
 
 /// Lowest-precedence configuration layer: read `/etc/bepository/env` (or the
 /// `BEPOSITORY_ENV_FILE` override, used by tests) and set any KEY=VALUE pairs
-/// that are not already present in the process environment. Mirrors systemd's
-/// `EnvironmentFile` semantics: `KEY=VALUE` lines, `#` comments, blanks, and
-/// one surrounding pair of double-quotes stripped from the value. **No** shell
-/// expansion is performed — values are literal.
+/// that are not already present in the process environment. Parsing rules are
+/// shared with the service installer — see [`envfile`].
 ///
 /// # Safety
 ///
@@ -1165,23 +1166,16 @@ unsafe fn load_env_file() {
     };
     for raw in contents.lines() {
         let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
+        if !line.is_empty() && !line.starts_with('#') && !line.contains('=') {
             eprintln!("bepository: ignoring malformed env line in {path}: {raw}");
-            continue;
-        };
+        }
+    }
+    for (key, value) in envfile::parse_env_lines(&contents) {
         // Existing process env wins — never override. systemd EnvironmentFile is
         // similarly the lowest layer.
         if std::env::var_os(key).is_some() {
             continue;
         }
-        // Strip one surrounding pair of double-quotes, matching systemd semantics.
-        let value = value
-            .strip_prefix('"')
-            .and_then(|v| v.strip_suffix('"'))
-            .unwrap_or(value);
         // Safety: single-threaded per the function's contract.
         unsafe { std::env::set_var(key, value) };
     }
@@ -1190,8 +1184,11 @@ unsafe fn load_env_file() {
 /// Parse the CLI. When `BEPOSITORY_PACKAGE_MANAGED` is set, the self-manage
 /// subcommands are hidden from `--help` (their handlers still refuse execution,
 /// independently — clap's `hide` only affects help text).
+///
+/// The second return value is the storage URI **only when given on the command
+/// line**, for `install-service` to persist.
 #[cfg(feature = "self-manage")]
-fn parse_cli() -> Cli {
+fn parse_cli() -> (Cli, Option<String>) {
     use clap::{CommandFactory, FromArgMatches};
     let mut cmd = Cli::command();
     if std::env::var_os("BEPOSITORY_PACKAGE_MANAGED").is_some_and(|v| !v.is_empty()) {
@@ -1205,12 +1202,27 @@ fn parse_cli() -> Cli {
         }
     }
     let matches = cmd.get_matches();
-    Cli::from_arg_matches(&matches).expect("Cli derives Parser; from_arg_matches cannot fail here")
+    let storage_uri = command_line_storage_uri(&matches);
+    let cli = Cli::from_arg_matches(&matches)
+        .expect("Cli derives Parser; from_arg_matches cannot fail here");
+    (cli, storage_uri)
+}
+
+/// The storage URI when its value source is the command line. Values sourced
+/// from the environment (`BEPOSITORY_STORAGE_URI`, or the env file loaded
+/// before parsing) must never be persisted into `/etc/bepository/env`.
+/// `storage_uri` is a global arg, so the value may sit in the subcommand's
+/// matches — walk down the tree.
+#[cfg(feature = "self-manage")]
+fn command_line_storage_uri(matches: &clap::ArgMatches) -> Option<String> {
+    std::iter::successors(Some(matches), |m| m.subcommand().map(|(_, sub)| sub))
+        .find(|m| m.value_source("storage_uri") == Some(clap::parser::ValueSource::CommandLine))
+        .and_then(|m| m.get_one::<String>("storage_uri").cloned())
 }
 
 #[cfg(not(feature = "self-manage"))]
-fn parse_cli() -> Cli {
-    Cli::parse()
+fn parse_cli() -> (Cli, Option<String>) {
+    (Cli::parse(), None)
 }
 
 fn main() -> Result<()> {
@@ -1223,7 +1235,7 @@ fn main() -> Result<()> {
 
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let cli = parse_cli();
+    let (cli, cli_storage_uri) = parse_cli();
     // Scrub the env var so child processes can't inherit it.
     // Safety: single-threaded at this point; no concurrent env reads.
     unsafe { std::env::remove_var("BEPOSITORY_DAV_PASSWORD") };
@@ -1243,7 +1255,7 @@ fn main() -> Result<()> {
         .build()
         .context("failed to create main runtime")?;
 
-    main_runtime.block_on(async_main(cli, storage_runtime_handle))
+    main_runtime.block_on(async_main(cli, cli_storage_uri, storage_runtime_handle))
 }
 
 async fn cmd_init(
@@ -1326,7 +1338,14 @@ async fn cmd_get_id(
     Ok(())
 }
 
-async fn async_main(cli: Cli, storage_runtime_handle: tokio::runtime::Handle) -> Result<()> {
+async fn async_main(
+    cli: Cli,
+    // Only read by the `InstallService` arm (self-manage builds).
+    #[cfg_attr(not(feature = "self-manage"), allow(unused_variables))] cli_storage_uri: Option<
+        String,
+    >,
+    storage_runtime_handle: tokio::runtime::Handle,
+) -> Result<()> {
     let machine_id = cli.machine_id.clone().unwrap_or_else(|| {
         machine_uid::get().unwrap_or_else(|_| {
             tracing::warn!(
@@ -1433,7 +1452,7 @@ async fn async_main(cli: Cli, storage_runtime_handle: tokio::runtime::Handle) ->
             if let Some(hint) = service::package_managed_hint() {
                 return Err(service::package_managed_error(&hint));
             }
-            service::install_service(no_auto_upgrade)?;
+            service::install_service(no_auto_upgrade, cli_storage_uri.as_deref())?;
         }
         #[cfg(feature = "self-manage")]
         Commands::UninstallService => {
@@ -1833,10 +1852,10 @@ mod tests {
         assert_eq!(run_init(&storage).await.unwrap(), id);
     }
 
-    /// Serializes env-file tests: both load_env_file and the env-file-missing
-    /// check mutate the global `BEPOSITORY_ENV_FILE` var, and cargo runs tests
-    /// on parallel threads. Holding a sync mutex across the synchronous
-    /// load_env_file (no awaits) is fine.
+    /// Serializes tests that mutate process env vars (`BEPOSITORY_ENV_FILE`,
+    /// `BEPOSITORY_STORAGE_URI`), which cargo otherwise races on parallel
+    /// threads. Holding a sync mutex across the synchronous bodies (no awaits)
+    /// is fine.
     static ENV_FILE_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// `load_env_file` sets unset vars, leaves already-set vars untouched, and
@@ -1889,7 +1908,6 @@ mod tests {
             std::env::remove_var("BEPOSITORY_ENV_FILE");
         }
     }
-
     /// `merge_object_store_opts` must lowercase `AWS_*` env keys (object_store's
     /// parser is case-sensitive and silently drops unrecognised keys — the bug
     /// that sent S3 to the EC2 metadata endpoint), while leaving other env vars
@@ -1939,5 +1957,56 @@ mod tests {
         assert!(has("endpoint", "https://ep.example.com"));
         // A stray non-provider env var must not be offered as a config key.
         assert!(!opts.iter().any(|(k, _)| k == "token"));
+    }
+
+    /// `install-service --storage-uri x` must report a CommandLine value
+    /// source (so the URI gets persisted) even though `storage_uri` is a
+    /// global arg passed after the subcommand; the same URI via
+    /// `BEPOSITORY_STORAGE_URI` must NOT be persisted.
+    #[cfg(feature = "self-manage")]
+    #[test]
+    fn storage_uri_source_distinguishes_command_line_from_env() {
+        use clap::CommandFactory;
+        let _guard = ENV_FILE_TEST_GUARD.lock().unwrap();
+        const URI: &str = "sftp://user@example.com/srv/bepository?key=/tmp/id";
+        // Safety: serialized by ENV_FILE_TEST_GUARD; restored at the end.
+        let saved = std::env::var("BEPOSITORY_STORAGE_URI").ok();
+        unsafe { std::env::remove_var("BEPOSITORY_STORAGE_URI") };
+
+        // Flag after the subcommand → CommandLine source → persisted.
+        let matches = Cli::command()
+            .try_get_matches_from(["bepository", "install-service", "--storage-uri", URI])
+            .unwrap();
+        assert_eq!(
+            matches.value_source("storage_uri"),
+            Some(clap::parser::ValueSource::CommandLine)
+        );
+        assert_eq!(command_line_storage_uri(&matches).as_deref(), Some(URI));
+
+        // Flag before the subcommand → same.
+        let matches = Cli::command()
+            .try_get_matches_from(["bepository", "--storage-uri", URI, "install-service"])
+            .unwrap();
+        assert_eq!(command_line_storage_uri(&matches).as_deref(), Some(URI));
+
+        // Same URI from the environment → env source → not persisted.
+        // Safety: see above.
+        unsafe { std::env::set_var("BEPOSITORY_STORAGE_URI", URI) };
+        let matches = Cli::command()
+            .try_get_matches_from(["bepository", "install-service"])
+            .unwrap();
+        assert_eq!(
+            matches.value_source("storage_uri"),
+            Some(clap::parser::ValueSource::EnvVariable)
+        );
+        assert_eq!(command_line_storage_uri(&matches), None);
+
+        // Safety: restoring the ambient state.
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("BEPOSITORY_STORAGE_URI", v),
+                None => std::env::remove_var("BEPOSITORY_STORAGE_URI"),
+            }
+        }
     }
 }

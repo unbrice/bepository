@@ -5,14 +5,23 @@
 //! `install-service` / `print-service` / `uninstall-service` subcommands.
 //!
 //! Gated behind the `self-manage` feature. Emits a hardened systemd unit for
-//! `bepository serve` and (optionally) a daily self-upgrade timer.
+//! `bepository serve` and (optionally) a daily self-upgrade timer, and wires
+//! credential-file paths from `/etc/bepository/env` into `LoadCredential`
+//! drop-ins (see [`credential_wiring`]).
+
+mod credential_wiring;
 
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
+
+use self::credential_wiring::{
+    print_credential_notes, unwire_credential_dropins, wire_credential_dropins,
+};
+use crate::envfile::set_env_assignment;
 
 /// The example env file, embedded so `install-service` is self-contained.
 const ENV_EXAMPLE: &str = include_str!("../../deploy/env.example");
@@ -24,6 +33,9 @@ const UPGRADE_SERVICE_NAME: &str = "bepository-upgrade.service";
 const UPGRADE_TIMER_NAME: &str = "bepository-upgrade.timer";
 const ENV_DIR: &str = "/etc/bepository";
 const ENV_PATH: &str = "/etc/bepository/env";
+/// Drop-in directory holding the `LoadCredential` entries install-service
+/// manages (`<name>.conf`).
+const DROPIN_DIR: &str = "/etc/systemd/system/bepository.service.d";
 
 /// The hardened systemd unit for `bepository serve`.
 ///
@@ -53,10 +65,44 @@ pub(crate) fn print_service() -> Result<()> {
 /// Install the systemd units (and the upgrade timer, unless `--no-auto-upgrade`),
 /// reload systemd, enable the units, and seed `/etc/bepository/env` if missing.
 ///
-/// Idempotent: re-running overwrites the unit files and re-enables. The env
-/// file is never overwritten once it exists. No UID probing: a `PermissionDenied`
-/// from the writes is mapped to a clear "requires root" error.
-pub(crate) fn install_service(no_auto_upgrade: bool) -> Result<()> {
+/// A `storage_uri` from the command line is persisted into the env file; the
+/// file is otherwise never overwritten. Absolute credential paths in it are
+/// wired into `LoadCredential` drop-ins. Idempotent. No UID probing: a
+/// `PermissionDenied` from the writes is mapped to a clear "requires root" error.
+pub(crate) fn install_service(no_auto_upgrade: bool, storage_uri: Option<&str>) -> Result<()> {
+    // Env file first: a --storage-uri and the credential wiring both operate
+    // on it.
+    let mut env_text = if Path::new(ENV_PATH).exists() {
+        fs::read_to_string(ENV_PATH)
+            .map_err(|e| map_fs_err(e, "install-service", "reading", Path::new(ENV_PATH)))?
+    } else {
+        fs::create_dir_all(ENV_DIR)
+            .map_err(|e| map_fs_err(e, "install-service", "creating", Path::new(ENV_DIR)))?;
+        // create_new: never clobber an existing env file (the `exists` check
+        // guards the common case; create_new closes the TOCTOU window).
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(ENV_PATH)
+            .map_err(|e| map_fs_err(e, "install-service", "creating", Path::new(ENV_PATH)))?;
+        f.write_all(ENV_EXAMPLE.as_bytes())
+            .map_err(|e| map_fs_err(e, "install-service", "writing", Path::new(ENV_PATH)))?;
+        println!("Installed example config at {ENV_PATH} (mode 600).");
+        ENV_EXAMPLE.to_string()
+    };
+
+    if let Some(uri) = storage_uri {
+        env_text = set_env_assignment(&env_text, "BEPOSITORY_STORAGE_URI", uri);
+        write_env_atomic(Path::new(ENV_PATH), &env_text, "install-service")?;
+        println!("Persisted --storage-uri as BEPOSITORY_STORAGE_URI in {ENV_PATH}.");
+    }
+
+    let (wired_env, outcomes) = wire_credential_dropins(&env_text, Path::new(DROPIN_DIR))?;
+    if wired_env != env_text {
+        write_env_atomic(Path::new(ENV_PATH), &wired_env, "install-service")?;
+    }
+
     write_unit(SERVICE_NAME, BEPOSITORY_SERVICE)?;
     if !no_auto_upgrade {
         write_unit(UPGRADE_SERVICE_NAME, BEPOSITORY_UPGRADE_SERVICE)?;
@@ -78,32 +124,23 @@ pub(crate) fn install_service(no_auto_upgrade: bool) -> Result<()> {
         systemctl(&["enable", "--now", UPGRADE_TIMER_NAME])?;
     }
 
-    if !Path::new(ENV_PATH).exists() {
-        fs::create_dir_all(ENV_DIR).with_context(|| format!("failed to create {ENV_DIR}"))?;
-        // create_new: never clobber an existing env file (the `exists` check
-        // guards the common case; create_new closes the TOCTOU window).
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(ENV_PATH)
-            .with_context(|| format!("failed to create {ENV_PATH}"))?;
-        f.write_all(ENV_EXAMPLE.as_bytes())
-            .with_context(|| format!("failed to write {ENV_PATH}"))?;
-        println!("Installed example config at {ENV_PATH} (mode 600).");
-    }
-
     println!("Service installed and enabled.");
     if no_auto_upgrade {
         println!("Auto-upgrade timer skipped (--no-auto-upgrade).");
     }
+    print_credential_notes(&outcomes);
     println!("Edit {ENV_PATH}, then: systemctl start {SERVICE_NAME}");
     Ok(())
 }
 
-/// Disable and remove the units, then daemon-reload. Leaves `/etc/bepository/`
-/// in place (it holds the user's config and credentials).
+/// Disable and remove the units, then daemon-reload. Reverses the credential
+/// wiring (restoring the original source paths into the env file) before
+/// removing the managed drop-ins. Leaves `/etc/bepository/` in place (it holds
+/// the user's config and credentials).
 pub(crate) fn uninstall_service() -> Result<()> {
+    // Unwire first: only the managed drop-ins still know the original source
+    // paths, and the /run/credentials paths vanish with the units.
+    unwire_credential_dropins(Path::new(ENV_PATH), Path::new(DROPIN_DIR))?;
     disable_and_remove_unit(UPGRADE_TIMER_NAME)?;
     disable_and_remove_unit(UPGRADE_SERVICE_NAME)?;
     disable_and_remove_unit(SERVICE_NAME)?;
@@ -112,21 +149,50 @@ pub(crate) fn uninstall_service() -> Result<()> {
     Ok(())
 }
 
+/// Map an IO error on `path` into an actionable error: PermissionDenied
+/// becomes a "requires root" hint, anything else gets path context.
+fn map_fs_err(e: std::io::Error, cmd: &str, verb: &str, path: &Path) -> anyhow::Error {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        anyhow!(
+            "{cmd} requires root: permission denied {verb} {}",
+            path.display()
+        )
+    } else {
+        anyhow::Error::from(e).context(format!("failed to {verb} {}", path.display()))
+    }
+}
+
 /// Write a unit file to the systemd dir, mapping permission errors to a "needs
 /// root" hint.
 fn write_unit(name: &str, content: &str) -> Result<()> {
     let path = Path::new(SYSTEMD_DIR).join(name);
-    fs::write(&path, content).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::PermissionDenied {
-            anyhow!(
-                "install-service requires root: permission denied writing {}",
-                path.display()
-            )
-        } else {
-            anyhow::Error::from(e).context(format!("failed to write {}", path.display()))
-        }
-    })?;
+    fs::write(&path, content).map_err(|e| map_fs_err(e, "install-service", "writing", &path))?;
     Ok(())
+}
+
+/// Atomically replace `env_path` with `text`: temp file in the same directory
+/// (created 0600, so the env file keeps its restrictive mode across rewrites),
+/// then rename. `cmd` prefixes the root-hint error.
+fn write_env_atomic(env_path: &Path, text: &str, cmd: &str) -> Result<()> {
+    let dir = env_path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = dir.join(format!(".env.tmp-{}", std::process::id()));
+    let result = (|| -> Result<()> {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| map_fs_err(e, cmd, "creating", &tmp))?;
+        f.write_all(text.as_bytes())
+            .and_then(|()| f.sync_all())
+            .map_err(|e| map_fs_err(e, cmd, "writing", &tmp))?;
+        fs::rename(&tmp, env_path).map_err(|e| map_fs_err(e, cmd, "replacing", env_path))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// `systemctl disable --now` + remove the unit file. Missing units are not an
@@ -135,16 +201,8 @@ fn disable_and_remove_unit(name: &str) -> Result<()> {
     let _ = systemctl(&["disable", "--now", name]);
     let path = Path::new(SYSTEMD_DIR).join(name);
     if path.exists() {
-        fs::remove_file(&path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                anyhow!(
-                    "uninstall-service requires root: permission denied removing {}",
-                    path.display()
-                )
-            } else {
-                anyhow::Error::from(e).context(format!("failed to remove {}", path.display()))
-            }
-        })?;
+        fs::remove_file(&path)
+            .map_err(|e| map_fs_err(e, "uninstall-service", "removing", &path))?;
     }
     Ok(())
 }
@@ -295,5 +353,19 @@ mod tests {
             }
         }
         None
+    }
+
+    #[test]
+    fn write_env_atomic_replaces_with_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let env_path = tmp.path().join("env");
+        fs::write(&env_path, "A=1\n").unwrap();
+        write_env_atomic(&env_path, "A=2\n", "install-service").unwrap();
+        assert_eq!(fs::read_to_string(&env_path).unwrap(), "A=2\n");
+        let mode = fs::metadata(&env_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        // No temp file left behind.
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
     }
 }

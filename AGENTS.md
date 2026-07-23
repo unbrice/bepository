@@ -50,8 +50,9 @@ documents its TOML metadata file in `CONFIG.md`.
 - Lock algorithm: `bepository-lock/src/epoch.rs`; renewal/guard: `guard.rs`
 - CLI (subcommands, storage-URI parsing, serve loop):
   `bepository-cli/src/main.rs` — no longer a single file: service-management is
-  in `service.rs`, self-upgrade in `upgrade.rs`, both behind the default
-  `self-manage` feature.
+  in `service.rs` (credential wiring in `service/credential_wiring.rs`; shared
+  env parser in `envfile.rs`), self-upgrade in `upgrade.rs`, both behind the
+  default `self-manage` feature.
 
 ## Vocabulary
 

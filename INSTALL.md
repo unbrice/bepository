@@ -38,6 +38,12 @@ The `BEPOSITORY_STORAGE_URI` defines where to store data. Non-secret config
 | SFTP                           | `sftp://user@host:22/remote/path`                                           |
 | Local path (NAS, testing)      | `file:///var/lib/bepository/store` (writable under the service's state dir) |
 
+> [!WARNING]
+> An SFTP URI names a machine, and the store's identity lives on that machine:
+> every host sharing the store must reach the *same* SFTP server, so use a
+> stable hostname or IP — never `localhost` (each machine would silently sync
+> into its own private store).
+
 ### Credentials
 
 Credentials live in `/etc/bepository/env`, which the service reads (but cannot
@@ -93,9 +99,22 @@ GOOGLE_APPLICATION_CREDENTIALS=/run/credentials/bepository.service/sa-key.json
 
 The same applies to an SFTP key:
 `LoadCredential=id_ed25519:/etc/bepository/id_ed25519` and
-`?key=/run/credentials/bepository.service/id_ed25519` in the storage URI. NixOS
-users, see the [NixOS section](#nixos) below — the module wires `LoadCredential`
-via `systemd.services.bepository.serviceConfig`.
+`?key=/run/credentials/bepository.service/id_ed25519` in the storage URI.
+
+**`install-service` wires this up automatically.** On every run it reads
+`/etc/bepository/env` and, for an SFTP `?key=/absolute/path` or a
+`GOOGLE_APPLICATION_CREDENTIALS=/absolute/path`, writes the drop-in and rewrites
+the value to the `/run/credentials/…` path (warning if the source file is
+missing). If you add such a path by hand, re-run
+`sudo bepository
+install-service`. Because systemd re-reads the source at every
+service start, rotating the key at the source path keeps working.
+`uninstall-service` restores the original paths before removing the drop-ins.
+
+The manual recipe above remains relevant for NixOS users — see the
+[NixOS section](#nixos) below; the module wires `LoadCredential` via
+`systemd.services.bepository.serviceConfig` — and for drop-ins you manage
+yourself.
 
 ### Optional: Configure Cache
 
@@ -121,16 +140,58 @@ Choose the installation method that best fits your environment.
 
 ### Decision Table
 
-| Method                | Best for               | Notes                                                                      |
-| --------------------- | ---------------------- | -------------------------------------------------------------------------- |
-| **Native binary**     | Most Linux distros     | **Recommended**. One binary + `install-service`; daily auto-upgrade timer. |
-| **NixOS**             | NixOS users            | Native declarative module using the prebuilt release binary.               |
-| **Build from source** | Developers / non-Linux | Requires Rust stable and `protoc`.                                         |
+| Method                | Best for               | Notes                                                                |
+| --------------------- | ---------------------- | -------------------------------------------------------------------- |
+| **Native binary**     | Most Linux distros     | **Recommended**. One-liner install script; daily auto-upgrade timer. |
+| **NixOS**             | NixOS users            | Native declarative module using the prebuilt release binary.         |
+| **Build from source** | Developers / non-Linux | Requires Rust stable and `protoc`.                                   |
 
 ### Native binary (Recommended)
 
 Prebuilt static binaries (musl) are published for **x86_64** and **aarch64**
 Linux only — on other architectures, [build from source](#build-from-source).
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/unbrice/bepository/master/install.sh | sh
+```
+
+The script downloads the latest release for your architecture, installs it to
+`/usr/local/bin`, and installs the systemd service (see below). It uses `sudo`
+only for the two privileged steps, never for the download. On NixOS it refuses
+and points at the [flake module](#nixos) instead.
+
+It asks up to two questions. Without a terminal, the script requires
+`BEPOSITORY_STORAGE_URI` to be set (the storage URI prompt is skipped if the
+variable is set; the second question is only asked when a terminal is present):
+
+1. **Your storage URI** (Step 1), offering an SFTP example. An empty answer is
+   not accepted.
+2. **Whether to run `bepository init`** — recommended: it validates the URI and
+   credentials and creates the storage identity, printing your Device ID. If
+   init fails, nothing is installed.
+
+To pin a version instead of tracking `latest`, set `BEPOSITORY_VERSION` (with or
+without the leading `v`); a pinned install skips the auto-upgrade timer so the
+pin is not upgraded away:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/unbrice/bepository/master/install.sh | BEPOSITORY_VERSION=0.8.0 sh
+```
+
+`install-service` writes `/etc/systemd/system/bepository.service`, enables it
+and the `bepository-upgrade.timer`, and — if `/etc/bepository/env` does not yet
+exist — installs the example config there (mode 600); a `--storage-uri <URI>` on
+the command line is persisted into it. Credential-file paths in that file get
+`LoadCredential` drop-ins automatically — see
+[Credential files under systemd](#credential-files-under-systemd-loadcredential).
+Edit the env file (set at least `BEPOSITORY_STORAGE_URI`,
+`BEPOSITORY_MASTER_DEVICE_ID`, and `BEPOSITORY_LISTEN`) before starting.
+
+The unit runs hardened: `DynamicUser=yes`, `ProtectSystem=strict`, with state in
+`/var/lib/bepository` and cache in `/var/cache/bepository`.
+
+<details>
+<summary>Manual install (without the script)</summary>
 
 ```sh
 # 1. Download the static binary for your architecture
@@ -148,14 +209,7 @@ sudoedit /etc/bepository/env
 sudo systemctl start bepository
 ```
 
-`install-service` writes `/etc/systemd/system/bepository.service`, enables it
-and the `bepository-upgrade.timer`, and — if `/etc/bepository/env` does not yet
-exist — installs the example config there (mode 600). Edit that file (set at
-least `BEPOSITORY_STORAGE_URI`, `BEPOSITORY_MASTER_DEVICE_ID`, and
-`BEPOSITORY_LISTEN`) before starting.
-
-The unit runs hardened: `DynamicUser=yes`, `ProtectSystem=strict`, with state in
-`/var/lib/bepository` and cache in `/var/cache/bepository`.
+</details>
 
 #### Local storage outside `/var/lib/bepository`
 
@@ -186,7 +240,8 @@ sudo systemctl disable --now bepository-upgrade.timer
 > instances sharing one store, keep them on the same version — the auto-upgrade
 > timer does not coordinate across hosts.
 >
-> To pin a specific version instead of tracking `latest`, download a tagged
+> To pin a specific version instead of tracking `latest`, run the install script
+> with `BEPOSITORY_VERSION` (implies `--no-auto-upgrade`), or download a tagged
 > asset URL (e.g.
 > `…/releases/download/v0.8.0/bepository-x86_64-unknown-linux-musl`) and install
 > with `--no-auto-upgrade`.
@@ -321,7 +376,10 @@ the device as **Connected** and syncing.
 - **Connection rejected in the logs** — the connecting device is not
   `BEPOSITORY_MASTER_DEVICE_ID`; each instance accepts exactly one master.
 - **Storage errors at startup** — check the URI and credentials;
-  `sudo bepository get-id` tests them without starting the daemon.
+  `sudo bepository get-id` tests them without starting the daemon. With
+  credentials wired via `LoadCredential`, that only works while the service is
+  running — see
+  [Running ad-hoc commands without the service](#running-ad-hoc-commands-without-the-service).
 - **Lock/standby messages** — another instance holds the lock; expected when
   several machines share a store. `sudo bepository fsck --clear-lock` forces it
   free, but only when no other instance is running.
@@ -330,14 +388,15 @@ the device as **Connected** and syncing.
 
 `get-id`, `fsck`, and friends read the same `/etc/bepository/env` the daemon
 does (your process environment always wins over the file, matching systemd's
-`EnvironmentFile` semantics). With GCS configured via `LoadCredential`, the env
-file points `GOOGLE_APPLICATION_CREDENTIALS` at
+`EnvironmentFile` semantics). When credentials are wired via `LoadCredential` —
+automatically by `install-service`, or by hand — the env file points at
 `/run/credentials/bepository.service/…`, which only exists while the service is
-running — so ad-hoc commands fail when the daemon is stopped.
+running. Ad-hoc commands therefore fail when the daemon is stopped; the
+workarounds below depend on the backend.
 
-Pipe the key in and override the path to `/dev/stdin` (Linux symlinks it to your
-input; bepository reads it once at startup, then holds the parsed credentials in
-memory). Run as a normal user — no `sudo` on `bepository` itself:
+**GCS:** pipe the key in and override the path to `/dev/stdin` (Linux symlinks
+it to your input; bepository reads it once at startup, then holds the parsed
+credentials in memory). Run as a normal user — no `sudo` on `bepository` itself:
 
 ```sh
 sudo cat /etc/bepository/sa-key.json | \
@@ -346,7 +405,15 @@ sudo cat /etc/bepository/sa-key.json | \
 
 The `sudo cat` is the only privileged step: it reads the `root:root 0600` key
 that the dynamic-user daemon also can't open by path. The same pattern works for
-`get-id`. (GCS only — SFTP's `?key=…` lives in the URI, not an env var.)
+`get-id`.
+
+**SFTP:** the key lives in the URI, not an env var, so override the whole URI
+(your process environment wins) with the real key path:
+
+```sh
+BEPOSITORY_STORAGE_URI='sftp://user@host/path?key=/home/user/.ssh/id_ed25519' \
+  bepository fsck
+```
 
 **Uninstall:** `sudo bepository uninstall-service`, then remove
 `/etc/bepository/`, `/var/lib/bepository`, and `/var/cache/bepository`. Synced
