@@ -1586,12 +1586,17 @@ impl StorageFolder for SlateFolder {
         loser: &FileInfo,
         loser_path: Option<&str>,
     ) -> Result<(), StorageError> {
-        self.store.put_file(winner).await?;
+        // Commit the loser copy first: it carries block pointers from the
+        // committed entry at the original name, which the winner commit below
+        // overwrites (winner and loser share the file name).
         if let Some(path) = loser_path {
             let mut loser_copy = loser.clone();
             loser_copy.name = path.to_string();
-            self.store.put_file(&loser_copy).await?;
+            self.store
+                .put_file_with_carry(&loser_copy, &loser.name)
+                .await?;
         }
+        self.store.put_file(winner).await?;
         Ok(())
     }
 

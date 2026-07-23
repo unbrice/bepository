@@ -292,6 +292,154 @@ async fn apply_concurrent_conflict() {
     assert!(matches!(result, UpdateResult::Concurrent { .. }));
 }
 
+// --- Block-pointer carry-over on commit ---
+
+/// Wire form with one separated (4096 B) block and one inline (100 B) block.
+fn wire_file_mixed_blocks(name: &str, counters: &[(u64, u64)]) -> FileInfo {
+    let mut file = make_file_with_blocks_of_size(name, counters, &[[0xAA; 32], [0xBB; 32]], 4096);
+    file.blocks[1].size = 100;
+    file.size = 4096 + 100;
+    file
+}
+
+/// Wire form with two separated (4096 B) blocks. Used by tests that run fsck:
+/// fsck requires an `mr` ref per committed block and the inline path writes
+/// none, so committed files with inline blocks are flagged (pre-existing).
+fn wire_file_separated_blocks(name: &str, counters: &[(u64, u64)]) -> FileInfo {
+    make_file_with_blocks_of_size(name, counters, &[[0xAA; 32], [0xBB; 32]], 4096)
+}
+
+/// Commit `file` and store its block data (0x07 bytes for block 0, 0x08 bytes
+/// for block 1, sized to match).
+async fn seed_committed_file(folder: &SlateFolder, file: FileInfo) {
+    let name = file.name.clone();
+    let block1_size = usize::try_from(file.blocks[1].size).unwrap();
+    folder.insert_file(file).await;
+    folder
+        .insert_block(&name, 0, Bytes::from(vec![7u8; 4096]))
+        .await;
+    folder
+        .insert_block(&name, 4096, Bytes::from(vec![8u8; block1_size]))
+        .await;
+}
+
+#[tokio::test]
+async fn apply_metadata_only_update_preserves_block_pointers() {
+    let (_storage, folder) = setup_folder("f1").await;
+    seed_committed_file(&folder, wire_file_mixed_blocks("hello.txt", &[(1, 1)])).await;
+
+    // Metadata-only remote update: newer version, identical blocks.
+    let mut remote = wire_file_mixed_blocks("hello.txt", &[(1, 2)]);
+    remote.modified_s = 1_700_000_000;
+    let result = folder.apply_update(&remote, &REMOTE_DEV).await.unwrap();
+    assert!(matches!(result, UpdateResult::Applied(_)));
+
+    let big = folder
+        .read_block("hello.txt", 0, 4096, &[0xAA; 32])
+        .await
+        .unwrap();
+    assert_eq!(big, Bytes::from(vec![7u8; 4096]));
+    let small = folder
+        .read_block("hello.txt", 4096, 100, &[0xBB; 32])
+        .await
+        .unwrap();
+    assert_eq!(small, Bytes::from(vec![8u8; 100]));
+}
+
+#[tokio::test]
+async fn resolve_conflict_local_winner_preserves_block_pointers() {
+    let (storage, folder) = setup_folder("f1").await;
+    seed_committed_file(&folder, wire_file_separated_blocks("hello.txt", &[(1, 1)])).await;
+
+    let local = folder.get_file("hello.txt").await.unwrap();
+    let remote = make_file_with_blocks_of_size("hello.txt", &[(2, 1)], &[[0xCC; 32]], 4096);
+    folder
+        .resolve_conflict(&local, &remote, None)
+        .await
+        .unwrap();
+
+    let big = folder
+        .read_block("hello.txt", 0, 4096, &[0xAA; 32])
+        .await
+        .unwrap();
+    assert_eq!(big, Bytes::from(vec![7u8; 4096]));
+
+    assert!(check_integrity_passed(&storage, bepository_storage::FsckLevel::Structural).await);
+}
+
+#[tokio::test]
+async fn resolve_conflict_loser_copy_carries_block_pointers() {
+    let (storage, folder) = setup_folder("f1").await;
+    seed_committed_file(&folder, wire_file_separated_blocks("hello.txt", &[(1, 1)])).await;
+
+    let local = folder.get_file("hello.txt").await.unwrap();
+    let remote = make_file_with_blocks_of_size("hello.txt", &[(2, 1)], &[[0xCC; 32]], 4096);
+    folder
+        .resolve_conflict(&remote, &local, Some("hello.txt.sync-conflict"))
+        .await
+        .unwrap();
+
+    // The conflict copy is readable before the winner's blocks arrive.
+    let big = folder
+        .read_block("hello.txt.sync-conflict", 0, 4096, &[0xAA; 32])
+        .await
+        .unwrap();
+    assert_eq!(big, Bytes::from(vec![7u8; 4096]));
+
+    // The winner's blocks arrive (the engine fetches them after resolving).
+    folder
+        .insert_block("hello.txt", 0, Bytes::from(vec![9u8; 4096]))
+        .await;
+    assert!(check_integrity_passed(&storage, bepository_storage::FsckLevel::Structural).await);
+}
+
+#[tokio::test]
+async fn commit_carries_unchanged_block_pointers() {
+    let (_storage, folder) = setup_folder("f1").await;
+
+    // v1 committed with two separated blocks.
+    let hash_a = [0xA1; 32];
+    let hash_b = [0xB1; 32];
+    let v1 = make_file_with_blocks_of_size("hello.txt", &[(1, 1)], &[hash_a, hash_b], 4096);
+    let result = folder.apply_update(&v1, &REMOTE_DEV).await.unwrap();
+    assert!(matches!(result, UpdateResult::NeedBlocks(_)));
+    folder
+        .insert_block("hello.txt", 0, Bytes::from(vec![1u8; 4096]))
+        .await;
+    folder
+        .insert_block("hello.txt", 4096, Bytes::from(vec![2u8; 4096]))
+        .await;
+    folder
+        .complete_file("hello.txt", v1.version.as_ref())
+        .await
+        .unwrap();
+
+    // v2 shares block A, replaces block B with C; only C is transferred.
+    let hash_c = [0xC1; 32];
+    let v2 = make_file_with_blocks_of_size("hello.txt", &[(1, 2)], &[hash_a, hash_c], 4096);
+    let result = folder.apply_update(&v2, &REMOTE_DEV).await.unwrap();
+    assert!(matches!(result, UpdateResult::NeedBlocks(_)));
+    folder
+        .insert_block("hello.txt", 4096, Bytes::from(vec![3u8; 4096]))
+        .await;
+    folder
+        .complete_file("hello.txt", v2.version.as_ref())
+        .await
+        .unwrap();
+
+    // Block A's pointer was carried from v1's committed entry.
+    let a = folder
+        .read_block("hello.txt", 0, 4096, &hash_a)
+        .await
+        .unwrap();
+    assert_eq!(a, Bytes::from(vec![1u8; 4096]));
+    let c = folder
+        .read_block("hello.txt", 4096, 4096, &hash_c)
+        .await
+        .unwrap();
+    assert_eq!(c, Bytes::from(vec![3u8; 4096]));
+}
+
 // --- Block storage ---
 
 #[tokio::test]
