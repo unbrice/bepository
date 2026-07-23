@@ -121,7 +121,7 @@ fn prefix_for(key: &[u8]) -> [u8; 2] {
 /// `log_completion` are `bucket_<min>` where `<min>` is the bucket's
 /// inclusive lower bound (0, 16, 64, …, 64M, 128M). The step from 64M to
 /// 128M is ×2 rather than ×4 because 128 MiB is the chosen ceiling and
-/// doesn't sit on the ×4 ladder; the last bucket therefore covers half the
+/// doesn't sit on the ×4 ladder; the `bucket_64M` bucket therefore covers half the
 /// dynamic range of its neighbours — fine for the "is this prefix large
 /// enough to deserve OOB?" question but worth knowing when reading the
 /// histogram.

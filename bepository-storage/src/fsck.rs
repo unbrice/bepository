@@ -122,7 +122,7 @@ async fn check_sequences(
         };
         if u64::try_from(fi.sequence).ok() != Some(seq) {
             errors.push(format!(
-                "Sequence mismatch for {name}: s/ says {seq}, n/ says {}",
+                "Sequence mismatch for {name}: ms/ says {seq}, mn/ says {}",
                 fi.sequence
             ));
         }
@@ -146,7 +146,7 @@ async fn check_sequences(
             let seq_key = store_keys::seq_key(fi.sequence)?;
             if db.get(&seq_key).await.map_err(slate_err)?.is_none() {
                 errors.push(format!(
-                    "File {name} has sequence {} but no s/ entry exists",
+                    "File {name} has sequence {} but no ms/ entry exists",
                     fi.sequence
                 ));
             }

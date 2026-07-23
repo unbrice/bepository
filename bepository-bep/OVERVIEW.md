@@ -1,7 +1,7 @@
 # bepository-bep
 
-Rust BEP v1 library: wire protocol, state machine, and storage abstraction.
-Networking and TLS are provided by the caller.
+Rust BEP v1 library: wire protocol, session state machine, and storage
+abstraction. Networking and TLS are provided by the caller.
 
 ## Scope
 
@@ -53,4 +53,5 @@ Networking and TLS are provided by the caller.
 - **Atomic Promotion**: `complete_file` is only called when no pending or
   deferred requests remain for a file, ensuring data integrity.
 - **Event Capacity**: The engine event channel (64 slots) must be drained
-  promptly; `DeviceConnecting` events drop on overflow.
+  promptly; `DeviceConnecting` events apply backpressure; a stalled listener
+  wedges new connections.

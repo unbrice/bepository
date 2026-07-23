@@ -146,12 +146,13 @@ impl LockedFileName<'_> {
 /// Per-folder SlateDB wrapper.
 ///
 /// Each shared folder gets its own SlateDB instance with the key layout
-/// defined in [`crate::keys`].
+/// defined in [`crate::store_keys`].
 pub(crate) struct FolderStore {
     pub(crate) db: Db,
     pub(crate) gc: Arc<CompactionState>,
-    /// Per-name async lock pool. Serializes `n/`, `s/`, and `in/`
-    /// mutations for a given name. Witnessed by `LockedFileName`.
+    /// Per-name async lock pool. Witnessed by `LockedFileName`.
+    /// Protects `stage_file`/`complete_file`/`put_file`, but `store_block`
+    /// and `reuse_block` currently mutate `mi`/`mn` outside this lock.
     /// Compaction may drop dead entries outside this lock; see
     /// `compaction.rs`.
     name_locks: LockPool<String>,
@@ -519,10 +520,7 @@ impl FolderStore {
 
     // --- Block storage ---
 
-    /// Store block data with cross-directory dedup.
-    ///
-    /// All writes (data or pointer + reverse ref) go through a single `WriteBatch`
-    /// to avoid races between concurrent `store_block` calls with the same hash.
+    /// Find the file info to update, either in the inbox or the main index.
     pub(crate) async fn get_file_to_update(
         &self,
         epoch: Option<Epoch>,
@@ -556,8 +554,8 @@ impl FolderStore {
 
     /// Store block data with cross-directory dedup.
     ///
-    /// All writes (data or pointer + reverse ref) go through a single `WriteBatch`
-    /// to avoid races between concurrent `store_block` calls with the same hash.
+    /// Uses a `WriteBatch` for per-call atomicity (does not provide cross-call exclusion
+    /// for concurrent `store_block` calls on the same file).
     pub async fn store_block(
         &self,
         epoch: Option<Epoch>,

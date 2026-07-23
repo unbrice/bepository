@@ -34,7 +34,7 @@ impl DeviceId {
     /// Parse a DeviceId from its string representation.
     ///
     /// Accepts the canonical `XXXXXXX-XXXXXXX-…` format (63 chars with hyphens,
-    /// 56 chars without).
+    /// 56 chars without, hyphens anywhere, lowercase accepted).
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         s.parse().ok()
