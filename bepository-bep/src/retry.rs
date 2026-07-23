@@ -54,11 +54,28 @@ pub struct ExponentialBackoff {
     /// Delay before the first retry.
     pub base: Duration,
     /// Multiplicative factor applied on each attempt.
-    pub multiplier: f64,
+    multiplier: f64,
     /// Maximum per-attempt delay cap.
     pub max_delay: Duration,
     /// Give up after this many retries.
     pub max_attempts: u32,
+}
+
+impl ExponentialBackoff {
+    /// Create a policy with the given tuning knobs.
+    ///
+    /// # Panics
+    /// Panics if `multiplier` is negative or NaN.
+    #[must_use]
+    pub fn new(base: Duration, multiplier: f64, max_delay: Duration, max_attempts: u32) -> Self {
+        assert!(multiplier >= 0.0, "multiplier must be non-negative");
+        Self {
+            base,
+            multiplier,
+            max_delay,
+            max_attempts,
+        }
+    }
 }
 
 impl Default for ExponentialBackoff {
@@ -250,6 +267,12 @@ mod tests {
                 "should not retry {err:?}"
             );
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "multiplier must be non-negative")]
+    fn backoff_rejects_negative_multiplier() {
+        let _ = ExponentialBackoff::new(Duration::from_secs(1), -2.0, Duration::from_secs(60), 10);
     }
 
     // --- standard_map_error (via NoRetry.map_error) ---

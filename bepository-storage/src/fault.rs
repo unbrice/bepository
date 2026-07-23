@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -69,13 +70,13 @@ impl ObjectStoreFaultConfig {
     pub fn set(
         &self,
         method: ObjectStoreMethod,
-        count: u32,
+        count: NonZeroU32,
         make_error: impl Fn() -> object_store::Error + Send + Sync + 'static,
     ) {
         self.inner
             .rules
             .lock()
-            .insert(method, (count, Arc::new(make_error)));
+            .insert(method, (count.get(), Arc::new(make_error)));
     }
 
     /// Clear any pending fault for `method`.

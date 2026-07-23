@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -240,6 +241,21 @@ async fn apply_new_file() {
 }
 
 #[tokio::test]
+async fn apply_rejects_negative_block_offset_and_size() {
+    let (_storage, folder) = setup_folder("f1").await;
+
+    let mut file = make_file_with_blocks("bad.bin", &[(1, 1)], &[[7; 32]]);
+    file.blocks[0].size = -1;
+    let err = folder.apply_update(&file, &REMOTE_DEV).await.unwrap_err();
+    assert!(matches!(err, StorageError::InvalidInput(_)));
+
+    let mut file = make_file_with_blocks("bad.bin", &[(1, 1)], &[[7; 32]]);
+    file.blocks[0].offset = -1;
+    let err = folder.apply_update(&file, &REMOTE_DEV).await.unwrap_err();
+    assert!(matches!(err, StorageError::InvalidInput(_)));
+}
+
+#[tokio::test]
 async fn apply_remote_dominates_same_blocks() {
     let (_storage, folder) = setup_folder("f1").await;
 
@@ -259,6 +275,7 @@ async fn apply_remote_dominates_different_blocks() {
     folder.insert_file(local).await;
 
     let mut remote = make_file("hello.txt", &[(1, 2)], false);
+    remote.size = 100;
     remote.blocks = vec![BlockInfo {
         hash: vec![0xAA; 32],
         offset: 0,
@@ -669,11 +686,44 @@ async fn version_upgrade_during_transfer() {
 
     // Complete V2.
     folder
+        .insert_block("upgrade.txt", 0, Bytes::from(vec![0xBB; 1024]))
+        .await;
+    folder
         .complete_file("upgrade.txt", v2.version.as_ref())
         .await
         .unwrap();
     let committed = folder.get_file("upgrade.txt").await.unwrap();
     assert_eq!(committed.version.as_ref().unwrap().counters[0].value, 2);
+}
+
+#[tokio::test]
+async fn complete_file_refuses_incomplete_blocks() {
+    let (_storage, folder) = setup_folder("f1").await;
+
+    // Stage a file but never store its block.
+    let file = make_file_with_blocks("incomplete.txt", &[(1, 1)], &[[0xCC; 32]]);
+    folder.apply_update(&file, &REMOTE_DEV).await.unwrap();
+
+    // Promotion must fail loudly rather than commit a blockless entry.
+    let err = folder
+        .complete_file("incomplete.txt", file.version.as_ref())
+        .await
+        .expect_err("complete_file must reject unstored blocks");
+    assert!(matches!(err, StorageError::Internal(_)));
+    assert!(folder.get_file("incomplete.txt").await.is_none());
+
+    // After the block arrives, completion succeeds.
+    folder
+        .insert_block("incomplete.txt", 0, Bytes::from(vec![0xCC; 1024]))
+        .await;
+    folder
+        .complete_file("incomplete.txt", file.version.as_ref())
+        .await
+        .unwrap();
+    assert_eq!(
+        folder.get_file("incomplete.txt").await.unwrap().name,
+        "incomplete.txt"
+    );
 }
 
 #[tokio::test]
@@ -744,9 +794,11 @@ async fn object_store_put_error_propagates_as_transient_io() {
     );
 
     // Inject one Put failure: activate calls write_meta which does an unconditional put.
-    fault_config.set(ObjectStoreMethod::Put, 1, || object_store::Error::Generic {
-        store: "test",
-        source: Box::new(std::io::Error::other("injected")),
+    fault_config.set(ObjectStoreMethod::Put, NonZeroU32::MIN, || {
+        object_store::Error::Generic {
+            store: "test",
+            source: Box::new(std::io::Error::other("injected")),
+        }
     });
 
     let result = storage
@@ -773,12 +825,14 @@ async fn object_store_list_error_propagates_as_transient_io() {
     );
 
     // Inject one ListWithDelimiter failure: activate calls read_meta_unlocked which lists files.
-    fault_config.set(ObjectStoreMethod::ListWithDelimiter, 1, || {
-        object_store::Error::Generic {
+    fault_config.set(
+        ObjectStoreMethod::ListWithDelimiter,
+        NonZeroU32::MIN,
+        || object_store::Error::Generic {
             store: "test",
             source: Box::new(std::io::Error::other("injected")),
-        }
-    });
+        },
+    );
 
     let result = storage
         .activate(bepository_lock::Epoch::new(1).unwrap())

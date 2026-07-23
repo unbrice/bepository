@@ -32,6 +32,17 @@ pub const HASH_LEN: usize = 32;
 /// Device ID length in bytes.
 pub const DEVID_LEN: usize = 32;
 
+/// Blocks smaller than this are stored inline in the `FileInfo` rather than
+/// as `bd` block-data keys.
+pub const INLINE_BLOCK_THRESHOLD: u32 = 4096;
+
+/// True if a block of `size` bytes is stored inline (see
+/// [`INLINE_BLOCK_THRESHOLD`]). Negative sizes are never inline.
+#[must_use]
+pub fn is_inline_block(size: i32) -> bool {
+    u32::try_from(size).is_ok_and(|s| s < INLINE_BLOCK_THRESHOLD)
+}
+
 // --- Prefix constants ---
 
 pub const FILE_PREFIX: &[u8] = b"mn";
@@ -100,7 +111,7 @@ pub fn file_key(name: &str) -> Vec<u8> {
 pub fn parse_file_key(key: &[u8]) -> Option<String> {
     let rest = key.strip_prefix(FILE_PREFIX)?;
     let s = std::str::from_utf8(rest).ok()?;
-    let (dir, basename) = s.split_once("//")?;
+    let (dir, basename) = s.rsplit_once("//")?;
     Some(join_name(dir, basename))
 }
 
@@ -135,7 +146,10 @@ pub const SEQ_SCAN_END: &[u8] = b"mt";
 
 /// Build a scan start key for sequences > `since`.
 pub fn seq_scan_start(since: i64) -> Result<[u8; SEQ_KEY_LEN], StorageError> {
-    seq_key(since + 1)
+    let next = since.checked_add(1).ok_or_else(|| {
+        StorageError::Internal(format!("sequence number overflow scanning past {since}"))
+    })?;
+    seq_key(next)
 }
 
 // --- Block pointer key: mb<dir>/<hash_32> ---
@@ -299,7 +313,7 @@ pub fn parse_block_reverse_key(key: &[u8]) -> Option<([u8; HASH_LEN], String)> {
         return None;
     }
     let s = std::str::from_utf8(&rest[HASH_LEN + 1..]).ok()?;
-    let (dir, basename) = s.split_once("//")?;
+    let (dir, basename) = s.rsplit_once("//")?;
     Some((hash, join_name(dir, basename)))
 }
 
@@ -335,7 +349,7 @@ pub fn parse_inbox_key(key: &[u8]) -> Option<(bepository_lock::Epoch, String)> {
         return None;
     }
     let s = std::str::from_utf8(&rest[EPOCH_BASE32_LEN + 1..]).ok()?;
-    let (dir, basename) = s.split_once("//")?;
+    let (dir, basename) = s.rsplit_once("//")?;
     Some((epoch, join_name(dir, basename)))
 }
 
@@ -374,7 +388,7 @@ pub fn parse_block_pointer_key(key: &[u8]) -> Option<[u8; HASH_LEN]> {
 pub fn file_key_dir(key: &[u8]) -> Option<&str> {
     let rest = key.strip_prefix(FILE_PREFIX)?;
     let s = std::str::from_utf8(rest).ok()?;
-    let (dir, _) = s.split_once("//")?;
+    let (dir, _) = s.rsplit_once("//")?;
     Some(dir)
 }
 
@@ -410,6 +424,31 @@ mod tests {
     }
 
     #[test]
+    fn file_key_round_trip_with_double_slash_in_dir() {
+        let key = file_key("a//b/c.txt");
+        assert_eq!(parse_file_key(&key).unwrap(), "a//b/c.txt");
+        assert_eq!(file_key_dir(&key).unwrap(), "a//b");
+    }
+
+    #[test]
+    fn block_reverse_key_round_trip_with_double_slash_in_dir() {
+        let hash = [0xCC; HASH_LEN];
+        let key = block_reverse_key(&hash, "a//b/c.txt");
+        let (parsed_hash, parsed_name) = parse_block_reverse_key(&key).unwrap();
+        assert_eq!(parsed_hash, hash);
+        assert_eq!(parsed_name, "a//b/c.txt");
+    }
+
+    #[test]
+    fn inbox_key_round_trip_with_double_slash_in_dir() {
+        let e = bepository_lock::Epoch::new(7).unwrap();
+        let key = inbox_key(e, "a//b/c.txt");
+        let (epoch, name) = parse_inbox_key(&key).unwrap();
+        assert_eq!(epoch, e);
+        assert_eq!(name, "a//b/c.txt");
+    }
+
+    #[test]
     fn seq_key_round_trip() {
         let key = seq_key(42).unwrap();
         assert_eq!(parse_seq_key(&key), Some(42));
@@ -427,6 +466,12 @@ mod tests {
     #[test]
     fn seq_key_negative_returns_error() {
         assert!(seq_key(-1).is_err());
+    }
+
+    #[test]
+    fn seq_scan_start_overflow_returns_error() {
+        assert!(seq_scan_start(i64::MAX).is_err());
+        assert_eq!(parse_seq_key(&seq_scan_start(41).unwrap()), Some(42));
     }
 
     #[test]

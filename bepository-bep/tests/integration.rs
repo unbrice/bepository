@@ -19,6 +19,7 @@
 //! ```
 
 use std::collections::HashSet;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -924,7 +925,7 @@ async fn storage_transient_io_on_store_block() {
     // Inject 3 transient failures on StoreBlock: the engine must retry and eventually succeed.
     fault_b.set(
         StorageMethod::StoreBlock,
-        3,
+        NonZeroU32::new(3).unwrap(),
         StorageError::TransientIo("injected".into()),
     );
 
@@ -998,7 +999,11 @@ async fn stream_read_error_disconnects() {
     let (fault_b, _config_b) = FaultStream::new(raw_b);
 
     // Inject one read failure on A's stream: A's next read (recv_hello) returns ConnectionReset.
-    config_a.set(StreamMethod::Read, 1, std::io::ErrorKind::ConnectionReset);
+    config_a.set(
+        StreamMethod::Read,
+        NonZeroU32::MIN,
+        std::io::ErrorKind::ConnectionReset,
+    );
 
     let handle_a = engine_a.connect(fault_a, dev_b).await.unwrap();
     let _handle_b = engine_b.accept(fault_b, dev_a).await.unwrap();
@@ -1055,7 +1060,11 @@ async fn stream_write_error_disconnects() {
     let (fault_b, _config_b) = FaultStream::new(raw_b);
 
     // Inject one write failure on A's stream: A's first write (send_hello) returns BrokenPipe.
-    config_a.set(StreamMethod::Write, 1, std::io::ErrorKind::BrokenPipe);
+    config_a.set(
+        StreamMethod::Write,
+        NonZeroU32::MIN,
+        std::io::ErrorKind::BrokenPipe,
+    );
 
     let handle_a = engine_a.connect(fault_a, dev_b).await.unwrap();
     let _handle_b = engine_b.accept(fault_b, dev_a).await.unwrap();
@@ -1099,7 +1108,7 @@ async fn storage_corruption_on_apply_update_is_fatal() {
     // Corruption is non-retryable: one failure closes the connection immediately.
     fault_b.set(
         StorageMethod::ApplyUpdate,
-        1,
+        NonZeroU32::MIN,
         StorageError::Corruption("injected".into()),
     );
 
@@ -1138,6 +1147,58 @@ async fn storage_corruption_on_apply_update_is_fatal() {
     );
 }
 
+// Malformed wire FileInfo (negative block size) → PeerBadMessage at the Index
+// boundary, connection closes before any storage call.
+#[tokio::test]
+async fn malformed_index_file_info_closes_connection() {
+    init_tracing();
+
+    let dev_a = make_device(1);
+    let dev_b = make_device(2);
+
+    // A announces a file whose block has a negative size.
+    let storage_a = MemoryStorage::new();
+    let mut bad = make_file_with_blocks("bad.bin", &[(1, 1)], &[[7; 32]]);
+    bad.blocks[0].size = -1;
+    storage_a
+        .folder(FolderId::from("shared"))
+        .await
+        .unwrap()
+        .insert_file(bad)
+        .await;
+
+    let storage_b = MemoryStorage::new();
+    let _f_b = storage_b.folder(FolderId::from("shared")).await.unwrap();
+
+    let engine_a = BepEngine::new(
+        storage_a,
+        dev_a,
+        "node-a".into(),
+        vec!["shared".into()],
+        resolver(),
+    );
+    let engine_b = BepEngine::new(
+        storage_b,
+        dev_b,
+        "node-b".into(),
+        vec!["shared".into()],
+        resolver(),
+    );
+
+    let (stream_a, stream_b) = tokio::io::duplex(64 * 1024);
+    let _handle_a = engine_a.connect(stream_a, dev_b).await.unwrap();
+    let handle_b = engine_b.accept(stream_b, dev_a).await.unwrap();
+
+    let reason_b = tokio::time::timeout(Duration::from_secs(5), handle_b.closed)
+        .await
+        .expect("B should close within timeout")
+        .expect("close reason should be sent");
+    assert!(
+        matches!(reason_b, CloseReason::Error(BepError::PeerBadMessage(_))),
+        "expected PeerBadMessage, got: {reason_b:?}"
+    );
+}
+
 // Recovery path: Storage Internal error → fatal (same close path as Corruption).
 #[tokio::test]
 async fn storage_internal_error_is_fatal() {
@@ -1160,7 +1221,7 @@ async fn storage_internal_error_is_fatal() {
     // Internal error is non-retryable: one failure closes the connection immediately.
     fault_b.set(
         StorageMethod::ApplyUpdate,
-        1,
+        NonZeroU32::MIN,
         StorageError::Internal("injected".into()),
     );
 
@@ -1231,7 +1292,7 @@ async fn storage_standby_closes_connection() {
     // The daemon must wait for lock re-activation before reconnecting.
     fault_b.set(
         StorageMethod::StoreBlock,
-        1,
+        NonZeroU32::MIN,
         StorageError::Standby("injected".into()),
     );
 
