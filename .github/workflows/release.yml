@@ -108,7 +108,7 @@ jobs:
 
       # cachix/install-nix-action@v31, pinned by SHA
       - name: Install nix
-        uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342
         with:
           extra_nix_config: "experimental-features = nix-command flakes"
 
@@ -210,7 +210,7 @@ jobs:
         # NAR-mode hash — i.e. the recursive hash over the file with the exec
         # bit set. `sha256sum` produces a flat hash, which can never match, so
         # we must derive the hash the same way nix ingests the file.
-        uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342
         with:
           extra_nix_config: "experimental-features = nix-command flakes"
 
