@@ -12,7 +12,7 @@ pub use guard::{LockGuard, LockLost};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
-use object_store::{ObjectStore, PutMode, PutOptions};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, warn};
@@ -191,7 +191,10 @@ impl<'a, T: ObjectStore + ?Sized> Lock<'a, T> {
                 .max();
             let next_val = highest.map_or(0, |h| h.as_u64().checked_add(1).unwrap_or(h.as_u64()));
             let next_epoch = Epoch::new(next_val)?;
-            let path = self.prefix.child(next_epoch.json_filename().as_str());
+            let path = self
+                .prefix
+                .clone()
+                .join(next_epoch.json_filename().as_str());
 
             match self
                 .store

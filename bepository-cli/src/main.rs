@@ -319,10 +319,11 @@ impl Commands {
     }
 }
 
-/// opendal's built-in registry omits sftp even when the feature is compiled in.
+/// Register sftp (and nothing else) with opendal's global registry. The
+/// `auto-register-services` ctor is compiled out (default-features off), so
+/// this is the only registration path on every build.
 static REGISTER_SFTP: LazyLock<()> = LazyLock::new(|| {
-    opendal::DEFAULT_OPERATOR_REGISTRY
-        .register::<opendal::services::Sftp>(opendal::services::SFTP_SCHEME);
+    opendal::services::register_sftp_service(opendal::OperatorRegistry::get());
 });
 
 /// object_store's config-key parser only accepts lowercase spellings and
@@ -423,7 +424,7 @@ fn is_truthy(v: &str) -> bool {
 
 /// Fails fast unless the storage URI carries explicit S3/GCS credentials.
 ///
-/// object_store 0.12 has no "disable metadata" flag: with no credentials it
+/// object_store has no "disable metadata" flag: with no credentials it
 /// silently probes the EC2 IMDS (`169.254.169.254`, ~14s × 10-retry hang
 /// off-cloud) and the GCE metadata server. This preflight turns that into an
 /// actionable error. `use_ambient_creds=true` opts back into the implicit
@@ -476,6 +477,8 @@ fn require_explicit_credentials(parsed_url: &url::Url, opts: &[(String, String)]
             | "service_account_path"
             | "google_service_account_key"
             | "service_account_key"
+            | "google_bearer_token"
+            | "bearer_token"
             | "application_credentials" => true,
             _ => false,
         }),
@@ -2268,8 +2271,16 @@ mod tests {
                 "{s}"
             );
         }
-        // The deleted CLOUDSDK_AUTH_ACCESS_TOKEN alias mapped to bearer_token,
-        // which 0.12 rejects — the alias was dead code.
-        assert!(GoogleConfigKey::from_str("bearer_token").is_err());
+        // bearer_token is accepted since object_store 0.14 (BearerToken key);
+        // the gate above must count it as explicit credentials.
+        for s in ["google_bearer_token", "bearer_token"] {
+            assert!(
+                matches!(
+                    GoogleConfigKey::from_str(s),
+                    Ok(GoogleConfigKey::BearerToken)
+                ),
+                "{s}"
+            );
+        }
     }
 }

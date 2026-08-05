@@ -23,7 +23,7 @@ tracing = { version = "0.1", features = ["log"] }
 bepository-harness = { path = "../bepository-harness" }
 bepository-storage = { path = "../bepository-storage", features = ["test-utils"] }
 bytes = "1"
-object_store = "0.12"
+object_store.workspace = true
 prost = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 sha2.workspace = true

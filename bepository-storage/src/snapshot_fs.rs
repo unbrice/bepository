@@ -69,7 +69,7 @@ impl SnapshotFs for SlateStorage {
         let prefix = read_dir_prefix(path);
 
         let mut iter = reader
-            .scan_prefix(&prefix)
+            .scan_prefix(&prefix, ..)
             .await
             .map_err(snap_io("scan snapshot prefix"))?;
 
@@ -131,7 +131,7 @@ impl SnapshotFs for SlateStorage {
         // Check if it's a virtual directory: any file exists under path/.
         let dir_prefix: Vec<u8> = [store_keys::FILE_PREFIX, path.as_bytes(), b"/"].concat();
         let mut iter = reader
-            .scan_prefix(&dir_prefix)
+            .scan_prefix(&dir_prefix, ..)
             .await
             .map_err(snap_io("scan snapshot prefix"))?;
         if iter

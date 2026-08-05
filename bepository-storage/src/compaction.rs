@@ -59,7 +59,7 @@ where
     F: Fn(bytes::Bytes) -> Result<Option<crate::proto::storage::FileInfo>, prost::DecodeError>,
 {
     let mut iter = snapshot
-        .scan_prefix(prefix)
+        .scan_prefix(prefix, ..)
         .await
         .map_err(|e| CompactionFilterError::CreationError(crate::store::slate_err(e).into()))?;
     while let Some(kv) = iter
@@ -1087,8 +1087,11 @@ mod tests {
                 self.inner.get_opts(location, options).await
             }
 
-            async fn delete(&self, location: &Path) -> object_store::Result<()> {
-                self.inner.delete(location).await
+            fn delete_stream(
+                &self,
+                locations: BoxStream<'static, object_store::Result<Path>>,
+            ) -> BoxStream<'static, object_store::Result<Path>> {
+                self.inner.delete_stream(locations)
             }
 
             fn list(
@@ -1105,35 +1108,13 @@ mod tests {
                 self.inner.list_with_delimiter(prefix).await
             }
 
-            async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-                self.inner.copy(from, to).await
-            }
-
-            async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-                self.inner.copy_if_not_exists(from, to).await
-            }
-
-            async fn put(
+            async fn copy_opts(
                 &self,
-                location: &Path,
-                payload: PutPayload,
-            ) -> object_store::Result<PutResult> {
-                let len = payload.content_length() as u64;
-                self.bytes_written.fetch_add(len, Ordering::Relaxed);
-                let loc_str = location.as_ref();
-                if loc_str.contains("compacted") && loc_str.ends_with(".sst") {
-                    self.compacted_bytes_written
-                        .fetch_add(len, Ordering::Relaxed);
-                }
-                self.inner.put(location, payload).await
-            }
-
-            async fn get(&self, location: &Path) -> object_store::Result<GetResult> {
-                self.inner.get(location).await
-            }
-
-            async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
-                self.inner.head(location).await
+                from: &Path,
+                to: &Path,
+                options: object_store::CopyOptions,
+            ) -> object_store::Result<()> {
+                self.inner.copy_opts(from, to, options).await
             }
         }
 

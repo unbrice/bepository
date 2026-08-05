@@ -6,8 +6,8 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use object_store::ObjectStore;
 use object_store::memory::InMemory;
+use object_store::{ObjectStore, ObjectStoreExt};
 
 use bepository_bep::proto::bep::{BlockInfo, Counter, FileInfo, Vector};
 use bepository_bep::storage::{

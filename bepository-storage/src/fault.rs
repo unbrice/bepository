@@ -17,23 +17,27 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
 };
 use parking_lot::Mutex;
 
 /// Methods on the `ObjectStore` trait that can have faults injected.
+///
+/// object_store 0.14 routes the convenience methods through the core `*_opts`
+/// methods, so faults are intercepted at the core-method level and
+/// distinguished by their options (see `FaultObjectStore`'s impl).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ObjectStoreMethod {
-    /// [`ObjectStore::get`] — SlateStorage meta reads, SlateDB SST reads.
+    /// `get_opts` without `head` — SlateStorage meta reads, SlateDB SST reads.
     Get,
-    /// [`ObjectStore::put`] — SlateStorage meta writes.
+    /// `put_opts` with default options (`put`) — SlateStorage meta writes.
     Put,
-    /// [`ObjectStore::put_opts`] — lock atomic creates (`PutMode::Create`).
+    /// `put_opts` with non-default options — lock atomic creates (`PutMode::Create`).
     PutOpts,
-    /// [`ObjectStore::delete`] — meta cleanup, lock release.
+    /// `delete_stream` (`delete`) — meta cleanup, lock release.
     Delete,
-    /// [`ObjectStore::head`] — lock file existence checks.
+    /// `get_opts` with `head: true` (`head`) — lock file existence checks.
     Head,
     /// [`ObjectStore::list`] — lock epoch enumeration.
     List,
@@ -149,7 +153,12 @@ impl ObjectStore for FaultObjectStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
-        self.config.check(ObjectStoreMethod::PutOpts)?;
+        // `ObjectStoreExt::put` delegates here with default options.
+        if opts == PutOptions::default() {
+            self.config.check(ObjectStoreMethod::Put)?;
+        } else {
+            self.config.check(ObjectStoreMethod::PutOpts)?;
+        }
         self.inner.put_opts(location, payload, opts).await
     }
 
@@ -166,12 +175,23 @@ impl ObjectStore for FaultObjectStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        // `ObjectStoreExt::head` delegates here with `head: true`.
+        if options.head {
+            self.config.check(ObjectStoreMethod::Head)?;
+        } else {
+            self.config.check(ObjectStoreMethod::Get)?;
+        }
         self.inner.get_opts(location, options).await
     }
 
-    async fn delete(&self, location: &Path) -> object_store::Result<()> {
-        self.config.check(ObjectStoreMethod::Delete)?;
-        self.inner.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        if let Err(e) = self.config.check(ObjectStoreMethod::Delete) {
+            return Box::pin(futures::stream::once(futures::future::ready(Err(e))));
+        }
+        self.inner.delete_stream(locations)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
@@ -186,28 +206,12 @@ impl ObjectStore for FaultObjectStore {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        self.inner.copy(from, to).await
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        self.inner.copy_if_not_exists(from, to).await
-    }
-
-    // Override defaults to add fault injection at the right level.
-
-    async fn put(&self, location: &Path, payload: PutPayload) -> object_store::Result<PutResult> {
-        self.config.check(ObjectStoreMethod::Put)?;
-        self.inner.put(location, payload).await
-    }
-
-    async fn get(&self, location: &Path) -> object_store::Result<GetResult> {
-        self.config.check(ObjectStoreMethod::Get)?;
-        self.inner.get(location).await
-    }
-
-    async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
-        self.config.check(ObjectStoreMethod::Head)?;
-        self.inner.head(location).await
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
     }
 }

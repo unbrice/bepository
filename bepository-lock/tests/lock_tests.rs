@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use bepository_lock::{AcquisitionStatus, Epoch, Lock};
-use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
+use object_store::{ObjectStore, ObjectStoreExt};
 use tempfile::tempdir;
 
 fn epoch(n: u64) -> Epoch {
@@ -137,7 +137,7 @@ async fn test_invalid_file_returns_error() {
     let prefix = Path::from("test-lock");
 
     // Manually put a bad file in the lock directory (epoch 0)
-    let bad_path = prefix.child("00000000.json");
+    let bad_path = prefix.clone().join("00000000.json");
     store
         .put(&bad_path, "not a json file".into())
         .await

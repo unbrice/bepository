@@ -390,7 +390,7 @@ impl FolderStore {
     pub async fn all_files(&self) -> Result<Vec<FileInfo>, StorageError> {
         let mut iter = self
             .db
-            .scan_prefix(store_keys::FILE_PREFIX)
+            .scan_prefix(store_keys::FILE_PREFIX, ..)
             .await
             .map_err(slate_err)?;
 
@@ -526,7 +526,7 @@ impl FolderStore {
     pub async fn gc_inbox(&self, current_epoch: Epoch) -> Result<usize, StorageError> {
         let mut iter = self
             .db
-            .scan_prefix(store_keys::INBOX_PREFIX)
+            .scan_prefix(store_keys::INBOX_PREFIX, ..)
             .await
             .map_err(slate_err)?;
 
@@ -584,7 +584,7 @@ impl FolderStore {
     pub(crate) async fn compute_peer_floor(&self) -> Result<Option<NonZeroI64>, StorageError> {
         let mut iter = self
             .db
-            .scan_prefix(store_keys::DEVICE_PREFIX)
+            .scan_prefix(store_keys::DEVICE_PREFIX, ..)
             .await
             .map_err(slate_err)?;
 
@@ -891,7 +891,7 @@ impl FolderStore {
             Err(_) => return Ok(false),
         };
         let prefix = store_keys::block_reverse_prefix(hash_arr);
-        let mut iter = self.db.scan_prefix(&prefix).await.map_err(slate_err)?;
+        let mut iter = self.db.scan_prefix(&prefix, ..).await.map_err(slate_err)?;
         let exists = iter.next().await.map_err(slate_err)?.is_some();
         if !exists {
             return Ok(false);
@@ -933,7 +933,7 @@ impl FolderStore {
         }
 
         let prefix = store_keys::block_reverse_prefix(hash);
-        let mut iter = self.db.scan_prefix(&prefix).await.map_err(slate_err)?;
+        let mut iter = self.db.scan_prefix(&prefix, ..).await.map_err(slate_err)?;
 
         while let Some(kv) = iter.next().await.map_err(slate_err)? {
             if let Some((_hash, name)) = store_keys::parse_block_reverse_key(&kv.key) {
