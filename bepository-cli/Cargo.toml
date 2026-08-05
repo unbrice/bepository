@@ -28,8 +28,14 @@ futures.workspace = true
 humantime.workspace = true
 machine-uid.workspace = true
 object_store.workspace = true
-object_store_opendal = "0.55"
-opendal = { version = "0.55", features = ["services-sftp"] }
+# Pinned exact: 0.58.1 is yanked (semver break for object_store 0.13 users,
+# apache/opendal#8008) but is the only release built against object_store 0.14,
+# which slatedb 0.15 requires. Revisit when object_store_opendal 0.59 lands.
+object_store_opendal = "=0.58.1"
+# default-features off: no auto-register-services ctor (uniform registration
+# via REGISTER_SFTP on every build, incl. musl static), no eager reqwest HTTP
+# transport install. sftp is the only opendal service used; layers are opt-in.
+opendal = { version = "0.58", default-features = false, features = ["services-sftp", "executors-tokio"] }
 reqwest = { workspace = true, features = ["rustls", "json"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 secrecy.workspace = true

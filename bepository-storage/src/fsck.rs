@@ -38,7 +38,7 @@ pub(crate) async fn check_folder_integrity(
 
 async fn check_inbox(db: &slatedb::Db, errors: &mut Vec<String>) -> Result<(), StorageError> {
     let mut iter = db
-        .scan_prefix(store_keys::INBOX_PREFIX)
+        .scan_prefix(store_keys::INBOX_PREFIX, ..)
         .await
         .map_err(slate_err)?;
     while let Some(kv) = iter.next().await.map_err(slate_err)? {
@@ -68,7 +68,7 @@ async fn check_metadata(
         }
     }
     let mut iter = db
-        .scan_prefix(store_keys::DEVICE_PREFIX)
+        .scan_prefix(store_keys::DEVICE_PREFIX, ..)
         .await
         .map_err(slate_err)?;
     while let Some(kv) = iter.next().await.map_err(slate_err)? {
@@ -92,7 +92,7 @@ async fn check_sequences(
     let mut max_observed_file_seq: i64 = 0;
 
     let mut iter = db
-        .scan_prefix(store_keys::SEQ_PREFIX)
+        .scan_prefix(store_keys::SEQ_PREFIX, ..)
         .await
         .map_err(slate_err)?;
     while let Some(kv) = iter.next().await.map_err(slate_err)? {
@@ -130,7 +130,7 @@ async fn check_sequences(
 
     if level == FsckLevel::Full {
         let mut file_iter = db
-            .scan_prefix(store_keys::FILE_PREFIX)
+            .scan_prefix(store_keys::FILE_PREFIX, ..)
             .await
             .map_err(slate_err)?;
         while let Some(kv) = file_iter.next().await.map_err(slate_err)? {
@@ -363,7 +363,7 @@ async fn check_directory_blocks(
     errors: &mut Vec<String>,
 ) -> Result<(), StorageError> {
     let mut files = DirGroupIter::new(
-        db.scan_prefix(store_keys::FILE_PREFIX)
+        db.scan_prefix(store_keys::FILE_PREFIX, ..)
             .await
             .map_err(slate_err)?,
         store_keys::file_key_dir,
@@ -371,7 +371,7 @@ async fn check_directory_blocks(
     .await?;
 
     let mut blocks = DirGroupIter::new(
-        db.scan_prefix(store_keys::BLOCK_PREFIX)
+        db.scan_prefix(store_keys::BLOCK_PREFIX, ..)
             .await
             .map_err(slate_err)?,
         store_keys::block_key_dir,
@@ -416,6 +416,8 @@ mod tests {
         let db = Db::builder("test".to_string(), object_store)
             .with_settings(Settings {
                 flush_interval: Some(std::time::Duration::from_millis(100)),
+                // slatedb 0.15 requires max_unflushed_bytes > l0_sst_size_bytes.
+                l0_sst_size_bytes: 1024 * 1024,
                 max_unflushed_bytes: 4 * 1024 * 1024,
                 manifest_poll_interval: std::time::Duration::from_millis(100),
                 ..Default::default()

@@ -15,7 +15,7 @@ use foyer::{
 };
 use futures::StreamExt;
 use futures::stream::{self, Stream};
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use parking_lot::{Mutex, RwLock};
 use secrecy::SecretSlice;
 use slatedb::admin::AdminBuilder;
@@ -300,7 +300,8 @@ impl SlateStorage {
 
         let mut builder =
             DbReaderBuilder::new(folder_sk.to_string(), self.inner.object_store.clone())
-                .with_checkpoint_id(id)
+                .with_reader_mode(slatedb::DbReaderMode::Checkpoint(id))
+                .with_segment_extractor(Arc::new(crate::store_keys::BepSegmentExtractor))
                 .with_filter_policies(crate::store_keys::make_filter_policies());
         if let Some(cache) = db_cache {
             builder = builder.with_db_cache(cache);
@@ -1757,16 +1758,25 @@ fn make_db_settings() -> Settings {
             // cold/archival; L0 headroom above absorbs flushes that arrive
             // during a compaction cycle.
             max_concurrent_compactions: 1,
-            // Bound parallel L0 fetches during compaction. Two is enough to
-            // overlap download with merge work without saturating the link.
-            max_fetch_tasks: 2,
-            // L1+ output chunk size. Compactor uploads are background work,
-            // so per-SST upload time only affects compaction wall-clock, not
-            // writer latency — pick the largest size that still completes
-            // each upload within a single GCS retry window on the slow link
-            // (~107 s @ 10 Mbps; ~11 s @ 100 Mbps). The 256 MiB default
-            // exceeds 3 min on a slow link and risks transient timeouts.
-            max_sst_size: 128 * 1024 * 1024,
+            worker: Some(slatedb::config::CompactionWorkerOptions {
+                // Bound parallel L0 fetches during compaction. Two is enough to
+                // overlap download with merge work without saturating the link.
+                max_fetch_tasks: 2,
+                // L1+ output chunk size. Compactor uploads are background work,
+                // so per-SST upload time only affects compaction wall-clock, not
+                // writer latency — pick the largest size that still completes
+                // each upload within a single GCS retry window on the slow link
+                // (~107 s @ 10 Mbps; ~11 s @ 100 Mbps). The 256 MiB default
+                // exceeds 3 min on a slow link and risks transient timeouts.
+                max_sst_size: 128 * 1024 * 1024,
+                // 0.15 splits one compaction into this many concurrent
+                // sub-range jobs (RFC-0028). Disable: serial compaction is
+                // deliberate (above), and N subcompactions would multiply
+                // both the fetch budget and per-upload wall-clock on slow
+                // links, breaking the retry-window sizing above.
+                max_subcompactions: 1,
+                ..Default::default()
+            }),
             // Raise size-tiered scheduler's L0 trigger from the default 4 to 32.
             // For the `b` segment, rows are written in monotonically increasing
             // seqno order, so its L0 SSTs have disjoint key ranges and reads only
