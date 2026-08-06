@@ -137,7 +137,6 @@
               socat
               dprint
               reuse
-              rtk
             ];
 
             shellHook = ''

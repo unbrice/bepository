@@ -91,22 +91,22 @@ documents its TOML metadata file in `CONFIG.md`.
 
 ## Commands
 
-Use `rtk cargo` instead of raw `cargo`. Run `just` to list all recipes.
+Run `just` to list all recipes.
 
 ### Fast feedback (preferred)
 
 ```
-rtk cargo check -p <crate>                # type-check
-rtk cargo clippy -p <crate> --all-targets # lint (incl. test code)
-rtk cargo test -p <crate>                 # unit tests
+cargo check -p <crate>                # type-check
+cargo clippy -p <crate> --all-targets # lint (incl. test code)
+cargo test -p <crate>                 # unit tests
 ```
 
 Note: without `--all-targets`, clippy never sees `#[cfg(test)]` code — CI lints
 it and denies warnings, so a clean local lint is not proof.
 
-Before declaring a change done, run `rtk cargo clippy -p <crate> --all-targets`
-and `rtk cargo test -p <crate>` on every crate you touched, then `just lint`
-(workspace sweep, `--deny warnings`) and `just fmt`.
+Before declaring a change done, run `cargo clippy -p <crate> --all-targets` and
+`cargo test -p <crate>` on every crate you touched, then `just lint` (workspace
+sweep, `--deny warnings`) and `just fmt`.
 
 ### Full suite
 
@@ -152,7 +152,7 @@ jj sharp edges:
 
 ## Permissions
 
-**Allowed:** read files, `rtk cargo check/clippy/fmt`, `just test-unit`,
+**Allowed:** read files, `cargo check/clippy/fmt`, `just test-unit`,
 `just test-e2e`, `just lint`, `just fmt`, `just check`.
 
 **Require approval:** `just test` (full suite), anything that pushes or opens
