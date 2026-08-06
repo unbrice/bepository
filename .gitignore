@@ -18,7 +18,6 @@ target
 **/mutants.out*/
 
 # Optimize LLM usage.
-.rtk/
 .aider*
 .antigravitycli/
 .claude/

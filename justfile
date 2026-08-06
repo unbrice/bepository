@@ -4,8 +4,6 @@ syncthing_version := "1.29.5"
 use_system_syncthing := env("USE_SYSTEM_SYNCTHING", "1")
 _local_syncthing := justfile_directory() / "target/tools/syncthing"
 
-cargo := `([ -n "${GEMINI_CLI:-}" ] || [ -n "${CLAUDE:-}" ]) && command -v rtk >/dev/null 2>/dev/null && echo "rtk cargo" || echo "cargo"`
-
 export SYNCTHING_BIN := if use_system_syncthing == "1" {
     `command -v syncthing 2>/dev/null || echo "{{_local_syncthing}}"`
 } else {
@@ -16,16 +14,16 @@ default:
     @just --list
 
 build:
-    {{cargo}} build --all-features
+    cargo build --all-features
 
 release:
-    {{cargo}} build --release
+    cargo build --release
 
 build-cli:
-    {{cargo}} build --bin bepository --all-features
+    cargo build --bin bepository --all-features
 
 release-cli:
-    {{cargo}} build --release --bin bepository
+    cargo build --release --bin bepository
 
 # Ensure syncthing binary is available (downloads if not in PATH and not already fetched)
 fetch-syncthing:
@@ -43,13 +41,13 @@ fetch-syncthing:
 test: test-unit test-e2e
 
 test-unit:
-    {{cargo}} test --all-features
+    cargo test --all-features
 
 test-e2e: build-cli fetch-syncthing
-    {{cargo}} test -p bepository-e2etest --all-features -- --ignored --nocapture
+    cargo test -p bepository-e2etest --all-features -- --ignored --nocapture
 
 lint:
-    {{cargo}} clippy --workspace --all-targets --all-features -- --deny warnings
+    cargo clippy --workspace --all-targets --all-features -- --deny warnings
     reuse lint --lines
 
 # Local CI parity gate: lints (--deny warnings), formatting, unit tests.
@@ -57,16 +55,16 @@ lint:
 check: lint fmt-check test-unit
 
 fmt:
-    {{cargo}} fmt --all
+    cargo fmt --all
     dprint fmt
 
 fmt-check:
-    {{cargo}} fmt --all -- --check
+    cargo fmt --all -- --check
     dprint check
 
 # Verify the CLI builds without the default self-manage feature (distro packager tier).
 check-packager:
-    {{cargo}} check -p bepository-cli --no-default-features
+    cargo check -p bepository-cli --no-default-features
 
 # Configure git to use hooks from the .githooks directory
 setup-hooks:
@@ -120,9 +118,9 @@ cut-release version: sync
     set -euo pipefail
     jj new 'trunk()' -m "chore: bump version to {{version}}"
     sed -i 's/^version = ".*"/version = "{{version}}"/' Cargo.toml
-    {{cargo}} check
+    cargo check
     just ship @
     jj new
 
 clean:
-    {{cargo}} clean
+    cargo clean
