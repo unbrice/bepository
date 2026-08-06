@@ -49,8 +49,12 @@ test-e2e: build-cli fetch-syncthing
     {{cargo}} test -p bepository-e2etest --all-features -- --ignored --nocapture
 
 lint:
-    {{cargo}} clippy --workspace --all-targets --all-features
+    {{cargo}} clippy --workspace --all-targets --all-features -- --deny warnings
     reuse lint --lines
+
+# Local CI parity gate: lints (--deny warnings), formatting, unit tests.
+# `just ship` runs this before pushing.
+check: lint fmt-check test-unit
 
 fmt:
     {{cargo}} fmt --all
@@ -88,8 +92,9 @@ credit-ai rev="@-":
     Co-authored-by: GLM <noreply@z.ai>"
 
 
-# Push REV (default @-) as a PR on a <hostname>/<changeid> branch; auto-merges when CI passes
-ship rev="@-":
+# Push REV (default @-) as a PR on a <hostname>/<changeid> branch; auto-merges when CI passes.
+# Runs check (lint + fmt-check + unit tests) before pushing.
+ship rev="@-": check
     #!/usr/bin/env bash
     set -euo pipefail
     cid=$(jj log -r '{{rev}}' --no-graph -T 'change_id.short()')

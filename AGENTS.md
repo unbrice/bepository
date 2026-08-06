@@ -96,13 +96,17 @@ Use `rtk cargo` instead of raw `cargo`. Run `just` to list all recipes.
 ### Fast feedback (preferred)
 
 ```
-rtk cargo check -p <crate>    # type-check
-rtk cargo clippy -p <crate>   # lint
-rtk cargo test -p <crate>     # unit tests
+rtk cargo check -p <crate>                # type-check
+rtk cargo clippy -p <crate> --all-targets # lint (incl. test code)
+rtk cargo test -p <crate>                 # unit tests
 ```
 
-Before declaring a change done, run `rtk cargo clippy -p <crate>` and
-`rtk cargo test -p <crate>` on every crate you touched, then `just fmt`.
+Note: without `--all-targets`, clippy never sees `#[cfg(test)]` code — CI lints
+it and denies warnings, so a clean local lint is not proof.
+
+Before declaring a change done, run `rtk cargo clippy -p <crate> --all-targets`
+and `rtk cargo test -p <crate>` on every crate you touched, then `just lint`
+(workspace sweep, `--deny warnings`) and `just fmt`.
 
 ### Full suite
 
@@ -113,6 +117,7 @@ just test-unit                 # unit tests
 just test-e2e                  # e2e (downloads syncthing if needed; USE_SYSTEM_SYNCTHING=0 to force)
 just test                      # unit + e2e (builds CLI first)
 just lint / just fmt
+just check                     # lint + fmt-check + unit tests; `just ship` runs it before pushing
 ```
 
 ## Version control
@@ -125,8 +130,8 @@ the exception: jj cannot create them; release CI does.
 Workflow — one change = one PR, CI is the reviewer:
 
 - `jj new 'trunk()'`, hack, `jj describe -m "<type>: <summary>"`.
-- `just ship [rev]` — pushes the change (default `@-`) as bookmark
-  `<hostname>/<changeid>`, opens a PR, enables rebase auto-merge.
+- `just ship [rev]` — runs `check`, then pushes the change (default `@-`) as
+  bookmark `<hostname>/<changeid>`, opens a PR, enables rebase auto-merge.
 - `just sync` — after merges: fetch + rebase; merged changes and their bookmarks
   evaporate.
 - `just cut-release <version>` — version bump shipped like any PR; release CI
@@ -148,7 +153,7 @@ jj sharp edges:
 ## Permissions
 
 **Allowed:** read files, `rtk cargo check/clippy/fmt`, `just test-unit`,
-`just test-e2e`, `just lint`, `just fmt`.
+`just test-e2e`, `just lint`, `just fmt`, `just check`.
 
 **Require approval:** `just test` (full suite), anything that pushes or opens
 PRs (`jj git push`, `just ship`, `just cut-release`, `git push`),
